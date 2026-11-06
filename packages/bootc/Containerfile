@@ -1,0 +1,11 @@
+FROM localhost/blockie-pkg-builder
+
+COPY SOURCE.env /tmp/bootc/
+RUN . /tmp/bootc/SOURCE.env \
+ && srpm=/srpm/${SRPM_URL##*/} \
+ && install -d /srpm \
+ && curl -fsSL --retry 3 -o "$srpm" "$SRPM_URL" \
+ && echo "$SRPM_SHA256  $srpm" | sha256sum -c - \
+ && dnf -y --setopt=install_weak_deps=False builddep "$srpm" \
+ && dnf clean all \
+ && rm -rf /tmp/bootc

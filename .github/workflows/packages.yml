@@ -158,8 +158,8 @@ jobs:
           ARCHIVE: ${{ steps.built.outputs.archive }}
         run: |
           [[ -z $(git ls-files -- "packages/$PKG/LOCAL") ]] || { echo "::error::$PKG artifact, packages/$PKG/LOCAL keeps it off CI"; exit 1; }
-          mapfile -t names < <(awk '$1 == "Name:" { n = $2; print n } $1 == "%package" { print ($2 == "-n" ? $3 : n "-" $2) }' "packages/$PKG"/*.spec)
-          (( ${#names[@]} )) || { echo "::error::no spec Name in packages/$PKG"; exit 1; }
+          mapfile -t names < <(build/pkg-names.sh "packages/$PKG")
+          (( ${#names[@]} )) || { echo "::error::no spec Name and no SRPM_URL in packages/$PKG"; exit 1; }
           bad=$(printf '%s\n' "${names[@]}" | grep -vE '^[A-Za-z0-9._+-]+$' || true)
           [[ -z $bad ]] || { echo "::error::package names in packages/$PKG that are not literal: $bad"; exit 1; }
           re="^rpms/($(printf '%s\n' "${names[@]}" | sed 's/[.+]/\\&/g' | paste -sd'|'))-[0-9][^/]*\.rpm$"

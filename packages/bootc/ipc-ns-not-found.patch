@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: seilent <github@seilent.net>
+Date: Fri, 6 Nov 2026 21:40:00 +0900
+Subject: [PATCH] cli: skip the host ipc namespace join when /proc/1/ns/ipc does not exist
+
+---
+ crates/lib/src/cli.rs | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+--- a/crates/lib/src/cli.rs
++++ b/crates/lib/src/cli.rs
+@@ -1887,7 +1887,12 @@ fn join_host_ipc_namespace() -> Result<()> {
+     }
+     let ns_pid1 = match std::fs::read_link("/proc/1/ns/ipc") {
+         Ok(v) => v,
+-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
++        Err(e)
++            if matches!(
++                e.kind(),
++                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
++            ) =>
++        {
+             return Ok(());
+         }
+         Err(e) => return Err(e).context("reading /proc/1/ns/ipc"),

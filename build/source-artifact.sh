@@ -30,14 +30,28 @@ out=$(cd "$out" && pwd)
 tmp=$(mktemp -d)
 trap 'rm -rf "${tmp:?}"' EXIT
 
-awk '$1 == "Name:" { n = $2; print n } $1 == "%package" { print ($2 == "-n" ? $3 : n "-" $2) }' "$root"/packages/*/*.spec \
-  | sort -u > "$tmp/own"
+awk '$1 == "Name:" { print $2 }' "$root"/packages/*/*.spec | sort -u > "$tmp/own"
 [[ -s $tmp/own ]] || fail "no spec names under packages/"
 
 sha=$(git -C "$root" rev-parse HEAD)
 short=${sha::7}
 git -C "$root" archive --format=tar.gz --prefix=blockie-image/ -o "$out/blockie-image-$short.tar.gz" HEAD
 printf '%s %s\n' "blockie-image-$short.tar.gz" "$repo/tree/$sha" > "$tmp/origins"
+
+nevra='^([A-Za-z0-9][A-Za-z0-9._+~^-]*)-([A-Za-z0-9._+~^]+)-([A-Za-z0-9._+~^]+)\.src\.rpm$'
+: > "$tmp/upstream"
+for env in "$root"/packages/*/SOURCE.env; do
+  url=$(sed -n 's/^SRPM_URL=//p' "$env")
+  [[ -n $url ]] || continue
+  want=$(sed -n 's/^SRPM_SHA256=//p' "$env")
+  f=${url##*/}
+  [[ $want =~ ^[0-9a-f]{64}$ && $f != *..* && $f =~ $nevra ]] || fail "bad SRPM_URL or SRPM_SHA256 in $env"
+  echo "${BASH_REMATCH[1]}" >> "$tmp/own"
+  curl -fsSL --retry 5 --retry-all-errors -o "$out/$f" "$url" || fail "$f download failed"
+  [[ $(sha256sum < "$out/$f" | cut -d' ' -f1) == "$want" ]] || fail "$f is not sha256 $want"
+  printf '%s %s\n' "$f" "$url" >> "$tmp/origins"
+  echo "$f" >> "$tmp/upstream"
+done
 
 krepo=${kref%@*}
 art=""
@@ -55,9 +69,10 @@ done < <(oras discover --artifact-type "$source_type" --format json "$kref" | jq
 [[ -n $art ]] || fail "no $source_type referrer on $kref holds $kname with sha256 $ksha"
 printf '%s %s\n' "$kname" "$krepo@$art" >> "$tmp/origins"
 
+: > "$tmp/srpms"
 if [[ $mode == full ]]; then
-  nevra='^([A-Za-z0-9][A-Za-z0-9._+~^-]*)-([A-Za-z0-9._+~^]+)-([A-Za-z0-9._+~^]+)\.src\.rpm$'
-  awk -F'\t' 'NR == FNR { own[$1] = 1; next } !($1 in own) && $2 != "(none)" { print $2 }' "$tmp/own" "$tsv" \
+  awk -F'\t' 'NR == FNR { own[$1] = 1; next } { n = $2; sub(/-[^-]*-[^-]*\.src\.rpm$/, "", n) }
+    !(n in own) && $2 != "(none)" { print $2 }' "$tmp/own" "$tsv" \
     | sort -u > "$tmp/srpms"
   [[ -s $tmp/srpms ]] || fail "no source rpms in $tsv"
   get=()
@@ -78,9 +93,12 @@ if [[ $mode == full ]]; then
   while read -r f; do
     [[ -s $out/$f ]] || fail "$f missing"
   done < "$tmp/srpms"
+fi
+n=$(cat "$tmp/upstream" "$tmp/srpms" | wc -l)
+if (( n )); then
   podman run --rm -v "$out:/src:ro" "$fedora" sh -c 'cd /src && rpm -K -- *.src.rpm' > "$tmp/rpmk" \
     || { grep -v ': digests signatures OK$' "$tmp/rpmk" >&2; fail "rpm -K failed"; }
-  [[ $(grep -c ': digests signatures OK$' "$tmp/rpmk") == "$(wc -l < "$tmp/srpms")" ]] || fail "rpm -K did not pass every source rpm"
+  [[ $(grep -c ': digests signatures OK$' "$tmp/rpmk") == "$n" ]] || fail "rpm -K did not pass every source rpm"
 fi
 
 sort "$tmp/origins" | while read -r f url; do

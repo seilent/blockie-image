@@ -416,10 +416,15 @@ jobs:
           ART: ${{ steps.attach.outputs.digest }}
         run: |
           names=$(printf '%s\n' "blockie-image-$SHORT.tar.gz" blockie-kernel-source.tar.gz)
+          upstream=$(sed -n 's/^SRPM_URL=//p' packages/*/SOURCE.env | sed 's|.*/||')
+          [[ -z $upstream ]] || names+=$'\n'$upstream
           if [[ $MODE == full ]]; then
-            own=$(awk '$1 == "Name:" { n = $2; print n } $1 == "%package" { print ($2 == "-n" ? $3 : n "-" $2) }' packages/*/*.spec | sort -u)
-            names+=$'\n'$(awk -F'\t' 'NR == FNR { own[$1] = 1; next } !($1 in own) && $2 != "(none)" { print $2 }' \
-              <(printf '%s\n' "$own") "$RUNNER_TEMP/srpms/srpms.tsv" | sort -u)
+            own=$(awk '$1 == "Name:" { print $2 }' packages/*/*.spec
+              while read -r f; do
+                [[ -z $f ]] || echo "${f%-*-*.src.rpm}"
+              done <<< "$upstream")
+            names+=$'\n'$(awk -F'\t' 'NR == FNR { own[$1] = 1; next } { n = $2; sub(/-[^-]*-[^-]*\.src\.rpm$/, "", n) }
+              !(n in own) && $2 != "(none)" { print $2 }' <(printf '%s\n' "$own") "$RUNNER_TEMP/srpms/srpms.tsv" | sort -u)
           fi
           cd "$RUNNER_TEMP/source"
           [[ $(cut -d' ' -f1 SOURCES | sort) == "$(sort <<< "$names")" ]] || { echo "::error::SOURCES is not the $MODE set"; exit 1; }
