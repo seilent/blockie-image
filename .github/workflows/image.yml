@@ -293,18 +293,15 @@ jobs:
           [[ $(sb state) == clean ]] || { echo "::error::state is $(sb state)"; exit 1; }
           [[ $(sb features | tr ' ' '\n' | sort | xargs) == "$(tr , '\n' <<< "$FS_FEATURES" | sort | xargs)" ]] \
             || { echo "::error::features are $(sb features), not $FS_FEATURES"; exit 1; }
-          head_sha=$(head -c 1048576 "$img" | sha256sum | cut -d' ' -f1)
-          body_sha=$(tail -c +1048577 "$img" | sha256sum | cut -d' ' -f1)
-          whole_sha=$(sha256sum < "$img" | cut -d' ' -f1)
-          pigz -1 -c "$img" > "$out/$gz"
-          [[ $(pigz -dc "$out/$gz" | sha256sum | cut -d' ' -f1) == "$whole_sha" ]] || { echo "::error::$gz does not unpack to the image"; exit 1; }
+          build/root-seal.sh "$img" "$out/$gz" > "$RUNNER_TEMP/seal"
+          . "$RUNNER_TEMP/seal"
           {
             echo "ROOT_GZ=$gz"
-            echo "ROOT_GZ_SHA=$(sha256sum < "$out/$gz" | cut -d' ' -f1)"
+            echo "ROOT_GZ_SHA=$ROOT_GZ_SHA"
             echo "ROOT_BYTES=$FS_BYTES"
-            echo "ROOT_SHA=$whole_sha"
-            echo "ROOT_HEAD_SHA=$head_sha"
-            echo "ROOT_BODY_SHA=$body_sha"
+            echo "ROOT_SHA=$ROOT_SHA"
+            echo "ROOT_HEAD_SHA=$ROOT_HEAD_SHA"
+            echo "ROOT_BODY_SHA=$ROOT_BODY_SHA"
           } > "$out/root.conf"
           {
             echo "IMAGE=$IMAGE@$DIGEST"

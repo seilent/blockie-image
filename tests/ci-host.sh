@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
 set -u
 
+if [[ $(id -u) == 0 ]]; then
+  echo "ci-host: refuses to run as root"
+  exit 1
+fi
 here=$(cd "$(dirname "$0")/.." && pwd)
 disk=$here/build/ci-disk.sh
 need=$here/build/ci-need.sh
 plan=$here/build/pkg-plan.sh
 cache=$here/build/source-cache.sh
+seal=$here/build/root-seal.sh
 top=$(mktemp -d "${TMPDIR:-/tmp}/ci-host.XXXXXX")
 trap 'rm -rf "${top:?}"' EXIT
 fails=0
@@ -20,6 +25,7 @@ res() {
 }
 
 fake() {
+  rm -f "${bin:?}/$1"
   printf '#!%s\n%s\n' "$BASH" "$2" > "$bin/$1"
   chmod 755 "$bin/$1"
 }
@@ -48,6 +54,14 @@ is() { [[ $1 == "$2" ]]; }
 df_fake() {
   fake df "echo \"\$*\" >> '$d/df.args'; echo '   Avail'; echo '$1'"
 }
+
+if [[ -z ${CI_HOST_INNER:-} ]]; then
+  setup h_root
+  fake id 'echo 0'
+  out=$(CI_HOST_INNER=1 PATH=$bin:$PATH "$BASH" "$here/tests/ci-host.sh" 2>&1)
+  rc=$?
+  is "$rc" 1 && is "$out" 'ci-host: refuses to run as root'; res $? "host test: refuses to run as root, before any fake is written"
+fi
 
 setup d_low
 df_fake 39000000000
@@ -428,6 +442,52 @@ a=$(blob alpha)
 artifact testing "$(printf 'alpha-1.0-1.fc44.src.rpm %s u\nlost-1-1.fc44.src.rpm %s u\n' "$a" "$(printf 'f%.0s' {1..64})")" > /dev/null
 cache_run
 is "$rc" 0 && cached 'alpha-1.0-1.fc44.src.rpm '; res $? "cache: a blob that cannot be fetched leaves no file"
+
+seal_setup() {
+  setup "$1"
+  local tool
+  for tool in head sha256sum tee cut mktemp rm cat; do
+    ln -sf "$(command -v "$tool")" "$bin/$tool"
+  done
+  zip=$(command -v pigz || command -v gzip)
+  fake pigz "exec '$zip' \"\$@\""
+  img=$d/root.ext4
+  head -c 1048576 /dev/urandom > "$img"
+  head -c 2097152 /dev/zero >> "$img"
+  head -c 70000 /dev/urandom >> "$img"
+}
+
+seal_run() {
+  out=$(PATH=$bin "$BASH" "$seal" "$img" "$d/root.ext4.gz" 2> "$d/err")
+  rc=$?
+}
+
+seal_setup r_ok
+seal_run
+want=$(printf 'ROOT_GZ_SHA=%s\nROOT_SHA=%s\nROOT_HEAD_SHA=%s\nROOT_BODY_SHA=%s' \
+  "$(sha256sum < "$d/root.ext4.gz" | cut -d' ' -f1)" "$(sha256sum < "$img" | cut -d' ' -f1)" \
+  "$(head -c 1048576 "$img" | sha256sum | cut -d' ' -f1)" "$(tail -c +1048577 "$img" | sha256sum | cut -d' ' -f1)")
+is "$rc" 0 && is "$out" "$want" && cmp -s <("$zip" -dc "$d/root.ext4.gz") "$img"; res $? "seal: the four sha256s equal separate passes and the gz unpacks to the image"
+
+seal_setup r_badunpack
+fake pigz "if [[ \$1 == -dc ]]; then '$zip' -dc | tr '\\0' x; else exec '$zip' \"\$@\"; fi"
+seal_run
+is "$rc" 1 && grep -qF 'root.ext4.gz does not unpack to the image' "$d/err"; res $? "seal: a gz that does not unpack to the image fails"
+
+seal_setup r_tailfail
+fake tail 'exit 1'
+seal_run
+is "$rc" 1 && grep -qF '::error::root-seal: hashing or compressing' "$d/err"; res $? "seal: a failed body hash fails"
+
+seal_setup r_pigzfail
+fake pigz 'exit 1'
+seal_run
+is "$rc" 1 && grep -qF '::error::root-seal: hashing or compressing' "$d/err"; res $? "seal: a failed compression fails"
+
+seal_setup r_nosum
+fake sha256sum "cat > /dev/null; echo 'garbage  -'"
+seal_run
+is "$rc" 1 && grep -qF '::error::root-seal: no ' "$d/err"; res $? "seal: an unparsable sha256 fails"
 
 if (( fails )); then
   echo "ci-host: $fails failed"
