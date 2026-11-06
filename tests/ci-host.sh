@@ -5,6 +5,7 @@ here=$(cd "$(dirname "$0")/.." && pwd)
 disk=$here/build/ci-disk.sh
 need=$here/build/ci-need.sh
 plan=$here/build/pkg-plan.sh
+cache=$here/build/source-cache.sh
 top=$(mktemp -d "${TMPDIR:-/tmp}/ci-host.XXXXXX")
 trap 'rm -rf "${top:?}"' EXIT
 fails=0
@@ -303,6 +304,130 @@ printf 'a missing\nb signed\nc signed\n' > "$d/cfg"
 out=$(cd "$d" && PATH=$bin GH_ACTOR=actor GH_TOKEN=token "$BASH" "$r/build/pkg-plan.sh" rel.json 2>&1)
 rc=$?
 is "$rc" 0 && is "$(< "$d/rel.json")" '[{"package":"a","state":"missing"}]'; res $? "plan: a relative output path is taken from the caller's directory"
+
+cache_setup() {
+  setup "$1"
+  local tool i
+  for tool in git jq realpath dirname mktemp rm find wc mkdir cp cat; do
+    ln -sf "$(command -v "$tool")" "$bin/$tool"
+  done
+  ln -sf "$BASH" "$bin/bash"
+  r=$d/repo
+  reg=$d/reg
+  mkdir -p "$r/build" "$reg/tags" "$reg/man" "$reg/blobs"
+  cp "$cache" "$r/build/"
+  echo key > "$d/blockie.pub"
+  : > "$reg/bad"
+  : > "$d/discover.calls"
+  git -C "$r" init -q
+  for i in 0 1 2 3 4 5 6 7; do
+    echo "$i" > "$r/f"
+    git -C "$r" add -A
+    git -C "$r" -c user.name=t -c user.email=t@invalid commit -q -m "c$i"
+  done
+  cat > "$bin/oras" << EOF
+#!$BASH
+case \$1 in
+  discover)
+    ref=\${*: -1}
+    tag=\${ref##*:}
+    echo "\$tag" >> '$d/discover.calls'
+    [[ -f '$reg/tags/'\$tag ]] || { echo 'Error: not found' >&2; exit 1; }
+    jq -nc --rawfile l '$reg/tags/'\$tag '{referrers: (\$l | split("\n") | map(select(length > 0)) | map({digest: .}))}'
+    ;;
+  manifest)
+    cat '$reg/man/'\${3##*@sha256:}
+    ;;
+  blob)
+    h=\${5##*@sha256:}
+    [[ -f '$reg/blobs/'\$h ]] || { echo partial > "\$4"; exit 1; }
+    cp '$reg/blobs/'\$h "\$4"
+    ;;
+esac
+EOF
+  cat > "$bin/cosign" << EOF
+#!$BASH
+ref=\${*: -1}
+! grep -qxF "\${ref##*@}" '$reg/bad'
+EOF
+  chmod 755 "$bin/oras" "$bin/cosign"
+}
+
+blob() {
+  local h
+  h=$(printf '%s' "$1" | sha256sum | cut -d' ' -f1)
+  printf '%s' "$1" > "$reg/blobs/$h"
+  echo "$h"
+}
+
+artifact() {
+  local tag=$1 sources=$2 title=${3:-SOURCES} s m
+  s=$(blob "$sources"$'\n')
+  m=$(printf '%s' "manifest $tag $s $title" | sha256sum | cut -d' ' -f1)
+  jq -nc --arg d "sha256:$s" --arg t "$title" '{layers: [{digest: $d, annotations: {"org.opencontainers.image.title": $t}}]}' > "$reg/man/$m"
+  echo "sha256:$m" >> "$reg/tags/$tag"
+  echo "sha256:$m"
+}
+
+srpms() {
+  local a b
+  a=$(blob alpha)
+  b=$(blob beta)
+  printf 'alpha-1.0-1.fc44.src.rpm %s https://koji/a\nbeta-2.0-3.fc44.src.rpm %s https://koji/b\n' "$a" "$b"
+}
+
+cache_run() {
+  out=$(cd "$r" && PATH=$bin IMAGE=ghcr.io/seilent/blockie SOURCE_TYPE=application/vnd.blockie.source.v1 PUBKEY=$d/blockie.pub "$BASH" "$r/build/source-cache.sh" "$d/cache" 2>&1)
+  rc=$?
+}
+
+anc() { git -C "$r" rev-parse --short=7 "HEAD~$1"; }
+
+cached() { [[ $(cd "$d/cache" 2> /dev/null && find . -mindepth 1 -printf '%P\n' | sort | tr '\n' ' ') == "$1" ]]; }
+
+cache_setup s_testing
+artifact testing "$(srpms)" > /dev/null
+cache_run
+is "$rc" 0 && cached 'alpha-1.0-1.fc44.src.rpm beta-2.0-3.fc44.src.rpm ' && is "$(tail -n 1 "$d/discover.calls")" testing && is "$(wc -l < "$d/discover.calls")" 6 && has '2 source rpms from ghcr.io/seilent/blockie:testing'; res $? "cache: testing, tried last, fills the cache when no ancestor has SOURCES"
+
+cache_setup s_ancestor
+artifact "testing-$(anc 2)" "$(srpms)" > /dev/null
+cache_run
+is "$rc" 0 && cached 'alpha-1.0-1.fc44.src.rpm beta-2.0-3.fc44.src.rpm ' && is "$(< "$d/discover.calls")" "$(printf 'testing-%s\ntesting-%s' "$(anc 1)" "$(anc 2)")" && has "from ghcr.io/seilent/blockie:testing-$(anc 2)"; res $? "cache: missing tags move on to the next main ancestor"
+
+cache_setup s_unsigned
+artifact "testing-$(anc 1)" "$(srpms)" >> "$reg/bad"
+artifact "testing-$(anc 2)" "$(srpms)" > /dev/null
+cache_run
+is "$rc" 0 && has '::warning::' && has 'fails cosign verify, not used' && has "from ghcr.io/seilent/blockie:testing-$(anc 2)"; res $? "cache: a referrer failing cosign verify is not used"
+
+cache_setup s_newest
+artifact testing "$(srpms)" > /dev/null
+artifact "testing-$(anc 1)" "$(srpms)" > /dev/null
+cache_run
+is "$rc" 0 && is "$(< "$d/discover.calls")" "testing-$(anc 1)" && has "from ghcr.io/seilent/blockie:testing-$(anc 1)"; res $? "cache: the newest main parent is used before testing"
+
+cache_setup s_none
+cache_run
+is "$rc" 0 && cached '' && has '::notice::no signed source artifact' && is "$(< "$d/discover.calls")" "$(printf 'testing-%s\n' "$(anc 1)" "$(anc 2)" "$(anc 3)" "$(anc 4)" "$(anc 5)"; echo testing)"; res $? "cache: five ancestors newest first, then testing, not HEAD, none found"
+
+cache_setup s_notitle
+artifact "testing-$(anc 1)" "$(srpms)" OTHER > /dev/null
+artifact "testing-$(anc 2)" "$(srpms)" > /dev/null
+cache_run
+is "$rc" 0 && has "from ghcr.io/seilent/blockie:testing-$(anc 2)"; res $? "cache: a referrer without a SOURCES layer is skipped"
+
+cache_setup s_badlines
+good=$(blob gamma)
+artifact testing "$(printf '../evil-1-1.src.rpm %s u\ndir/a-1-1.src.rpm %s u\nb-1-1.src.rpm nothex u\nc.rpm %s u\ngamma-1-1.fc44.src.rpm %s u\n' "$good" "$good" "$good" "$good")" > /dev/null
+cache_run
+is "$rc" 0 && cached 'gamma-1-1.fc44.src.rpm ' && [[ ! -e $d/evil-1-1.src.rpm ]]; res $? "cache: names outside the NEVRA pattern, paths and bad sums are not fetched"
+
+cache_setup s_lostblob
+a=$(blob alpha)
+artifact testing "$(printf 'alpha-1.0-1.fc44.src.rpm %s u\nlost-1-1.fc44.src.rpm %s u\n' "$a" "$(printf 'f%.0s' {1..64})")" > /dev/null
+cache_run
+is "$rc" 0 && cached 'alpha-1.0-1.fc44.src.rpm '; res $? "cache: a blob that cannot be fetched leaves no file"
 
 if (( fails )); then
   echo "ci-host: $fails failed"

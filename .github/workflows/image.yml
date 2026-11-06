@@ -364,6 +364,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+          fetch-depth: 6
 
       - name: Disk
         run: build/ci-disk.sh 40
@@ -389,28 +390,7 @@ jobs:
 
       - name: Source cache
         if: env.MODE == 'full'
-        run: |
-          cache=$RUNNER_TEMP/cache
-          mkdir -p "$cache"
-          if ! refs=$(oras discover --artifact-type "$SOURCE_TYPE" --format json --depth 1 "$IMAGE:testing" | jq -r '.referrers[]?.digest'); then
-            echo "::notice::no source artifact on $IMAGE:testing, every source rpm comes from koji"
-            exit 0
-          fi
-          for d in $refs; do
-            layer=$(oras manifest fetch "$IMAGE@$d" | jq -r '.layers[] | select(.annotations["org.opencontainers.image.title"] == "SOURCES") | .digest')
-            [[ $layer == sha256:* && $layer != *$'\n'* ]] || continue
-            oras blob fetch --output "$RUNNER_TEMP/prev.SOURCES" "$IMAGE@$layer"
-            break
-          done
-          [[ -s $RUNNER_TEMP/prev.SOURCES ]] || { echo "::notice::no SOURCES on $IMAGE:testing"; exit 0; }
-          nevra='^([A-Za-z0-9][A-Za-z0-9._+~^-]*)-([A-Za-z0-9._+~^]+)-([A-Za-z0-9._+~^]+)\.src\.rpm$'
-          while read -r f sum _; do
-            [[ $f =~ $nevra && $f != */* && $f != *..* && $sum =~ ^[0-9a-f]{64}$ ]] || continue
-            (( $(jobs -rp | wc -l) < 8 )) || wait -n
-            { oras blob fetch --output "$cache/$f" "$IMAGE@sha256:$sum" > /dev/null 2>&1 || rm -f "$cache/$f"; } &
-          done < "$RUNNER_TEMP/prev.SOURCES"
-          wait
-          echo "::notice::$(find "$cache" -name '*.src.rpm' | wc -l) source rpms from $IMAGE:testing"
+        run: build/source-cache.sh "$RUNNER_TEMP/cache"
 
       - name: Sources
         env:
