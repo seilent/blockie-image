@@ -1,0 +1,13 @@
+{
+  "default": [{"type": "reject"}],
+  "transports": {
+    "docker": {
+      "ghcr.io/seilent/blockie": [{
+        "type": "sigstoreSigned",
+        "keyPaths": ["/usr/share/blockie/keys/blockie.pub"],
+        "signedIdentity": {"type": "matchRepository"}
+      }]
+    },
+    "oci": {"": [{"type": "insecureAcceptAnything"}]}
+  }
+}

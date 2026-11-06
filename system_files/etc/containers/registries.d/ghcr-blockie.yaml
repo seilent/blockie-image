@@ -1,0 +1,3 @@
+docker:
+  ghcr.io/seilent/blockie:
+    use-sigstore-attachments: true

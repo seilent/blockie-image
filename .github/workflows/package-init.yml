@@ -1,0 +1,39 @@
+name: package-init
+
+on:
+  workflow_dispatch:
+    inputs:
+      name:
+        description: "Package name under ghcr.io/seilent/blockie/pkg/"
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  init:
+    runs-on: ubuntu-24.04
+    permissions:
+      packages: write
+    env:
+      NAME: ${{ inputs.name }}
+    steps:
+      - name: Create the package
+        env:
+          GH_ACTOR: ${{ github.actor }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          [[ $NAME =~ ^[a-z0-9][a-z0-9-]*$ ]] || { echo "::error::bad name $NAME"; exit 1; }
+          repo=ghcr.io/seilent/blockie/pkg/$NAME
+          if skopeo inspect --no-creds --raw "docker://$repo:init" > /dev/null 2>&1; then
+            echo "$repo:init exists"
+            exit 0
+          fi
+          dir=$(mktemp -d)
+          echo "$NAME" > "$dir/init"
+          printf 'FROM scratch\nCOPY init /init\n' > "$dir/Containerfile"
+          podman build -f "$dir/Containerfile" \
+            --label org.opencontainers.image.source=https://github.com/seilent/blockie-image \
+            -t "$repo:init" "$dir"
+          podman login ghcr.io -u "$GH_ACTOR" --password-stdin <<< "$GH_TOKEN"
+          podman push "$repo:init"

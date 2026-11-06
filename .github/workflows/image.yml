@@ -1,0 +1,158 @@
+name: image
+
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  IMAGE: ghcr.io/seilent/blockie
+  PKG_KERNEL: ghcr.io/seilent/blockie/pkg/kernel
+  PUBKEY: system_files/usr/share/blockie/keys/blockie.pub
+
+jobs:
+  image:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+      push_tag: ${{ steps.version.outputs.push_tag }}
+      short: ${{ steps.version.outputs.short }}
+    steps:
+      - uses: ublue-os/remove-unwanted-software@cc0becac701cf642c8f0a6613bbdaf5dc36b259e
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman skopeo
+
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
+        with:
+          cosign-release: v2.6.3
+
+      - name: Kernel
+        id: kernel
+        run: |
+          hash=$(build/pkg-hash.sh kernel)
+          digest=sha256:$(skopeo inspect --no-creds --raw "docker://$PKG_KERNEL:$hash" | sha256sum | cut -d' ' -f1)
+          cosign verify --key "$PUBKEY" "$PKG_KERNEL@$digest" > /dev/null
+          build/pkg-check.sh "$PKG_KERNEL@$digest" "$RUNNER_TEMP/check"
+          echo "ref=$PKG_KERNEL@$digest" >> "$GITHUB_OUTPUT"
+          echo "$PKG_KERNEL:$hash $digest"
+
+      - name: Packages
+        run: |
+          mkdir -p "$RUNNER_TEMP/pkgs"
+          for name in $(git ls-files -- 'packages/*/build.sh' | cut -d/ -f2); do
+            [[ $name != kernel ]] || continue
+            hash=$(build/pkg-hash.sh "$name")
+            repo=$IMAGE/pkg/$name
+            digest=sha256:$(skopeo inspect --no-creds --raw "docker://$repo:$hash" | sha256sum | cut -d' ' -f1)
+            cosign verify --key "$PUBKEY" "$repo@$digest" > /dev/null
+            build/pkg-check.sh "$repo@$digest" "$RUNNER_TEMP/check" "$RUNNER_TEMP/pkgs/$name"
+            echo "$repo:$hash $digest"
+          done
+
+      - name: Version
+        id: version
+        run: |
+          short=${GITHUB_SHA::7}
+          if [[ $GITHUB_REF == refs/heads/main ]]; then
+            push_tag=testing-$short
+          else
+            push_tag=dev-$short
+          fi
+          {
+            echo "short=$short"
+            echo "push_tag=$push_tag"
+            echo "version=$(date -u +%Y%m%d).$short"
+          } >> "$GITHUB_OUTPUT"
+          echo "$push_tag"
+
+      - name: Build
+        env:
+          KERNEL_REF: ${{ steps.kernel.outputs.ref }}
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.push_tag }}
+        run: |
+          podman build \
+            --build-arg "KERNEL_REF=$KERNEL_REF" \
+            --build-arg "BLOCKIE_VERSION=$VERSION" \
+            --build-arg "BLOCKIE_REVISION=$GITHUB_SHA" \
+            --build-context "pkgs=$RUNNER_TEMP/pkgs" \
+            -t "$IMAGE:$TAG" .
+          base=$(sed -n 's/^FROM \([^ ]*\/fedora-bootc:[^ ]*\)$/\1/p' Containerfile)
+          [[ -n $base ]] || { echo "::error::no fedora-bootc FROM line in Containerfile"; exit 1; }
+          mapfile -t want < <(podman image inspect --format '{{range .RootFS.Layers}}{{println .}}{{end}}' "$base" | sed '/^$/d')
+          mapfile -t got < <(podman image inspect --format '{{range .RootFS.Layers}}{{println .}}{{end}}' "$IMAGE:$TAG" | sed '/^$/d')
+          n=${#want[@]}
+          [[ $n -gt 0 && ${got[*]:0:n} == "${want[*]}" ]] || { echo "::error::image layers do not start with the $base layers"; exit 1; }
+          podman image inspect --format '{{.Size}}' "$IMAGE:$TAG" | awk '{ printf "image %.2f GB\n", $1 / 1e9 }'
+
+      - name: Test
+        env:
+          TAG: ${{ steps.version.outputs.push_tag }}
+        run: |
+          for t in image units blobs; do
+            podman run --rm -v "$PWD/tests:/tests:ro" "$IMAGE:$TAG" "/tests/$t.sh"
+          done
+
+      - name: Push
+        id: push
+        env:
+          TAG: ${{ steps.version.outputs.push_tag }}
+          GH_ACTOR: ${{ github.actor }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          podman login ghcr.io -u "$GH_ACTOR" --password-stdin <<< "$GH_TOKEN"
+          podman push --digestfile "$RUNNER_TEMP/digest" "$IMAGE:$TAG"
+          digest=$(cat "$RUNNER_TEMP/digest")
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "$IMAGE:$TAG $digest"
+
+      - name: Unsigned check
+        env:
+          TAG: ${{ steps.version.outputs.push_tag }}
+        run: |
+          podman run --rm -v "$PWD/tests:/tests:ro" "$IMAGE:$TAG" /tests/verify-sig.sh unsigned "docker://$IMAGE:$TAG"
+
+      - name: Sign
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+          GH_ACTOR: ${{ github.actor }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
+          COSIGN_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
+        run: |
+          cosign login ghcr.io -u "$GH_ACTOR" --password-stdin <<< "$GH_TOKEN"
+          cosign sign --yes --new-bundle-format=false --key env://COSIGN_PRIVATE_KEY "$IMAGE@$DIGEST"
+
+      - name: Verify
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: cosign verify --key "$PUBKEY" "$IMAGE@$DIGEST" > /dev/null
+
+      - name: Signed check
+        env:
+          TAG: ${{ steps.version.outputs.push_tag }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          podman run --rm -v "$PWD/tests:/tests:ro" "$IMAGE:$TAG" \
+            /tests/verify-sig.sh signed "docker://$IMAGE@$DIGEST" dir:/var/tmp/signed

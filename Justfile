@@ -1,0 +1,106 @@
+set positional-arguments
+
+podman := env_var_or_default("PODMAN", "podman")
+builder := "localhost/blockie-pkg-builder"
+
+pkg name:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    hash=$(build/pkg-hash.sh "$1")
+    mapfile -t inputs < <(build/pkg-hash.sh --inputs "$1")
+    dirty=0
+    [[ -z $(git status --porcelain -- "${inputs[@]}") ]] || dirty=1
+    out=out/pkg/$1
+    tag=localhost/blockie-pkg/$1:$hash
+    {{podman}} build --memory=14g --cpu-period=100000 --cpu-quota=600000 -t {{builder}} -f build/pkg.Containerfile build
+    img={{builder}}
+    if [[ -f packages/$1/Containerfile ]]; then
+      img={{builder}}-$1
+      {{podman}} build --memory=14g --cpu-period=100000 --cpu-quota=600000 -t "$img" -f "packages/$1/Containerfile" "packages/$1"
+    fi
+    rm -rf "${out:?}"
+    mkdir -p "$out"
+    src=()
+    if [[ -n ${PKG_INPUT:-} ]]; then
+      src=(-v "$(realpath "$PKG_INPUT"):/input:ro,Z")
+    fi
+    {{podman}} run --rm --memory=14g --cpus=6 --network=none "${src[@]}" \
+      -v "$PWD/packages/$1:/src:ro,Z" \
+      -v "$PWD/$out:/out:Z" \
+      "$img" /src/build.sh /out
+    if [[ -f tests/pkg-$1.sh ]]; then
+      {{podman}} run --rm --memory=14g --cpus=6 --network=none \
+        -v "$PWD/tests:/tests:ro,Z" \
+        -v "$PWD/$out:/out:ro,Z" \
+        "$img" "/tests/pkg-$1.sh" /out
+    fi
+    [[ ! -e $out/dirty ]] || dirty=1
+    {{podman}} build --memory=14g --cpu-period=100000 --cpu-quota=600000 -f build/pkg-wrap.Containerfile --label "blockie.dirty=$dirty" -t "$tag" "$out"
+    echo "$tag"
+
+pkg-push name:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mapfile -t inputs < <(build/pkg-hash.sh --inputs "$1")
+    if [[ -n $(git status --porcelain -- "${inputs[@]}") ]]; then
+      echo "uncommitted changes in the inputs of $1" >&2
+      exit 1
+    fi
+    hash=$(build/pkg-hash.sh "$1")
+    local=localhost/blockie-pkg/$1:$hash
+    if [[ $({{podman}} inspect -f '{{{{index .Labels "blockie.dirty"}}' "$local") != 0 ]]; then
+      echo "$local was built from uncommitted inputs" >&2
+      exit 1
+    fi
+    pass=out/audit/$1.pass
+    [[ -s $pass ]] || { echo "$pass missing: run the package audit first" >&2; exit 1; }
+    work=$(mktemp -d)
+    trap 'rm -rf "${work:?}"' EXIT
+    ctr=$({{podman}} create "$local" none)
+    {{podman}} cp "$ctr:/rpms/." "$work/"
+    {{podman}} rm "$ctr" > /dev/null
+    found=0
+    for f in "$work"/*.rpm; do
+      [[ -f $f ]] || continue
+      found=1
+      grep -qxF "$(sha256sum < "$f" | cut -d' ' -f1)  ${f##*/}" "$pass" || { echo "${f##*/} in $local is not in $pass" >&2; exit 1; }
+    done
+    (( found )) || { echo "$local has no RPMs" >&2; exit 1; }
+    repo=ghcr.io/seilent/blockie/pkg/$1
+    api=/user/packages/container/blockie%2Fpkg%2F$1
+    keys=${BLOCKIE_KEYS:-$HOME/keystores/blockie-cosign}
+    cosign=${COSIGN:-cosign}
+    {{podman}} login --get-login ghcr.io > /dev/null
+    if ! gh api "$api" > /dev/null 2>&1; then
+      start=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+      gh workflow run package-init.yml -R seilent/blockie-image -f name="$1"
+      run=
+      for _ in $(seq 60); do
+        sleep 5
+        run=$(gh run list -R seilent/blockie-image --workflow package-init.yml --event workflow_dispatch \
+          --user seilent --json databaseId,createdAt \
+          --jq "[.[] | select(.createdAt >= \"$start\")][0].databaseId // empty")
+        [[ -z $run ]] || break
+      done
+      [[ -n $run ]] || { echo "package-init run not found" >&2; exit 1; }
+      gh run watch "$run" -R seilent/blockie-image --exit-status > /dev/null
+    fi
+    if err=$(skopeo inspect --raw "docker://$repo:$hash" 2>&1 > /dev/null); then
+      echo "$repo:$hash exists" >&2
+      exit 1
+    fi
+    if ! grep -qiE 'manifest unknown|404' <<< "$err"; then
+      echo "$err" >&2
+      exit 1
+    fi
+    {{podman}} tag "$local" "$repo:$hash"
+    digest=$work/digest
+    {{podman}} push --digestfile "$digest" "$repo:$hash"
+    COSIGN_PASSWORD=$(cat "$keys/blockie.password") \
+      "$cosign" sign -y --new-bundle-format=false --key "$keys/blockie.key" "$repo@$(cat "$digest")"
+    "$cosign" verify --key system_files/usr/share/blockie/keys/blockie.pub "$repo@$(cat "$digest")" > /dev/null
+    init=$(gh api "$api/versions" --jq '.[] | select(.metadata.container.tags | index("init")) | .id')
+    if [[ -n $init ]]; then
+      gh api -X DELETE "$api/versions/$init"
+    fi
+    echo "$repo:$hash"
