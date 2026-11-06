@@ -24,7 +24,9 @@ pkg name:
     if [[ -n ${PKG_INPUT:-} ]]; then
       src=(-v "$(realpath "$PKG_INPUT"):/input:ro,Z")
     fi
-    {{podman}} run --rm --memory=14g --cpus=6 --network=none "${src[@]}" \
+    epoch=$(git log -1 --format=%ct -- "packages/$1")
+    [[ -n $epoch ]] || epoch=$(git log -1 --format=%ct)
+    {{podman}} run --rm --memory=14g --cpus=6 --network=none "${src[@]}" -e "SOURCE_DATE_EPOCH=$epoch" \
       -v "$PWD/packages/$1:/src:ro,Z" \
       -v "$PWD/$out:/out:Z" \
       "$img" /src/build.sh /out
@@ -35,7 +37,7 @@ pkg name:
         "$img" "/tests/pkg-$1.sh" /out
     fi
     [[ ! -e $out/dirty ]] || dirty=1
-    {{podman}} build --memory=14g --cpu-period=100000 --cpu-quota=600000 -f build/pkg-wrap.Containerfile --label "blockie.dirty=$dirty" -t "$tag" "$out"
+    {{podman}} build --platform linux/arm64 --timestamp "$epoch" --memory=14g --cpu-period=100000 --cpu-quota=600000 -f build/pkg-wrap.Containerfile --label "blockie.dirty=$dirty" -t "$tag" "$out"
     echo "$tag"
 
 pkg-push name:
