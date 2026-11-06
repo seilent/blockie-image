@@ -8,7 +8,7 @@ Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/bin/iw reg reload
 ExecStart=/usr/bin/iw reg set JP
-ExecStartPost=/bin/sh -c 'iw reg get | awk "/^global/ { g = 1; next } g && /^country / { print; exit }" | grep -q "^country JP:"'
+ExecStartPost=/bin/sh -c 'for i in 1 2 3 4 5 6 7 8 9 10; do iw reg get | awk "/^global/ { g = 1; next } g && /^country / { print; exit }" | grep -q "^country JP:" && exit 0; sleep 0.5; done; exit 1'
 
 [Install]
 WantedBy=multi-user.target
