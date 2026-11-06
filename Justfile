@@ -79,7 +79,9 @@ pkg-push name:
     repo=ghcr.io/seilent/blockie/pkg/$1
     api=/user/packages/container/blockie%2Fpkg%2F$1
     keys=${BLOCKIE_KEYS:-$HOME/keystores/blockie-cosign}
-    cosign=${COSIGN:-cosign}
+    cosign=$(command -v "${COSIGN:-$HOME/.local/bin/cosign-v2.6.3}") || { echo "no cosign: set COSIGN" >&2; exit 1; }
+    [[ $(sha256sum < "$cosign" | cut -d' ' -f1) == 7c78a7f2efc00088bd788a758db6e0928e79f3e0eb83eb5d3c499ed98da4c4f4 ]] ||
+      { echo "$cosign is not the pinned cosign 2.6.3" >&2; exit 1; }
     {{podman}} login --get-login ghcr.io > /dev/null
     if ! gh api "$api" > /dev/null 2>&1; then
       start=$(date -u +%Y-%m-%dT%H:%M:%SZ)
