@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: seilent <github@seilent.net>
+Date: Sat, 7 Nov 2026 09:00:00 +0900
+Subject: [PATCH] deploy: skip the SELinux policy refresh when the deployment disables SELinux
+
+---
+ src/libostree/ostree-sysroot-deploy.c | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+--- a/src/libostree/ostree-sysroot-deploy.c
++++ b/src/libostree/ostree-sysroot-deploy.c
+@@ -3407,6 +3407,21 @@ sysroot_finalize_selinux_policy (int deployment_dfd, GError **error)
+   if (errno != 0)
+     return TRUE;
+ 
++  g_autofree char *config
++      = glnx_file_get_contents_utf8_at (deployment_dfd, "etc/selinux/config", NULL, NULL, error);
++  if (!config)
++    return FALSE;
++  g_auto (GStrv) lines = g_strsplit (config, "\n", -1);
++  for (char **iter = lines; *iter; iter++)
++    {
++      if (!g_str_has_prefix (*iter, "SELINUX="))
++        continue;
++      if (g_ascii_strncasecmp (*iter + strlen ("SELINUX="), "disabled", strlen ("disabled")) != 0)
++        break;
++      ot_journal_print (LOG_INFO, "SELinux is disabled, skipping the policy refresh");
++      return TRUE;
++    }
++
+   /*
+    * Skip the SELinux policy refresh if the --refresh
+    * flag is not supported by semodule.

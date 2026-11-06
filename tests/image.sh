@@ -59,6 +59,9 @@ grep -qx 'enable blockie-\*' /usr/lib/systemd/system-preset/50-blockie.preset ||
 
 rpm -q systemd bootc ostree skopeo podman NetworkManager kmod > /dev/null || fail "base rpms missing"
 [[ $(rpm -q --qf '%{RELEASE}' bootc) == *.blockie ]] || fail "bootc is not the blockie build: $(rpm -q bootc)"
+for p in ostree ostree-libs; do
+  [[ $(rpm -q --qf '%{RELEASE}' "$p") == *.blockie ]] || fail "$p is not the blockie build: $(rpm -q "$p")"
+done
 rpm -q e2fsprogs erofs-utils vulkan-tools egl-utils drm-utils strace file procps-ng jq libwayland-client \
   libwayland-server NetworkManager-wifi wpa_supplicant iw wireless-regdb iperf3 bluez alsa-ucm alsa-ucm-utils \
   alsa-utils retroarch libretro-mgba libretro-pcsx-rearmed > /dev/null || fail "packages missing"

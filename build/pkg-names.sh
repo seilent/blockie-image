@@ -8,6 +8,11 @@ if (( ${#specs[@]} )); then
   awk '$1 == "Name:" { n = $2; print n } $1 == "%package" { print ($2 == "-n" ? $3 : n "-" $2) }' "${specs[@]}"
 elif [[ -f $dir/SOURCE.env ]]; then
   url=$(sed -n 's/^SRPM_URL=//p' "$dir/SOURCE.env")
+  rpms=$(sed -n 's/^RPMS="\(.*\)"$/\1/p' "$dir/SOURCE.env")
   f=${url##*/}
-  [[ -z $url ]] || echo "${f%-*-*.src.rpm}"
+  if [[ -n $url && -n $rpms ]]; then
+    tr -s ' ' '\n' <<< "$rpms"
+  elif [[ -n $url ]]; then
+    echo "${f%-*-*.src.rpm}"
+  fi
 fi

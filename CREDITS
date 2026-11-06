@@ -13,3 +13,5 @@ after HCI Reset) were found by https://github.com/snowopsdev/omarchy-iplay50-min
 https://github.com/Barley-Project/tb330fu-ubuntu (684d207f) and https://github.com/HuskerMinion/techo5 (2fa63874).
 packages/bootc: Fedora's bootc 1.17.1-1.fc44 source RPM (https://github.com/bootc-dev/bootc, Apache-2.0 or MIT),
 rebuilt with ipc-ns-not-found.patch.
+packages/ostree: Fedora's ostree 2026.4-1.fc44 source RPM (https://github.com/ostreedev/ostree, LGPL-2.0-or-later),
+rebuilt with selinux-disabled-skip.patch.
