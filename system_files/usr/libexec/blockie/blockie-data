@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+me=blockie-data
+die() { echo "$me: $*" >&2; exit 1; }
+
+sys=${BLOCKIE_SYS:-/sys}
+devdir=${BLOCKIE_DEV:-/dev}
+host=${BLOCKIE_SD_HOST:-11240000.mmc}
+target=${BLOCKIE_DATA_DIR:-/var/lib/blockie/data}
+label=BLOCKIE_DATA
+
+if mountpoint -q "$target"; then
+  echo "$me: $target is already mounted"
+  exit 0
+fi
+
+found=()
+shopt -s nullglob
+for p in "$sys"/class/block/mmcblk*p*; do
+  [[ -e $p/partition && -r $p/uevent ]] || continue
+  [[ $(sed -n 's/^PARTNAME=//p' "$p/uevent") == "$label" ]] || continue
+  [[ $(readlink -f "$p") == */"$host"/* ]] || continue
+  found+=("${p##*/}")
+done
+shopt -u nullglob
+(( ${#found[@]} == 1 )) || die "expected one $label partition on $host, found ${#found[@]} (${found[*]})"
+
+dev=$devdir/${found[0]}
+type=$(blkid -p -o value -s TYPE "$dev") || die "blkid cannot probe $dev"
+[[ $type == ext4 ]] || die "$dev is $type, not ext4"
+[[ $(blkid -p -o value -s LABEL "$dev") == "$label" ]] || die "$dev is not labelled $label"
+rc=0
+e2fsck -p "$dev" || rc=$?
+(( rc < 4 )) || die "e2fsck -p $dev exited $rc, not mounted"
+(( !(rc & 2) )) || echo "$me: e2fsck -p $dev fixed errors and asks for a reboot, mounting anyway"
+install -d -m 0755 "$target"
+mount -t ext4 -o rw,noatime,nodev,nosuid,noexec "$dev" "$target"
+echo "$me: $dev mounted at $target"
