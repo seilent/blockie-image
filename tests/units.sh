@@ -13,6 +13,8 @@ done
 for d in /usr/lib/udev/rules.d /etc/udev/rules.d; do
   [[ ! -e $d/99-blockie-emmc.rules ]] || fail "$d/99-blockie-emmc.rules has the name of the ramdisk eMMC rule"
 done
+cycles=$(systemd-analyze verify --man=no default.target 2>&1 | grep 'ordering cycle' | head -n 3 || true)
+[[ -z $cycles ]] || fail "ordering cycles in the default.target transaction: $cycles"
 
 units=()
 for u in /usr/lib/systemd/system/blockie-*; do
