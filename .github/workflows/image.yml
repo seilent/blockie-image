@@ -110,7 +110,7 @@ jobs:
         env:
           TAG: ${{ steps.version.outputs.push_tag }}
         run: |
-          for t in image units blobs; do
+          for t in image units blobs audio; do
             podman run --rm -v "$PWD/tests:/tests:ro" "$IMAGE:$TAG" "/tests/$t.sh"
           done
 

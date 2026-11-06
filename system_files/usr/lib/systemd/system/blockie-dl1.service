@@ -1,0 +1,13 @@
+[Unit]
+Description=Keep the DL1 playback buffer in DRAM
+DefaultDependencies=no
+After=systemd-udev-trigger.service
+Before=sysinit.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/blockie/dl1 set
+
+[Install]
+WantedBy=sysinit.target

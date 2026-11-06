@@ -1,0 +1,53 @@
+#!/bin/sh
+set -u
+export PATH=/usr/bin:/usr/sbin
+
+cards=${DL1_CARDS:-/proc/asound/cards}
+card=
+
+find_card() {
+    card=$(sed -n 's/^ *\([0-9][0-9]*\) \[mt6768mt6358 *\]:.*/\1/p' "$cards" 2> /dev/null | head -n 1)
+}
+
+value() {
+    amixer -c "$card" cget name=primary_play_scenario 2> /dev/null | sed -n 's/^  : values=//p'
+}
+
+case "${1:-}" in
+set)
+    n=0
+    while :; do
+        find_card
+        [ -n "$card" ] && [ -e "/dev/snd/controlC$card" ] && break
+        if [ "$n" -ge 20 ]; then
+            echo "dl1: no card mt6768mt6358 after 10 s" >&2
+            exit 2
+        fi
+        sleep 0.5
+        n=$((n + 1))
+    done
+    if ! amixer -q -c "$card" cset name=primary_play_scenario 1; then
+        echo "dl1: card $card: cset primary_play_scenario failed" >&2
+        exit 1
+    fi
+    v=$(value)
+    if [ "$v" != on ]; then
+        echo "dl1: card $card: primary_play_scenario reads '${v}' after the set" >&2
+        exit 1
+    fi
+    echo "dl1: card $card primary_play_scenario on"
+    ;;
+check)
+    find_card
+    [ -n "$card" ] || exit 0
+    v=$(value)
+    if [ "$v" != on ]; then
+        echo "dl1: card $card: primary_play_scenario reads '${v}', DL1 may use SRAM" >&2
+        exit 1
+    fi
+    ;;
+*)
+    echo "usage: dl1 set|check" >&2
+    exit 2
+    ;;
+esac

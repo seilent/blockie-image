@@ -1,0 +1,1 @@
+ACTION=="add", SUBSYSTEM=="sound", KERNEL=="controlC*", ATTRS{id}=="mt6768mt6358", RUN+="/usr/libexec/blockie/dl1 set"
