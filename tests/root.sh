@@ -21,6 +21,7 @@ done
 [[ -f $d/usr/lib/ld-linux-aarch64.so.1 ]] || fail "the loader is missing in the deployment"
 grep -qx 'container-image-reference=ostree-unverified-image:oci:/var/lib/blockie/oci:testing' "$d.origin" \
   || fail "origin: $(grep container-image-reference "$d.origin" || echo none)"
+cmp -s /etc/containers/policy.json "$d/etc/containers/policy.json" || fail "the deployment's policy.json is not the image's"
 
 [[ $(ostree config --repo "$t/ostree/repo" get sysroot.bootloader) == none ]] || fail "sysroot.bootloader is not none"
 csum=${d##*/}

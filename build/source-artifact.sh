@@ -71,7 +71,7 @@ if [[ $mode == full ]]; then
     fi
     printf '%s %s\n' "$f" "$url" >> "$tmp/origins"
   done < "$tmp/srpms"
-  echo "source-artifact: $(( $(wc -l < "$tmp/srpms") - ${#get[@]} / 2 )) source rpms from the cache, $(( ${#get[@]} / 2 )) from koji"
+  echo "source-artifact: $(( $(wc -l < "$tmp/srpms") - ${#get[@]} / 3 )) source rpms from the cache, $(( ${#get[@]} / 3 )) from koji"
   if (( ${#get[@]} )); then
     curl -fsSLg --retry 5 --retry-all-errors --parallel --parallel-max 8 "${get[@]}" || fail "source rpm download failed"
   fi

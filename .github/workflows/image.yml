@@ -258,8 +258,11 @@ jobs:
             -E lazy_itable_init=0,lazy_journal_init=0,nodiscard -L "$FS_LABEL" -U "$FS_UUID" "$img"
           sudo mkdir -p /mnt/target
           sudo mount -o loop "$img" /mnt/target
+          jq '.transports["containers-storage"] = {"": [{"type": "insecureAcceptAnything"}]}' \
+            system_files/etc/containers/policy.json > "$RUNNER_TEMP/install-policy.json"
           sudo podman run --rm --privileged --pid=host --security-opt label=type:unconfined_t \
             -v /dev:/dev -v /var/lib/containers:/var/lib/containers -v /mnt/target:/target \
+            -v "$RUNNER_TEMP/install-policy.json:/etc/containers/policy.json:ro" \
             "$IMAGE@$DIGEST" bootc install to-filesystem --bootloader none --stateroot "$STATEROOT" \
             --disable-selinux --skip-fetch-check --target-transport oci --target-imgref "$TARGET_IMGREF" /target
           sudo podman run --rm -v /mnt/target:/target:ro -v "$PWD/tests:/tests:ro" "$IMAGE@$DIGEST" \
