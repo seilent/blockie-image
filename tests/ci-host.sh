@@ -446,7 +446,7 @@ is "$rc" 0 && cached 'alpha-1.0-1.fc44.src.rpm '; res $? "cache: a blob that can
 seal_setup() {
   setup "$1"
   local tool
-  for tool in head sha256sum tee cut mktemp rm cat; do
+  for tool in head sha256sum tee cut mktemp rm cat date; do
     ln -sf "$(command -v "$tool")" "$bin/$tool"
   done
   zip=$(command -v pigz || command -v gzip)
@@ -467,7 +467,7 @@ seal_run
 want=$(printf 'ROOT_GZ_SHA=%s\nROOT_SHA=%s\nROOT_HEAD_SHA=%s\nROOT_BODY_SHA=%s' \
   "$(sha256sum < "$d/root.ext4.gz" | cut -d' ' -f1)" "$(sha256sum < "$img" | cut -d' ' -f1)" \
   "$(head -c 1048576 "$img" | sha256sum | cut -d' ' -f1)" "$(tail -c +1048577 "$img" | sha256sum | cut -d' ' -f1)")
-is "$rc" 0 && is "$out" "$want" && cmp -s <("$zip" -dc "$d/root.ext4.gz") "$img"; res $? "seal: the four sha256s equal separate passes and the gz unpacks to the image"
+is "$rc" 0 && is "$out" "$want" && cmp -s <("$zip" -dc "$d/root.ext4.gz") "$img" && grep -qE '^root-seal: ms from start: head [0-9]+, whole [0-9]+, body [0-9]+, compress [0-9]+, unpack [0-9]+, gz sha256 [0-9]+$' "$d/err"; res $? "seal: the four sha256s equal separate passes, the gz unpacks to the image, the part times are printed"
 
 seal_setup r_badunpack
 fake pigz "if [[ \$1 == -dc ]]; then '$zip' -dc | tr '\\0' x; else exec '$zip' \"\$@\"; fi"

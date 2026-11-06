@@ -6,12 +6,16 @@ gz=${2:?usage: root-seal.sh <image> <gz out>}
 tmp=$(mktemp -d)
 trap 'rm -rf "${tmp:?}"' EXIT
 
+start=$(date +%s%N)
+mark() { echo $(( ($(date +%s%N) - start) / 1000000 )) > "$tmp/ms.$1"; }
+
 head -c 1048576 "$img" | sha256sum > "$tmp/head"
-sha256sum < "$img" > "$tmp/whole" &
+mark head
+{ sha256sum < "$img" > "$tmp/whole"; mark whole; } &
 p1=$!
-tail -c +1048577 "$img" | sha256sum > "$tmp/body" &
+{ tail -c +1048577 "$img" | sha256sum > "$tmp/body"; mark body; } &
 p2=$!
-pigz -1 -c "$img" | tee "$gz" | pigz -dc | sha256sum > "$tmp/unpack" &
+{ pigz -1 -c "$img" | { tee "$gz"; mark compress; } | pigz -dc | sha256sum > "$tmp/unpack"; mark unpack; } &
 p3=$!
 rc=0
 for p in "$p1" "$p2" "$p3"; do
@@ -19,6 +23,8 @@ for p in "$p1" "$p2" "$p3"; do
 done
 (( rc == 0 )) || { echo "::error::root-seal: hashing or compressing $img failed" >&2; exit 1; }
 sha256sum < "$gz" > "$tmp/gz"
+mark gz
+echo "root-seal: ms from start: head $(< "$tmp/ms.head"), whole $(< "$tmp/ms.whole"), body $(< "$tmp/ms.body"), compress $(< "$tmp/ms.compress"), unpack $(< "$tmp/ms.unpack"), gz sha256 $(< "$tmp/ms.gz")" >&2
 
 sum() {
   local s
