@@ -1,0 +1,7 @@
+packages/blk-wmt: the loader and launcher sequence follows mtk-wmt-init.c from
+https://github.com/snowopsdev/omarchy-iplay50-mini-pro (b7fa1570, GPL-2.0). Ioctl numbers and the patch info layouts
+follow MediaTek's WMT driver (wmt_detect.h, wmt_dev.c, wmt_lib.h, GPL-2.0) as published in
+https://github.com/MotorolaMobilityLLC/vendor-mediatek-kernel_modules-connectivity-common (android-15-release-vvob35,
+2993f4be). The NVRAM and Wi-Fi power on writes follow MediaTek's wmt_cdev_wifi.c (GPL-2.0, Dual BSD/GPL module) as
+published in https://github.com/MotorolaMobilityLLC/vendor-mediatek-kernel_modules-connectivity-wlan-adaptor
+(android-15-release-vvob35, 11353556).

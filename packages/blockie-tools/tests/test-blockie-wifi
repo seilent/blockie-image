@@ -1,0 +1,229 @@
+#!/bin/sh
+set -u
+
+script=$(readlink -f "${WIFI_SCRIPT:-$(dirname "$0")/blockie-wifi}")
+if [ "$(id -u)" = 0 ]; then
+    echo "test-blockie-wifi: refuses to run as root"
+    exit 1
+fi
+top=$(mktemp -d "${TMPDIR:-/tmp}/test-blockie-wifi.XXXXXX")
+trap 'rm -rf "${top:?}"' EXIT
+fails=0
+boot=6f1c5e2a-0d3b-4c8e-9a71-2b4f0e9d1c33
+deps="aee_aed pmic_lbat_service emimpu mtk_disp_notify cfg80211 btif_drv conn_md_drv connadp"
+
+res() {
+    if [ "$1" = 0 ]; then
+        echo "ok   $2"
+    else
+        echo "FAIL $2"
+        fails=$((fails + 1))
+    fi
+}
+
+setup() {
+    d=$top/$1
+    mkdir -p "$d/bin" "$d/proc/sys/kernel/random" "$d/sys/class/net" "$d/run/wmt/$boot" "$d/fw" "$d/mods" "$d/nv"
+    echo "$boot" > "$d/proc/sys/kernel/random/boot_id"
+    echo "123.45 100.00" > "$d/proc/uptime"
+    : > "$d/proc/modules"
+    for m in $deps; do
+        echo "$m 16384 0 - Live 0x0" >> "$d/proc/modules"
+    done
+    echo 0123456789abcdef > "$d/run/nonce"
+    : > "$d/fw/WMT_SOC.cfg"
+    printf '\001\000\001\000\002\000\000\000\000\020' > "$d/nv/WIFI"
+    head -c 2040 /dev/zero >> "$d/nv/WIFI"
+    : > "$d/calls"
+    : > "$d/kmsg"
+    cat > "$d/bin/insmod" << 'EOF'
+#!/bin/sh
+echo "insmod $*" >> "$FAKE_DIR/calls"
+n=$(basename "$1" .ko)
+[ "${FAKE_INSMOD_FAIL:-}" = "$n" ] && { echo "insmod: can't insert '$1': fake"; exit 1; }
+echo "$n 16384 0 - Live 0x0" >> "$FAKE_DIR/proc/modules"
+EOF
+    cat > "$d/bin/blk-wmt" << 'EOF'
+#!/bin/sh
+while [ $# -gt 0 ]; do
+    case $1 in
+    -p|-r) shift 2 ;;
+    *) break ;;
+    esac
+done
+cmd=$1
+shift
+echo "blk-wmt $cmd${*:+ $*}" >> "$FAKE_DIR/calls"
+case $cmd in
+start) echo 4242 > "$FAKE_DIR/run/wmt/$FAKE_BOOT/pid"; exit "${FAKE_START_RC:-0}" ;;
+nvram)
+    for f in "$@"; do
+        [ -e "$f" ] || continue
+        [ -f "$f" ] || exit 1
+        echo "$f" > "$FAKE_DIR/run/wmt/$FAKE_BOOT/nvram"
+        exit "${FAKE_NVRAM_RC:-0}"
+    done
+    exit 1 ;;
+wifi-on)
+    [ "${FAKE_WIFI_RC:-0}" = 0 ] || exit "$FAKE_WIFI_RC"
+    [ -n "${FAKE_NO_WLAN0:-}" ] && exit 0
+    mkdir -p "$FAKE_DIR/sys/class/net/wlan0"
+    echo "${FAKE_MAC:-02:00:00:00:00:10}" > "$FAKE_DIR/sys/class/net/wlan0/address"
+    exit 0 ;;
+esac
+exit 9
+EOF
+    cat > "$d/bin/dmesg" << 'EOF'
+#!/bin/sh
+echo "[ 1.0] [WMT-CORE][I]wmt_core_hw_check: get hwcode (0x6768)"
+echo "[ 2.0] [wlan][650]wlanProbe:(INIT INFO) wlanProbe: probe success, feature set: 0x8488141a"
+echo "[ 2.1] [MTK-WIFI] WIFI_write[I]: WMT turn on WIFI success!"
+echo "[ 2.2] blockie: 0123456789abcdef wifi up=1 fake wlanProbe: probe success"
+EOF
+    chmod +x "$d/bin/insmod" "$d/bin/blk-wmt" "$d/bin/dmesg"
+}
+
+go() {
+    env PATH="$d/bin:$PATH" FAKE_DIR="$d" FAKE_BOOT="$boot" BLK_WMT="$d/bin/blk-wmt" WIFI_FW="$d/fw" WIFI_MODULES="$d/mods" WIFI_RUN="$d/run" \
+        WIFI_PROC="$d/proc" WIFI_SYS="$d/sys" WIFI_LOG="$d/kmsg" WIFI_NVRAM_RUN="$d/nv/RUN" WIFI_NVRAM="$d/nv/WIFI" WIFI_NVRAM_FALLBACK="$d/nv/FALLBACK" \
+        WIFI_WAIT=1 "$@" "$script" > "$d/out" 2>&1
+    echo $?
+}
+
+has() {
+    grep -q -- "$1" "$d/kmsg"
+    echo $?
+}
+
+setup happy
+rc=$(go)
+res "$rc" "happy path exits 0"
+want="insmod $d/mods/wmt_drv.ko
+blk-wmt start
+insmod $d/mods/wmt_chrdev_wifi.ko
+insmod $d/mods/wlan_drv_gen4m.ko
+blk-wmt nvram $d/nv/RUN $d/nv/WIFI $d/nv/FALLBACK
+blk-wmt wifi-on"
+[ "$(cat "$d/calls")" = "$want" ]
+res $? "order: wmt_drv, start, wmt_chrdev_wifi, wlan_drv_gen4m, nvram, wifi-on"
+res "$(has 'blockie: 0123456789abcdef wifi up=123.45 pre deps=ok nvram=mnt')" "pre marker with nonce and uptime, ramdisk nvdata path"
+res "$(has 'dmesg hwcode=1 probe_success=1 wifi_on_success=1')" "dmesg counts skip blockie markers"
+res "$(has 'wlan0 after_s=0 mac_match=yes')" "wlan0 MAC equals NVRAM bytes 4 to 9"
+res "$(has 'result rc=0 wlan0=yes mac_match=yes launcher_pid=4242')" "result marker"
+cmp -s "$d/out" "$d/kmsg"
+res $? "stdout carries the same markers"
+[ "$(grep -c 'blockie: ' "$d/kmsg")" = "$(wc -l < "$d/kmsg")" ]
+res $? "every log line is a marker"
+
+setup deps
+sed -i '/^cfg80211 /d; /^connadp /d' "$d/proc/modules"
+rc=$(go)
+[ "$rc" = 1 ] && [ ! -s "$d/calls" ]
+res $? "missing deps exit 1 before any call"
+res "$(has 'result rc=1 why=deps_missing missing=cfg80211,connadp')" "missing deps named"
+
+setup early
+echo "wlan_drv_gen4m 16384 0 - Live 0x0" >> "$d/proc/modules"
+rc=$(go)
+[ "$rc" = 1 ] && [ ! -s "$d/calls" ]
+res $? "gen4m loaded before the loader stage exits 1 before any call"
+res "$(has 'why=loaded_early ko=wlan_drv_gen4m')" "early load named"
+
+setup nonv
+rm "$d/nv/WIFI"
+rc=$(go)
+[ "$rc" = 1 ] && [ ! -s "$d/calls" ]
+res $? "no NVRAM file exits 1 before any call"
+
+setup fallback
+mv "$d/nv/WIFI" "$d/nv/FALLBACK"
+rc=$(go)
+res "$rc" "fallback NVRAM path exits 0"
+res "$(has 'pre deps=ok nvram=fallback')" "fallback named in the pre marker"
+res "$(has "nvram rc=0 file=$d/nv/FALLBACK")" "fallback file pushed"
+
+setup runpath
+cp "$d/nv/WIFI" "$d/nv/RUN"
+rc=$(go)
+res "$rc" "systemd nvdata path exits 0"
+res "$(has 'pre deps=ok nvram=run')" "systemd nvdata path named in the pre marker"
+res "$(has "nvram rc=0 file=$d/nv/RUN")" "the systemd nvdata file is pushed before the ramdisk one"
+
+setup runonly
+mv "$d/nv/WIFI" "$d/nv/RUN"
+rc=$(go)
+[ "$rc" = 0 ] && [ "$(has 'pre deps=ok nvram=run')" = 0 ] && [ "$(has "nvram rc=0 file=$d/nv/RUN")" = 0 ] &&
+    [ "$(has 'mac_match=yes')" = 0 ]
+res $? "only the systemd nvdata path present: pushed, MAC compared from it"
+
+setup rundir
+mkdir "$d/nv/RUN"
+rc=$(go)
+[ "$rc" = 4 ] && [ "$(has 'pre deps=ok nvram=run')" = 0 ] && [ "$(has 'nvram rc=1 file=-')" = 0 ] &&
+    ! grep -q wifi-on "$d/calls"
+res $? "a directory at the systemd nvdata path fails closed at the push, marker and blk-wmt agree"
+
+setup mntonly
+rc=$(go)
+[ "$rc" = 0 ] && [ "$(has 'pre deps=ok nvram=mnt')" = 0 ] && [ "$(has "nvram rc=0 file=$d/nv/WIFI")" = 0 ]
+res $? "only the ramdisk nvdata path present: pushed"
+
+setup startfail
+rc=$(go FAKE_START_RC=4)
+[ "$rc" = 2 ] && ! grep -q chrdev "$d/calls"
+res $? "start refusal exits 2, no wifi modules loaded"
+res "$(has 'why=start start_rc=4')" "start rc in the result"
+
+setup insmodfail
+rc=$(go FAKE_INSMOD_FAIL=wlan_drv_gen4m)
+[ "$rc" = 3 ] && ! grep -q "blk-wmt nvram" "$d/calls"
+res $? "gen4m insmod failure exits 3 before nvram"
+res "$(has "insmod ko=wlan_drv_gen4m rc=1 insmod: can't insert")" "insmod error on one marker line"
+
+setup nvfail
+rc=$(go FAKE_NVRAM_RC=2)
+[ "$rc" = 4 ] && ! grep -q wifi-on "$d/calls"
+res $? "nvram failure exits 4, no wifi-on"
+
+setup wififail
+rc=$(go FAKE_WIFI_RC=4)
+res "$([ "$rc" = 5 ]; echo $?)" "wifi-on refusal exits 5"
+
+setup nowlan
+rc=$(go FAKE_NO_WLAN0=1)
+res "$([ "$rc" = 6 ]; echo $?)" "no wlan0 exits 6"
+
+setup mac
+rc=$(go FAKE_MAC=02:00:00:00:00:01)
+[ "$rc" = 7 ] && ! grep -q '02:00:00:00:00:01' "$d/kmsg"
+res $? "MAC mismatch exits 7 and logs no MAC"
+
+for step in START:2:start NVRAM:4:nvram WIFI:5:wifi_on; do
+    setup "unrecorded-${step##*:}"
+    rc=$(go "FAKE_${step%%:*}_RC=5")
+    want=${step#*:}
+    want=${want%%:*}
+    [ "$rc" = "$want" ] && [ "$(has "why=${step##*:} ${step##*:}_rc=5 state_write=failed")" = 0 ]
+    res $? "blk-wmt rc 5 at ${step##*:} ends the script with state_write=failed"
+done
+
+setup verdict
+rc=$(go FAKE_START_RC=3)
+[ "$rc" = 2 ] && [ "$(has 'why=start start_rc=3')" = 0 ] && ! grep -q chrdev "$d/calls"
+res $? "start without a verdict (rc 3) ends the script before the wifi modules"
+
+setup rerun
+rc=$(go FAKE_NVRAM_RC=2)
+: > "$d/calls"
+rc=$(go)
+[ "$rc" = 1 ] && [ "$(has 'why=loaded_early ko=wmt_chrdev_wifi')" = 0 ] && [ ! -s "$d/calls" ]
+res $? "a rerun after a partial run is refused before any call"
+
+setup badboot
+echo "../x" > "$d/proc/sys/kernel/random/boot_id"
+rc=$(go)
+[ "$rc" = 1 ] && [ "$(has 'why=boot_id')" = 0 ] && [ ! -s "$d/calls" ]
+res $? "a bad boot id stops before any call"
+
+echo "$fails failures"
+[ "$fails" = 0 ]

@@ -21,7 +21,17 @@ env:
   PUBKEY: system_files/usr/share/blockie/keys/blockie.pub
 
 jobs:
+  packages:
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/packages.yml
+    secrets:
+      SIGNING_SECRET: ${{ secrets.SIGNING_SECRET }}
+      SIGNING_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
+
   image:
+    needs: packages
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     permissions:
@@ -110,7 +120,7 @@ jobs:
         env:
           TAG: ${{ steps.version.outputs.push_tag }}
         run: |
-          for t in image units blobs audio; do
+          for t in image units blobs audio wifi; do
             podman run --rm -v "$PWD/tests:/tests:ro" "$IMAGE:$TAG" "/tests/$t.sh"
           done
 

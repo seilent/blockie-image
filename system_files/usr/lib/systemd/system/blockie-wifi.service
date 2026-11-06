@@ -1,0 +1,17 @@
+[Unit]
+Description=Power on the MT6768 Wi-Fi through blk-wmt
+After=vendor.mount run-vendor-nvdata.mount
+Before=blockie-regdom.service NetworkManager.service
+ConditionPathExists=/vendor/firmware/WMT_SOC.cfg
+ConditionPathIsDirectory=/run/blockie
+RefuseManualStop=yes
+IgnoreOnIsolate=yes
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/blockie/blockie-wifi
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target

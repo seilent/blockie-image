@@ -1,0 +1,139 @@
+#!/bin/sh
+set -uf
+trap '' HUP
+
+PATH=/blockie/bin:$PATH:/usr/sbin:/usr/bin:/sbin:/bin
+here=$(cd "$(dirname "$0")" && pwd)
+bin=${BLK_WMT:-$here/blk-wmt}
+fw=${WIFI_FW:-/vendor/firmware}
+mods=${WIFI_MODULES:-/vendor/lib/modules}
+run=${WIFI_RUN:-/run/blockie}
+proc=${WIFI_PROC:-/proc}
+sys=${WIFI_SYS:-/sys}
+logs=${WIFI_LOG:-/dev/kmsg /dev/pmsg0}
+runnv=${WIFI_NVRAM_RUN:-/run/vendor/nvdata/APCFG/APRDEB/WIFI}
+live=${WIFI_NVRAM:-/mnt/vendor/nvdata/APCFG/APRDEB/WIFI}
+fallback=${WIFI_NVRAM_FALLBACK:-/vendor/nvdata-fallback/APCFG/APRDEB/WIFI}
+wait_s=${WIFI_WAIT:-30}
+hold=${WIFI_HOLD:-0}
+nonce=${BLOCKIE_NONCE:-$(cat "$run/nonce" 2> /dev/null)}
+boot=$(cat "$proc/sys/kernel/random/boot_id" 2> /dev/null)
+st=$run/wmt/$boot
+deps="aee_aed pmic_lbat_service emimpu mtk_disp_notify cfg80211 btif_drv conn_md_drv connadp"
+
+m() {
+    line="blockie: ${nonce:--} wifi up=$(cut -d' ' -f1 "$proc/uptime") $*"
+    echo "$line"
+    for f in $logs; do
+        [ -w "$f" ] && echo "$line" >> "$f" 2> /dev/null
+    done
+}
+
+end() {
+    rc=$1
+    shift
+    m "result rc=$rc $*"
+    exit "$rc"
+}
+
+loaded() {
+    grep -q "^$1 " "$proc/modules"
+}
+
+load() {
+    if loaded "$1"; then
+        m "insmod ko=$1 already=1"
+        return 0
+    fi
+    out=$(insmod "$mods/$1.ko" 2>&1)
+    rc=$?
+    m "insmod ko=$1 rc=$rc" $out
+    [ "$rc" = 0 ]
+}
+
+wmt() {
+    "$bin" -p "$fw" -r "$run" "$@"
+}
+
+unrecorded() {
+    [ "$1" = 5 ] && echo state_write=failed
+}
+
+count() {
+    printf '%s\n' "$dm" | grep -c -- "$1"
+}
+
+m "start bin=$bin fw=$fw mods=$mods"
+[ -x "$bin" ] || end 1 why=no_blk_wmt
+case $boot in
+"" | *[!0-9a-f-]*) end 1 why=boot_id ;;
+esac
+[ -f "$fw/WMT_SOC.cfg" ] || end 1 why=no_firmware
+missing=
+for d in $deps; do
+    loaded "$d" || missing="$missing${missing:+,}$d"
+done
+[ -z "$missing" ] || end 1 why=deps_missing missing="$missing"
+for d in wmt_chrdev_wifi wlan_drv_gen4m; do
+    loaded "$d" && end 1 why=loaded_early ko="$d"
+done
+if [ -e "$runnv" ]; then
+    src=run
+elif [ -e "$live" ]; then
+    src=mnt
+elif [ -e "$fallback" ]; then
+    src=fallback
+else
+    end 1 why=no_nvram
+fi
+m "pre deps=ok nvram=$src"
+
+load wmt_drv || end 3 why=insmod ko=wmt_drv
+wmt start
+rc=$?
+m "start rc=$rc"
+[ "$rc" = 0 ] || end 2 why=start start_rc="$rc" $(unrecorded "$rc")
+load wmt_chrdev_wifi || end 3 why=insmod ko=wmt_chrdev_wifi
+load wlan_drv_gen4m || end 3 why=insmod ko=wlan_drv_gen4m
+wmt nvram "$runnv" "$live" "$fallback"
+rc=$?
+used=$(cat "$st/nvram" 2> /dev/null)
+m "nvram rc=$rc file=${used:--}"
+[ "$rc" = 0 ] || end 4 why=nvram nvram_rc="$rc" $(unrecorded "$rc")
+wmt wifi-on
+rc=$?
+m "wifi_on rc=$rc"
+[ "$rc" = 0 ] || end 5 why=wifi_on wifi_on_rc="$rc" $(unrecorded "$rc")
+
+i=0
+while [ ! -e "$sys/class/net/wlan0" ] && [ "$i" -lt "$wait_s" ]; do
+    sleep 1
+    i=$((i + 1))
+done
+dm=$(dmesg 2> /dev/null | grep -v 'blockie: ')
+m "dmesg hwcode=$(count 'wmt_core_hw_check: get hwcode') probe_success=$(count 'wlanProbe: probe success')" \
+    "wifi_on_success=$(count 'WMT turn on WIFI success') nvram_handler=$(count 'Wi-Fi handler = ')" \
+    "host_mac=$(count 'Using host-supplied MAC address') nvram_not_ready=$(count 'not ready for write NVRAM')"
+[ -e "$sys/class/net/wlan0" ] || end 6 why=no_wlan0 wait_s="$wait_s"
+mac=$(cat "$sys/class/net/wlan0/address" 2> /dev/null)
+set -- $(od -A n -t x1 -j 4 -N 6 "$used" 2> /dev/null)
+want=
+[ $# = 6 ] && want="$1:$2:$3:$4:$5:$6"
+if [ -z "$want" ] || [ -z "$mac" ]; then
+    match=unknown
+elif [ "$mac" = "$want" ]; then
+    match=yes
+else
+    match=no
+fi
+m "wlan0 after_s=$i mac_match=$match"
+[ "$match" = no ] && end 7 why=mac_mismatch
+pid=$(cat "$st/pid" 2> /dev/null)
+m "result rc=0 wlan0=yes mac_match=$match launcher_pid=${pid:--}"
+if [ "$hold" = 1 ] && [ -n "$pid" ]; then
+    while kill -0 "$pid" 2> /dev/null; do
+        sleep 5
+    done
+    m "hold launcher_exit pid=$pid"
+fi
+exit 0

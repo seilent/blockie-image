@@ -1,0 +1,14 @@
+[Unit]
+Description=Load the Wi-Fi regulatory database and set the country to JP
+After=blockie-wifi.service
+Before=NetworkManager.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/iw reg reload
+ExecStart=/usr/bin/iw reg set JP
+ExecStartPost=/bin/sh -c 'iw reg get | grep -q "^country JP"'
+
+[Install]
+WantedBy=multi-user.target

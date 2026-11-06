@@ -1,0 +1,562 @@
+#!/usr/bin/env python3
+import os
+import re
+import select
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import tty
+
+BIN = os.path.abspath(sys.argv[1]) if len(sys.argv) == 2 else sys.exit("usage: test-wmt <blk-wmt test build>")
+BOOT = "6f1c5e2a-0d3b-4c8e-9a71-2b4f0e9d1c33"
+OLD = "00000000-0000-0000-0000-000000000000"
+fails = []
+daemons = []
+
+UNIT = {
+    "soc1_0_patch_mcu_1a_1_hdr.bin": (0x00, [0x11, 0xC0, 0x01, 0x00, 0xF9, 0x16, 0xFF, 0xFF]),
+    "soc1_0_ram_bt_1a_1_hdr.bin": (0x00, [0x11, 0x00, 0x08, 0xF0, 0x00, 0x00, 0x00, 0x00]),
+    "soc1_0_ram_mcu_1a_1_hdr.bin": (0x00, [0x11, 0x00, 0x00, 0xF0, 0x00, 0x00, 0x00, 0x04]),
+    "soc1_0_ram_wifi_1a_1_hdr.bin": (0x00, [0x11, 0x00, 0x14, 0xF0, 0x00, 0x00, 0x00, 0x03]),
+}
+
+DECOYS = {
+    "soc1_0_ram_gps_1a_1_hdr.bin": (0x01, [0x11, 0x00, 0x20, 0xF0, 0, 0, 0, 0x02]),
+    "soc1_0_ram_fm_1a_1_hdr.bin": (0x00, [0x11, 0x00, 0x30, 0x00, 0, 0, 0, 0x01]),
+    "soc1_0_ram_ant_1a_1_hdr.bin": (0x00, [0x11, 0x00, 0x40, 0xF0, 0, 0, 0, 0x06]),
+    "soc2_2_ram_wifi_1d_1_hdr.bin": (0x00, [0x11, 0x00, 0x50, 0xF0, 0, 0, 0, 0x03]),
+    "soc1_0_ram_wifi_1a_1.cfg": (0x00, [0x11, 0x00, 0x60, 0xF0, 0, 0, 0, 0x03]),
+    "soc1_0_patch_mcu_1b_1_hdr.bin": (0x01, [0x11, 0xC0, 0x02, 0x00, 0, 0, 0, 0]),
+    "WIFI_RAM_CODE_soc1_0_1a_1.bin": (0x00, [0x11, 0x00, 0x70, 0xF0, 0, 0, 0, 0x03]),
+}
+
+LOADER = [
+    "ioctl 0x8004770a 0x0",
+    "ioctl 0x80047706 0x0",
+    "ioctl 0x80047703 0x0",
+    "ioctl 0x40047701 0x6768",
+    "ioctl 0x80047705 0x6768",
+    "ioctl 0x80047704 0x6768",
+    "ioctl 0x80047709 0x0",
+    "ioctl 0x8004a016 0x0",
+    "ioctl 0x4004a005 0x23",
+    "ioctl 0x4004a00d 0x0",
+]
+
+ROM = [
+    "rom 0 000008f0 soc1_0_ram_bt_1a_1_hdr.bin",
+    "rom 4 000000f0 soc1_0_ram_mcu_1a_1_hdr.bin",
+    "rom 3 000014f0 soc1_0_ram_wifi_1a_1_hdr.bin",
+]
+
+
+def check(ok, what):
+    print(("ok   " if ok else "FAIL ") + what, flush=True)
+    if not ok:
+        fails.append(what)
+
+
+def header(ver, info):
+    h = bytearray(0x40)
+    h[0x16] = 0x8A
+    h[0x17] = ver
+    h[0x18:0x20] = bytes(info)
+    return bytes(h)
+
+
+def pair():
+    m, s = os.openpty()
+    tty.setraw(s)
+    return m, s
+
+
+class Env:
+    def __init__(self, top, name, fw=None, nodes=("wmtdetect", "stpwmt", "wmtWifi"), rundir=True):
+        self.d = os.path.join(top, name)
+        os.makedirs(self.d)
+        self.dev = self.sub("dev")
+        self.run = os.path.join(self.d, "run")
+        if rundir:
+            os.makedirs(self.run)
+        self.sub("sys/class")
+        self.sys = os.path.join(self.d, "sys")
+        self.fw = self.sub("fw")
+        self.nv = self.sub("nv")
+        self.boot = os.path.join(self.d, "boot_id")
+        self.kmsg = os.path.join(self.d, "kmsg")
+        self.trace = os.path.join(self.d, "trace")
+        self.hold = os.path.join(self.d, "hold")
+        with open(self.boot, "w") as f:
+            f.write(BOOT + "\n")
+        open(self.kmsg, "w").close()
+        for n, (ver, info) in (fw if fw is not None else {**UNIT, **DECOYS}).items():
+            with open(os.path.join(self.fw, n), "wb") as f:
+                f.write(header(ver, info))
+        self.wmt_m, self.wmt_s = pair()
+        self.wifi_m, self.wifi_s = pair()
+        targets = {"wmtdetect": "/dev/null", "stpwmt": os.ttyname(self.wmt_s), "wmtWifi": os.ttyname(self.wifi_s)}
+        for n in nodes:
+            os.symlink(targets[n], os.path.join(self.dev, n))
+        self.env = dict(os.environ, FAKE_TRACE=self.trace, FAKE_HOLD=self.hold)
+
+    def sub(self, p):
+        q = os.path.join(self.d, p)
+        os.makedirs(q, exist_ok=True)
+        return q
+
+    def argv(self, *args, wait="10"):
+        return [BIN, "-p", self.fw, "-d", self.dev, "-r", self.run, "-s", self.sys, "-b", self.boot, "-k", self.kmsg, "-n", "1",
+                "-w", wait] + list(args)
+
+    def run_(self, *args, wait="10", timeout=30, **extra):
+        r = subprocess.run(self.argv(*args, wait=wait), env=dict(self.env, **extra), capture_output=True, text=True,
+                           timeout=timeout)
+        self.track()
+        return r
+
+    def popen(self, *args, wait="10", **extra):
+        return subprocess.Popen(self.argv(*args, wait=wait), env=dict(self.env, **extra), stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+
+    def track(self):
+        p = self.state("pid")
+        if p and int(p) not in daemons:
+            daemons.append(int(p))
+
+    def state(self, name, boot=BOOT):
+        try:
+            with open(os.path.join(self.run, "wmt", boot, name)) as f:
+                return f.read().strip()
+        except OSError:
+            return None
+
+    def lines(self):
+        try:
+            with open(self.trace) as f:
+                return f.read().splitlines()
+        except OSError:
+            return []
+
+    def log(self):
+        try:
+            with open(self.kmsg) as f:
+                return f.read()
+        except OSError:
+            return ""
+
+    def ask(self, cmd):
+        os.write(self.wmt_m, cmd.encode())
+        return read(self.wmt_m, 64, 5)
+
+
+def read(fd, want, secs):
+    out = b""
+    end = time.time() + secs
+    while len(out) < want and time.time() < end:
+        r, _, _ = select.select([fd], [], [], 0.2)
+        if r:
+            out += os.read(fd, 4096)
+            if want == 64:
+                break
+    return out
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    try:
+        with open("/proc/%d/stat" % pid) as f:
+            return f.read().split(") ")[1][0] != "Z"
+    except OSError:
+        return False
+
+
+def started(e, **extra):
+    open(e.hold, "w").close()
+    r = e.run_("start", **extra)
+    return r
+
+
+def usage(top):
+    e = Env(top, "usage")
+    for args in ([], ["bogus"], ["start", "x"], ["wifi-on", "x"], ["-n", "abc", "start"], ["-w", "-1", "start"], ["-x", "start"]):
+        r = e.run_(*args)
+        check(r.returncode == 2 and "usage:" in r.stderr, "usage exit 2 for %s" % (" ".join(args) or "no args"))
+    check(not e.lines(), "usage touches no device")
+
+
+def no_rundir(top):
+    e = Env(top, "norun", rundir=False)
+    r = e.run_("start")
+    check(r.returncode == 1 and "run dir" in r.stderr, "missing run dir exits 1")
+    check(not e.lines() and not os.path.exists(e.run), "missing run dir touches nothing")
+
+
+def no_detect(top):
+    e = Env(top, "nodetect", nodes=("stpwmt", "wmtWifi"))
+    r = e.run_("start")
+    check(r.returncode == 1, "no wmtdetect exits 1")
+    check(e.state("once.power") is None and not e.lines(), "no wmtdetect claims no power marker and sends no ioctl")
+    os.makedirs(os.path.join(e.sys, "class", "wmtdrv", "wmtdetect"))
+    with open(os.path.join(e.sys, "class", "wmtdrv", "wmtdetect", "dev"), "w") as f:
+        f.write("154:0\n")
+    r = e.run_("start")
+    want = "mknod %s/wmtdetect c 154 0" % e.dev
+    check(r.returncode == 1 and want in e.log(), "sysfs fallback finds 154:0 and tries the mknod")
+    check(e.state("once.power") is None, "failed mknod claims no power marker")
+
+
+def happy(top):
+    e = Env(top, "happy")
+    p = e.popen("start")
+    time.sleep(0.5)
+    rom = e.ask("srh_rom_patch")
+    pat = e.ask("srh_patch")
+    upd = e.ask("update_patch_version")
+    bad = e.ask("dump_fwemi_log")
+    open(e.hold, "w").close()
+    try:
+        out, err = p.communicate(timeout=15)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        out, err = p.communicate()
+    e.track()
+    check(p.returncode == 0, "start exits 0 after the power on (rc %s)" % p.returncode)
+    check(rom == b"ok", "srh_rom_patch answered ok (%r)" % rom)
+    check(pat == b"ok", "srh_patch answered ok (%r)" % pat)
+    check(upd == b"ok", "update_patch_version answered ok (%r)" % upd)
+    check(bad == b"cmd not found", "unknown command answered cmd not found (%r)" % bad)
+    t = e.lines()
+    io = [x for x in t if x.startswith("ioctl ") and not x.startswith("ioctl 0x8004a00c")]
+    check(io[: len(LOADER)] == LOADER, "loader and launcher ioctl order")
+    check(t.count("ioctl 0x4004a007 0x2") == 1 and not [x for x in t if x.startswith("ioctl 0x4004a007") and x != "ioctl 0x4004a007 0x2"],
+          "LPBK_POWER_CTRL(2) exactly once, no power off")
+    check(sorted(x for x in t if x.startswith("rom ")) == sorted(ROM), "rom patches: the three unit 1a_1 RAM files only")
+    check([x for x in t if x.startswith("patch ")] == ["patch 1 00c00100 soc1_0_patch_mcu_1a_1_hdr.bin"],
+          "srh_patch: soc1_0_patch_mcu_1a_1 only, seq 1, low address byte zeroed")
+    check(t.count("ioctl 0x4004a00e 0x1") == 1, "SET_PATCH_NUM(1) once")
+    check(not [x for x in t if "0x4008a015" in x or "0x4004a017" in x], "no CFG_NAME or TELL_CHIPID (stock skips both on SoC chips)")
+    check(e.state("once.power") is not None and stat.S_IMODE(os.stat(os.path.join(e.run, "wmt", BOOT)).st_mode) == 0o700,
+          "power marker in the 0700 dir of this boot id")
+    check(e.state("chipid") == "0x6768" and e.state("adie") == "0x0000", "chipid and adie state")
+    check(e.state("launcher") == "yes", "launcher state yes")
+    pid = int(e.state("pid") or 0)
+    check(pid > 1 and alive(pid), "launcher daemon alive after start returned")
+    os.kill(pid, signal.SIGHUP)
+    time.sleep(0.3)
+    check(alive(pid) and e.state("launcher") == "yes", "launcher ignores SIGHUP")
+    n = len(e.lines())
+    r = e.run_("start")
+    check(r.returncode == 4 and "already attempted" in r.stderr, "second start refused with exit 4")
+    check(len(e.lines()) == n, "second start sends no ioctl")
+    r = e.run_("wifi-on")
+    check(r.returncode == 1 and "NVRAM not pushed" in r.stderr, "wifi-on before nvram refused")
+    data = os.urandom(2050)
+    nv = os.path.join(e.nv, "WIFI")
+    with open(nv, "wb") as f:
+        f.write(data)
+    r = e.run_("nvram", os.path.join(e.nv, "absent"), nv)
+    got = read(e.wifi_m, 2060, 5)
+    check(r.returncode == 0, "nvram falls back to the second file (rc %d)" % r.returncode)
+    check(got == b"WR-BUF:NVRAM" + data[:2048], "nvram writes WR-BUF:NVRAM plus size - 2 bytes in one write (%d bytes)" % len(got))
+    check(e.state("nvram") == nv, "nvram state names the file used")
+    r = e.run_("wifi-on")
+    got = read(e.wifi_m, 2, 5)
+    check(r.returncode == 0 and got == b"1\x00", "wifi-on writes 1 NUL as the Android HAL (%r)" % got)
+    check(e.state("wifi") == "on" and e.state("once.wifi") is not None, "wifi state on, wifi marker claimed")
+    r = e.run_("wifi-on")
+    got = read(e.wifi_m, 2, 1)
+    check(r.returncode == 4 and got == b"", "second wifi-on refused, nothing written")
+    os.kill(pid, signal.SIGTERM)
+    for _ in range(50):
+        if not alive(pid):
+            break
+        time.sleep(0.1)
+    check(not alive(pid), "launcher exits on SIGTERM")
+    check(e.lines()[-1] == "ioctl 0x4004a00d 0x1" and e.state("launcher") == "stopped", "SIGTERM sends SET_LAUNCHER_KILL(1)")
+
+
+def nvram_files(top):
+    e = Env(top, "nvram")
+    bad = os.path.join(e.nv, "BAD")
+    with open(bad, "wb") as f:
+        f.write(os.urandom(1000))
+    good = os.path.join(e.nv, "WIFI")
+    with open(good, "wb") as f:
+        f.write(os.urandom(2050))
+    r = e.run_("nvram", bad, good)
+    check(r.returncode == 1 and read(e.wifi_m, 1, 1) == b"", "nvram: a present but bad first file fails, no fallback")
+    r = e.run_("nvram", os.path.join(e.nv, "a"), os.path.join(e.nv, "b"))
+    check(r.returncode == 1 and e.state("nvram") is None, "nvram: no file exits 1")
+    e2 = Env(top, "nvram-nonode", nodes=("wmtdetect", "stpwmt"))
+    with open(os.path.join(e2.nv, "WIFI"), "wb") as f:
+        f.write(os.urandom(2050))
+    r = e2.run_("nvram", os.path.join(e2.nv, "WIFI"))
+    check(r.returncode == 1 and e2.state("nvram") is None, "nvram: no wmtWifi exits 1")
+
+
+def power_fail(top):
+    e = Env(top, "powerfail")
+    r = started(e, FAKE_POWER_FAIL="1")
+    check(r.returncode == 2 and e.state("launcher") == "no", "power on failure exits 2, launcher no")
+    pid = int(e.state("pid") or 0)
+    check(alive(pid), "launcher keeps the fd open after a failed power on")
+    with open(os.path.join(e.nv, "WIFI"), "wb") as f:
+        f.write(os.urandom(2050))
+    e.run_("nvram", os.path.join(e.nv, "WIFI"))
+    read(e.wifi_m, 2060, 2)
+    r = e.run_("wifi-on")
+    check(r.returncode == 1 and "not on" in r.stderr and read(e.wifi_m, 2, 1) == b"", "wifi-on refused after a failed power on")
+    check(e.state("wifi") is None, "refused wifi-on claims no wifi marker")
+    r = e.run_("start")
+    check(r.returncode == 4, "start after a failed power on refused")
+    check(e.lines().count("ioctl 0x4004a007 0x2") == 1, "only one LPBK_POWER_CTRL in the boot")
+
+
+def wrong_chip(top):
+    e = Env(top, "chip")
+    r = started(e, FAKE_CHIP="0x6765")
+    t = e.lines()
+    check(r.returncode == 2, "chip 0x6765 exits 2")
+    check("ioctl 0x80047704 0x6765" not in t and not [x for x in t if x.startswith("ioctl 0x400477")], "no SET_CHIP_ID or MODULE_INIT for a wrong chip")
+    check(e.state("once.power") is not None, "the loader attempt still claims the power marker")
+    n = len(t)
+    r = e.run_("start")
+    check(r.returncode == 4 and len(e.lines()) == n, "start refused after the wrong chip, no ioctl")
+
+
+def plant(e, boot, files):
+    d = os.path.join(e.run, "wmt", boot)
+    os.makedirs(d, exist_ok=True)
+    for n, v in files.items():
+        with open(os.path.join(d, n), "w") as f:
+            f.write(v + "\n")
+    return d
+
+
+def stale(top):
+    e = Env(top, "stale")
+    plant(e, BOOT, {"once.power": "1"})
+    r = e.run_("start")
+    check(r.returncode == 4 and not e.lines(), "an existing power marker of this boot refuses start, no ioctl")
+    e2 = Env(top, "stale-old")
+    keeper = subprocess.Popen(["sleep", "30"])
+    d = plant(e2, OLD, {"once.power": "1", "launcher": "yes", "pid": str(keeper.pid), "nvram": e2.nv + "/WIFI"})
+    r = e2.run_("wifi-on")
+    check(r.returncode == 1 and "this boot" in r.stderr and read(e2.wifi_m, 2, 1) == b"",
+          "launcher=yes and nvram from another boot do not satisfy wifi-on")
+    r = started(e2)
+    check(r.returncode == 0 and e2.state("launcher") == "yes", "start in a new boot ignores the old boot's state")
+    check(sorted(os.listdir(d)) == ["launcher", "nvram", "once.power", "pid"], "the old boot's dir is left as it was")
+    keeper.kill()
+    os.kill(int(e2.state("pid")), signal.SIGKILL)
+
+
+def concurrent(top):
+    e = Env(top, "pair")
+    a = e.popen("start")
+    b = e.popen("start")
+    end = time.time() + 10
+    while time.time() < end and a.poll() is None and b.poll() is None:
+        time.sleep(0.05)
+    open(e.hold, "w").close()
+    rcs = sorted([a.wait(timeout=15), b.wait(timeout=15)])
+    e.track()
+    check(rcs == [0, 4], "two starts at once: one runs, one refused (%s)" % rcs)
+    check(e.lines().count("ioctl 0x8004770a 0x0") == 1 and e.lines().count("ioctl 0x4004a007 0x2") == 1,
+          "two starts at once: one loader, one power on")
+    os.kill(int(e.state("pid")), signal.SIGKILL)
+
+
+def bad_boot_id(top):
+    e = Env(top, "badboot")
+    with open(e.boot, "w") as f:
+        f.write("../../x\n")
+    r = e.run_("start")
+    check(r.returncode == 1 and "boot id" in r.stderr and not e.lines(), "a boot id that is not a uuid exits 1, no ioctl")
+
+
+def failures(top):
+    for env, gone, what in (({"FAKE_HWINIT": "-1"}, "ioctl 0x80047706", "CONNSYS_SOC_HW_INIT"),
+                            ({"FAKE_CLEANUP": "-1"}, "ioctl 0x80047704", "MODULE_CLEANUP"),
+                            ({"FAKE_MODINIT": "-1"}, "ioctl 0x80047709", "DO_MODULE_INIT"),
+                            ({"FAKE_ADIE": "-1"}, "ioctl 0x8004a016", "GET_ADIE_CHIP_ID -1")):
+        e = Env(top, "fail-" + what.split()[0].lower())
+        r = started(e, **env)
+        t = e.lines()
+        check(r.returncode == 2 and not [x for x in t if x.startswith(gone)] and e.state("pid") is None,
+              "%s failure exits 2 and stops there" % what)
+        check(e.state("once.power") is not None and e.run_("start").returncode == 4, "%s failure still burns the boot" % what)
+
+
+def state_full(top):
+    e = Env(top, "full-power")
+    r = started(e, FAKE_ENOSPC="once.power")
+    check(r.returncode == 1 and "not written" in r.stderr and not e.lines(),
+          "a power marker that cannot be written stops start before any ioctl")
+    check(os.path.exists(os.path.join(e.run, "wmt", BOOT, "once.power")) and e.run_("start").returncode == 4,
+          "the unwritten power marker still blocks this boot")
+    e = Env(top, "full-chipid")
+    r = started(e, FAKE_ENOSPC="chipid")
+    check(r.returncode == 5 and "ioctl 0x8004a016 0x0" not in e.lines() and e.state("pid") is None,
+          "a chipid state write failure exits 5 before the launcher")
+    e = Env(top, "full-launcher")
+    r = started(e, FAKE_ENOSPC="launcher")
+    check(r.returncode == 5 and "launcher" in r.stderr and "not recorded" in r.stderr, "launcher state not recorded: start exits 5")
+    os.kill(int(e.state("pid")), signal.SIGKILL)
+    e = Env(top, "full-pid")
+    r = started(e, FAKE_ENOSPC="pid")
+    check(r.returncode == 5 and "not recorded (pid)" in r.stderr, "pid state not recorded: start exits 5")
+    m = re.search(r"launcher pid (\d+)", r.stderr)
+    if m:
+        daemons.append(int(m.group(1)))
+    e = Env(top, "full-nvram")
+    started(e)
+    with open(os.path.join(e.nv, "WIFI"), "wb") as f:
+        f.write(os.urandom(2050))
+    r = e.run_("nvram", os.path.join(e.nv, "WIFI"), FAKE_ENOSPC="nvram")
+    got = read(e.wifi_m, 2060, 5)
+    check(r.returncode == 5 and len(got) == 2060 and not e.state("nvram") and "not recorded" in r.stderr,
+          "NVRAM pushed but not recorded: nvram exits 5")
+    e.run_("nvram", os.path.join(e.nv, "WIFI"))
+    read(e.wifi_m, 2060, 5)
+    r = e.run_("wifi-on", FAKE_ENOSPC="once.wifi")
+    check(r.returncode == 1 and read(e.wifi_m, 2, 1) == b"" and "nothing was sent" in r.stderr,
+          "a Wi-Fi marker that cannot be written stops wifi-on before the 1")
+    check(e.run_("wifi-on").returncode == 4, "the unwritten Wi-Fi marker still blocks this boot")
+    os.kill(int(e.state("pid")), signal.SIGKILL)
+    e = Env(top, "full-wifi")
+    started(e)
+    with open(os.path.join(e.nv, "WIFI"), "wb") as f:
+        f.write(os.urandom(2050))
+    e.run_("nvram", os.path.join(e.nv, "WIFI"))
+    read(e.wifi_m, 2060, 5)
+    r = e.run_("wifi-on", FAKE_ENOSPC="wifi")
+    got = read(e.wifi_m, 2, 5)
+    check(r.returncode == 5 and got == b"1\x00" and not e.state("wifi") and "not recorded" in r.stderr,
+          "1 written but the wifi state not recorded: wifi-on exits 5")
+    os.kill(int(e.state("pid")), signal.SIGKILL)
+
+
+def node_checks(top):
+    e = Env(top, "regular", nodes=("wmtdetect", "stpwmt"))
+    reg = os.path.join(e.dev, "wmtWifi")
+    open(reg, "w").close()
+    with open(os.path.join(e.nv, "WIFI"), "wb") as f:
+        f.write(os.urandom(2050))
+    r = e.run_("nvram", os.path.join(e.nv, "WIFI"))
+    check(r.returncode == 1 and os.path.getsize(reg) == 0 and "not a character device" in r.stderr,
+          "nvram refuses a regular file at wmtWifi")
+    started(e)
+    os.remove(reg)
+    os.symlink(os.ttyname(e.wifi_s), reg)
+    e.run_("nvram", os.path.join(e.nv, "WIFI"))
+    read(e.wifi_m, 2060, 2)
+    os.remove(reg)
+    open(reg, "w").close()
+    r = e.run_("wifi-on")
+    check(r.returncode == 1 and os.path.getsize(reg) == 0 and e.state("once.wifi") is None,
+          "wifi-on refuses a regular file at wmtWifi before claiming the marker")
+    os.remove(reg)
+    os.symlink("/dev/full", reg)
+    r = e.run_("wifi-on")
+    check(r.returncode == 2 and e.state("wifi") == "failed" and e.state("once.wifi") is not None,
+          "a failed write of 1 exits 2, wifi=failed, marker kept")
+    check(e.run_("wifi-on").returncode == 4, "wifi-on after a failed write is refused")
+    r = e.run_("nvram", os.path.join(e.nv, "WIFI"))
+    check(r.returncode == 2, "a failed NVRAM write exits 2")
+    os.kill(int(e.state("pid")), signal.SIGKILL)
+
+
+def timeout(top):
+    e = Env(top, "timeout")
+    r = e.run_("start", wait="1")
+    pid = int(e.state("pid") or 0)
+    check(r.returncode == 3 and alive(pid), "no verdict in time exits 3, daemon still running")
+    check(e.state("launcher") is None, "launcher state unset while the power on blocks")
+    r = e.run_("wifi-on")
+    check(r.returncode == 1, "wifi-on refused while the power on blocks")
+
+
+def dead_launcher(top):
+    e = Env(top, "dead")
+    started(e)
+    pid = int(e.state("pid"))
+    os.kill(pid, signal.SIGKILL)
+    for _ in range(50):
+        if not alive(pid):
+            break
+        time.sleep(0.1)
+    with open(os.path.join(e.nv, "WIFI"), "wb") as f:
+        f.write(os.urandom(2050))
+    e.run_("nvram", os.path.join(e.nv, "WIFI"))
+    read(e.wifi_m, 2060, 2)
+    r = e.run_("wifi-on")
+    check(r.returncode == 1 and "not running" in r.stderr and read(e.wifi_m, 2, 1) == b"", "wifi-on refused with the launcher gone")
+
+
+def other_boot(top):
+    e = Env(top, "otherboot")
+    started(e)
+    with open(os.path.join(e.nv, "WIFI"), "wb") as f:
+        f.write(os.urandom(2050))
+    e.run_("nvram", os.path.join(e.nv, "WIFI"))
+    read(e.wifi_m, 2060, 2)
+    with open(e.boot, "w") as f:
+        f.write("11111111-1111-1111-1111-111111111111\n")
+    r = e.run_("wifi-on")
+    check(r.returncode == 1 and "this boot" in r.stderr, "wifi-on refused when the power on was another boot")
+    os.kill(int(e.state("pid")), signal.SIGKILL)
+
+
+def bad_files(top):
+    e = Env(top, "short", fw={**UNIT})
+    with open(os.path.join(e.fw, "soc1_0_ram_short_hdr.bin"), "wb") as f:
+        f.write(b"\0" * 10)
+    p = e.popen("start")
+    time.sleep(0.5)
+    rom = e.ask("srh_rom_patch")
+    open(e.hold, "w").close()
+    p.communicate(timeout=15)
+    e.track()
+    check(rom == b"resp_-4", "unreadable header answered resp_-4 as the stock launcher (%r)" % rom)
+    check(sorted(x for x in e.lines() if x.startswith("rom ")) == sorted(ROM), "the good files still go to the kernel")
+    os.kill(int(e.state("pid")), signal.SIGKILL)
+    e2 = Env(top, "empty", fw={})
+    p = e2.popen("start")
+    time.sleep(0.5)
+    rom = e2.ask("srh_rom_patch")
+    pat = e2.ask("srh_patch")
+    open(e2.hold, "w").close()
+    p.communicate(timeout=15)
+    e2.track()
+    check(rom == b"resp_-6" and pat == b"resp_-6", "no firmware answered resp_-6 (%r %r)" % (rom, pat))
+    os.kill(int(e2.state("pid")), signal.SIGKILL)
+
+
+def main():
+    if os.geteuid() == 0:
+        sys.exit("test-wmt: refuses to run as root")
+    top = tempfile.mkdtemp(prefix="test-wmt.", dir=os.environ.get("TMPDIR"))
+    try:
+        for case in (usage, no_rundir, no_detect, happy, nvram_files, power_fail, wrong_chip, stale, concurrent, bad_boot_id,
+                     failures, state_full, node_checks, timeout, dead_launcher, other_boot, bad_files):
+            case(top)
+    finally:
+        for pid in daemons:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        shutil.rmtree(top, ignore_errors=True)
+    print("%d failures" % len(fails))
+    sys.exit(1 if fails else 0)
+
+
+main()
