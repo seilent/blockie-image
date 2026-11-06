@@ -1,0 +1,136 @@
+name: promote
+
+on:
+  workflow_dispatch:
+    inputs:
+      digest:
+        description: "sha256 digest of an audited ghcr.io/seilent/blockie testing-<sha> image"
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: promote
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  IMAGE: ghcr.io/seilent/blockie
+  ROOT: ghcr.io/seilent/blockie/root
+  PUBKEY: system_files/usr/share/blockie/keys/blockie.pub
+  SOURCE_TYPE: application/vnd.blockie.source.v1
+  ORAS_VERSION: 1.3.4
+  ORAS_SHA256: 15702c6e3a4a56a8bd8ac5c17efdbcab56d9bada661ccbcf017f5b10c1d89399
+
+jobs:
+  promote:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    env:
+      DIGEST: ${{ inputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo
+          tarball=oras_${ORAS_VERSION}_linux_arm64.tar.gz
+          curl -fsSL -o "$RUNNER_TEMP/$tarball" "https://github.com/oras-project/oras/releases/download/v$ORAS_VERSION/$tarball"
+          echo "$ORAS_SHA256  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP/bin" oras
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
+        with:
+          cosign-release: v2.6.3
+
+      - name: Check
+        id: check
+        run: |
+          [[ $DIGEST =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::bad digest $DIGEST"; exit 1; }
+          cosign verify --key "$PUBKEY" "$IMAGE@$DIGEST" > /dev/null
+          label() { skopeo inspect --no-creds --format "{{index .Labels \"$2\"}}" "$1"; }
+          version=$(label "docker://$IMAGE@$DIGEST" org.opencontainers.image.version)
+          revision=$(label "docker://$IMAGE@$DIGEST" org.opencontainers.image.revision)
+          [[ $version =~ ^[0-9]{8}\.[0-9a-f]{7}$ ]] || { echo "::error::$IMAGE@$DIGEST version '$version'"; exit 1; }
+          [[ $revision =~ ^[0-9a-f]{40}$ && ${revision::7} == "${version##*.}" ]] || { echo "::error::revision '$revision' does not match version $version"; exit 1; }
+          git merge-base --is-ancestor "$revision" origin/main || { echo "::error::$revision is not on main"; exit 1; }
+          tagged=sha256:$(skopeo inspect --no-creds --raw "docker://$IMAGE:testing-${revision::7}" | sha256sum | cut -d' ' -f1)
+          [[ $tagged == "$DIGEST" ]] || { echo "::error::$IMAGE:testing-${revision::7} is $tagged, not $DIGEST"; exit 1; }
+          if err=$(skopeo inspect --no-creds --raw "docker://$IMAGE:testing" 2>&1 > /dev/null); then
+            old=$(label "docker://$IMAGE:testing" org.opencontainers.image.version)
+            old_rev=$(label "docker://$IMAGE:testing" org.opencontainers.image.revision)
+            [[ $old =~ ^[0-9]{8}\.[0-9a-f]{7}$ ]] || { echo "::error::$IMAGE:testing version '$old'"; exit 1; }
+            [[ $old_rev =~ ^[0-9a-f]{40}$ && ${old_rev::7} == "${old##*.}" ]] || { echo "::error::$IMAGE:testing revision '$old_rev' does not match version $old"; exit 1; }
+            (( 10#${version%%.*} >= 10#${old%%.*} )) || { echo "::error::$version is older than $IMAGE:testing $old"; exit 1; }
+            git merge-base --is-ancestor "$old_rev" "$revision" || { echo "::error::$revision does not descend from $IMAGE:testing $old_rev"; exit 1; }
+          elif ! grep -qiE 'manifest unknown|404' <<< "$err"; then
+            echo "::error::$err"
+            exit 1
+          fi
+          echo "short=${revision::7}" >> "$GITHUB_OUTPUT"
+          echo "$IMAGE@$DIGEST $version from $revision"
+
+      - name: Root artifact
+        id: root
+        env:
+          SHORT: ${{ steps.check.outputs.short }}
+        run: |
+          art=sha256:$(oras manifest fetch "$ROOT:testing-$SHORT" | sha256sum | cut -d' ' -f1)
+          cosign verify --key "$PUBKEY" "$ROOT@$art" > /dev/null
+          layer=$(oras manifest fetch "$ROOT@$art" | jq -r '.layers[] | select(.annotations["org.opencontainers.image.title"] == "root.info") | .digest')
+          [[ $layer == sha256:* && $layer != *$'\n'* ]] || { echo "::error::no root.info in $ROOT@$art"; exit 1; }
+          oras blob fetch --output "$RUNNER_TEMP/root.info" "$ROOT@$layer"
+          grep -qx "IMAGE=$IMAGE@$DIGEST" "$RUNNER_TEMP/root.info" || { echo "::error::$ROOT@$art is for $(grep '^IMAGE=' "$RUNNER_TEMP/root.info")"; exit 1; }
+          echo "digest=$art" >> "$GITHUB_OUTPUT"
+
+      - name: Source artifact
+        env:
+          SHORT: ${{ steps.check.outputs.short }}
+        run: |
+          refs=$(oras discover --artifact-type "$SOURCE_TYPE" --format json --depth 1 "$IMAGE@$DIGEST" \
+            | jq -r 'if (.referrers | type) == "array" then .referrers[].digest else error("no referrers list") end')
+          for d in $refs; do
+            [[ $d =~ ^sha256:[0-9a-f]{64}$ ]] || continue
+            cosign verify --key "$PUBKEY" "$IMAGE@$d" > /dev/null 2>&1 || continue
+            layer=$(oras manifest fetch "$IMAGE@$d" | jq -r '[.layers[] | select(.annotations["org.opencontainers.image.title"] == "SOURCES")] | if length == 1 then .[0].digest else empty end')
+            [[ $layer == sha256:* ]] || continue
+            oras blob fetch --output "$RUNNER_TEMP/SOURCES" "$IMAGE@$layer"
+            if grep -q "^blockie-image-$SHORT\.tar\.gz " "$RUNNER_TEMP/SOURCES" \
+              && grep -q '^blockie-kernel-source\.tar\.gz ' "$RUNNER_TEMP/SOURCES" \
+              && grep -q '^[^ /]*\.src\.rpm ' "$RUNNER_TEMP/SOURCES"; then
+              echo "$IMAGE@$d: $(wc -l < "$RUNNER_TEMP/SOURCES") files"
+              exit 0
+            fi
+          done
+          echo "::error::no signed full source artifact on $IMAGE@$DIGEST"
+          exit 1
+
+      - name: Move testing
+        env:
+          ART: ${{ steps.root.outputs.digest }}
+          GH_ACTOR: ${{ github.actor }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          oras login ghcr.io -u "$GH_ACTOR" --password-stdin <<< "$GH_TOKEN"
+          oras tag "$ROOT@$ART" testing
+          got=sha256:$(oras manifest fetch "$ROOT:testing" | sha256sum | cut -d' ' -f1)
+          [[ $got == "$ART" ]] || { echo "::error::$ROOT:testing resolves to $got, not $ART"; exit 1; }
+          skopeo login ghcr.io -u "$GH_ACTOR" --password-stdin <<< "$GH_TOKEN"
+          skopeo copy --preserve-digests --remove-signatures "docker://$IMAGE@$DIGEST" "docker://$IMAGE:testing"
+          got=sha256:$(skopeo inspect --raw "docker://$IMAGE:testing" | sha256sum | cut -d' ' -f1)
+          [[ $got == "$DIGEST" ]] || { echo "::error::$IMAGE:testing resolves to $got, not $DIGEST"; exit 1; }
+          echo "$ROOT:testing $ART, $IMAGE:testing $DIGEST"

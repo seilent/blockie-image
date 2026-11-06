@@ -19,6 +19,12 @@ env:
   IMAGE: ghcr.io/seilent/blockie
   PKG_KERNEL: ghcr.io/seilent/blockie/pkg/kernel
   PUBKEY: system_files/usr/share/blockie/keys/blockie.pub
+  ROOT: ghcr.io/seilent/blockie/root
+  SOURCE_TYPE: application/vnd.blockie.source.v1
+  ROOT_TYPE: application/vnd.blockie.root.v1
+  FEDORA: registry.fedoraproject.org/fedora:44@sha256:1ff9eb02e4e2d7fb1175becac7139b2960c4fdcccedce81c86ec25b98ef3124d
+  ORAS_VERSION: 1.3.4
+  ORAS_SHA256: 15702c6e3a4a56a8bd8ac5c17efdbcab56d9bada661ccbcf017f5b10c1d89399
 
 jobs:
   packages:
@@ -41,6 +47,8 @@ jobs:
       digest: ${{ steps.push.outputs.digest }}
       push_tag: ${{ steps.version.outputs.push_tag }}
       short: ${{ steps.version.outputs.short }}
+      channel: ${{ steps.version.outputs.channel }}
+      kernel_ref: ${{ steps.kernel.outputs.ref }}
     steps:
       - uses: ublue-os/remove-unwanted-software@cc0becac701cf642c8f0a6613bbdaf5dc36b259e
 
@@ -61,7 +69,9 @@ jobs:
         id: kernel
         run: |
           hash=$(build/pkg-hash.sh kernel)
-          digest=sha256:$(skopeo inspect --no-creds --raw "docker://$PKG_KERNEL:$hash" | sha256sum | cut -d' ' -f1)
+          skopeo inspect --no-creds --raw "docker://$PKG_KERNEL:$hash" > "$RUNNER_TEMP/raw" \
+            || { echo "::error::$PKG_KERNEL:$hash is missing; it comes from SePC (just pkg-push kernel) before the git push"; exit 1; }
+          digest=sha256:$(sha256sum < "$RUNNER_TEMP/raw" | cut -d' ' -f1)
           cosign verify --key "$PUBKEY" "$PKG_KERNEL@$digest" > /dev/null
           build/pkg-check.sh "$PKG_KERNEL@$digest" "$RUNNER_TEMP/check"
           echo "ref=$PKG_KERNEL@$digest" >> "$GITHUB_OUTPUT"
@@ -74,7 +84,15 @@ jobs:
             [[ $name != kernel ]] || continue
             hash=$(build/pkg-hash.sh "$name")
             repo=$IMAGE/pkg/$name
-            digest=sha256:$(skopeo inspect --no-creds --raw "docker://$repo:$hash" | sha256sum | cut -d' ' -f1)
+            skopeo inspect --no-creds --raw "docker://$repo:$hash" > "$RUNNER_TEMP/raw" || {
+              if [[ -n $(git ls-files -- "packages/$name/LOCAL") ]]; then
+                echo "::error::$repo:$hash is missing; it comes from SePC (just pkg-push $name) before the git push"
+              else
+                echo "::error::$repo:$hash is missing; the packages job did not publish it"
+              fi
+              exit 1
+            }
+            digest=sha256:$(sha256sum < "$RUNNER_TEMP/raw" | cut -d' ' -f1)
             cosign verify --key "$PUBKEY" "$repo@$digest" > /dev/null
             build/pkg-check.sh "$repo@$digest" "$RUNNER_TEMP/check" "$RUNNER_TEMP/pkgs/$name"
             echo "$repo:$hash $digest"
@@ -86,12 +104,15 @@ jobs:
           short=${GITHUB_SHA::7}
           if [[ $GITHUB_REF == refs/heads/main ]]; then
             push_tag=testing-$short
+            channel=true
           else
             push_tag=dev-$short
+            channel=false
           fi
           {
             echo "short=$short"
             echo "push_tag=$push_tag"
+            echo "channel=$channel"
             echo "version=$(date -u +%Y%m%d).$short"
           } >> "$GITHUB_OUTPUT"
           echo "$push_tag"
@@ -123,6 +144,21 @@ jobs:
           for t in image units blobs audio wifi; do
             podman run --rm -v "$PWD/tests:/tests:ro" "$IMAGE:$TAG" "/tests/$t.sh"
           done
+
+      - name: Source RPMs
+        env:
+          TAG: ${{ steps.version.outputs.push_tag }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/srpms"
+          podman run --rm "$IMAGE:$TAG" rpm -qa --qf '%{NAME}\t%{SOURCERPM}\t%{VENDOR}\n' > "$RUNNER_TEMP/srpms/srpms.tsv"
+          wc -l < "$RUNNER_TEMP/srpms/srpms.tsv"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: srpms-${{ steps.version.outputs.short }}
+          path: ${{ runner.temp }}/srpms
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Push
         id: push
@@ -166,3 +202,261 @@ jobs:
         run: |
           podman run --rm -v "$PWD/tests:/tests:ro" "$IMAGE:$TAG" \
             /tests/verify-sig.sh signed "docker://$IMAGE@$DIGEST" dir:/var/tmp/signed
+
+  root:
+    needs: image
+    if: needs.image.outputs.channel == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    env:
+      DIGEST: ${{ needs.image.outputs.digest }}
+      TAG: ${{ needs.image.outputs.push_tag }}
+      SHORT: ${{ needs.image.outputs.short }}
+    steps:
+      - uses: ublue-os/remove-unwanted-software@cc0becac701cf642c8f0a6613bbdaf5dc36b259e
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman e2fsprogs pigz busybox-static file
+          tarball=oras_${ORAS_VERSION}_linux_arm64.tar.gz
+          curl -fsSL -o "$RUNNER_TEMP/$tarball" "https://github.com/oras-project/oras/releases/download/v$ORAS_VERSION/$tarball"
+          echo "$ORAS_SHA256  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP/bin" oras
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
+        with:
+          cosign-release: v2.6.3
+
+      - name: Pull
+        env:
+          GH_ACTOR: ${{ github.actor }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cosign verify --key "$PUBKEY" "$IMAGE@$DIGEST" > /dev/null
+          sudo podman login ghcr.io -u "$GH_ACTOR" --password-stdin <<< "$GH_TOKEN"
+          sudo podman pull "$IMAGE@$DIGEST"
+          got=$(sudo podman image inspect --format '{{.Digest}}' "$IMAGE@$DIGEST")
+          [[ $got == "$DIGEST" ]] || { echo "::error::pulled $got, not $DIGEST"; exit 1; }
+
+      - name: Install
+        run: |
+          . build/root.conf
+          df -h /
+          img=$RUNNER_TEMP/root.ext4
+          truncate -s "$FS_BYTES" "$img"
+          mkfs.ext4 -q -F -b 4096 -I 256 -i 16384 -m 1 -O "none,$FS_FEATURES" \
+            -E lazy_itable_init=0,lazy_journal_init=0,nodiscard -L "$FS_LABEL" -U "$FS_UUID" "$img"
+          sudo mkdir -p /mnt/target
+          sudo mount -o loop "$img" /mnt/target
+          sudo podman run --rm --privileged --pid=host --security-opt label=type:unconfined_t \
+            -v /dev:/dev -v /var/lib/containers:/var/lib/containers -v /mnt/target:/target \
+            "$IMAGE@$DIGEST" bootc install to-filesystem --bootloader none --stateroot "$STATEROOT" \
+            --disable-selinux --skip-fetch-check --target-transport oci --target-imgref "$TARGET_IMGREF" /target
+          sudo podman run --rm -v /mnt/target:/target:ro -v "$PWD/tests:/tests:ro" "$IMAGE@$DIGEST" \
+            /tests/root.sh /target "$DIGEST"
+          sudo podman rmi "$IMAGE@$DIGEST"
+          read -r used avail < <(df -B1 --output=used,avail /mnt/target | tail -n 1)
+          echo "target used $used avail $avail"
+          (( used * 100 <= (used + avail) * 75 )) || { echo "::error::/mnt/target is over 75 % used"; exit 1; }
+          sudo umount /mnt/target
+          sudo e2fsck -fn "$img"
+          df -h /
+
+      - name: Seal
+        run: |
+          . build/root.conf
+          img=$RUNNER_TEMP/root.ext4
+          out=$RUNNER_TEMP/root
+          mkdir -p "$out"
+          gz=blockie-root-$SHORT.ext4.gz
+          android=has_journal,ext_attr,resize_inode,dir_index,filetype,extent,flex_bg,sparse_super,large_file,huge_file,dir_nlink,extra_isize,metadata_csum,64bit
+          [[ $FS_FEATURES == "$android" ]] || { echo "::error::FS_FEATURES is not the feature set of the card's Android made filesystems"; exit 1; }
+          [[ $(stat -c %s "$img") == "$FS_BYTES" ]] || { echo "::error::$img is not $FS_BYTES bytes"; exit 1; }
+          dumpe2fs -h "$img" 2> /dev/null > "$RUNNER_TEMP/sb"
+          sb() { sed -n "s/^Filesystem $1: *//p" "$RUNNER_TEMP/sb"; }
+          [[ $(sb 'volume name') == "$FS_LABEL" ]] || { echo "::error::label is $(sb 'volume name'), not $FS_LABEL"; exit 1; }
+          [[ $(sb UUID) == "$FS_UUID" ]] || { echo "::error::UUID is $(sb UUID), not $FS_UUID"; exit 1; }
+          [[ $(sb state) == clean ]] || { echo "::error::state is $(sb state)"; exit 1; }
+          [[ $(sb features | tr ' ' '\n' | sort | xargs) == "$(tr , '\n' <<< "$FS_FEATURES" | sort | xargs)" ]] \
+            || { echo "::error::features are $(sb features), not $FS_FEATURES"; exit 1; }
+          head_sha=$(head -c 1048576 "$img" | sha256sum | cut -d' ' -f1)
+          body_sha=$(tail -c +1048577 "$img" | sha256sum | cut -d' ' -f1)
+          whole_sha=$(sha256sum < "$img" | cut -d' ' -f1)
+          pigz -1 -c "$img" > "$out/$gz"
+          [[ $(pigz -dc "$out/$gz" | sha256sum | cut -d' ' -f1) == "$whole_sha" ]] || { echo "::error::$gz does not unpack to the image"; exit 1; }
+          {
+            echo "ROOT_GZ=$gz"
+            echo "ROOT_GZ_SHA=$(sha256sum < "$out/$gz" | cut -d' ' -f1)"
+            echo "ROOT_BYTES=$FS_BYTES"
+            echo "ROOT_SHA=$whole_sha"
+            echo "ROOT_HEAD_SHA=$head_sha"
+            echo "ROOT_BODY_SHA=$body_sha"
+          } > "$out/root.conf"
+          {
+            echo "IMAGE=$IMAGE@$DIGEST"
+            echo "TAG=$TAG"
+            echo "REVISION=$GITHUB_SHA"
+          } > "$out/root.info"
+          cat "$out/root.conf" "$out/root.info"
+          ls -l "$out"
+          df -h /
+
+      - name: Prepare root
+        run: |
+          [[ -f boot/ostree-root ]] || { echo "::error::boot/ostree-root missing"; exit 1; }
+          sudo BUSYBOX=/bin/busybox tests/ostree-root.sh "$RUNNER_TEMP/root.ext4" boot/ostree-root
+          rm -f "${RUNNER_TEMP:?}/root.ext4"
+
+      - name: Push
+        id: push
+        env:
+          GH_ACTOR: ${{ github.actor }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd "$RUNNER_TEMP/root"
+          oras login ghcr.io -u "$GH_ACTOR" --password-stdin <<< "$GH_TOKEN"
+          . root.conf
+          art=$(oras push --artifact-type "$ROOT_TYPE" --format go-template --template '{{.digest}}' \
+            "$ROOT:$TAG" "$ROOT_GZ" root.conf root.info)
+          [[ $art == sha256:* ]] || { echo "::error::no artifact digest: $art"; exit 1; }
+          echo "digest=$art" >> "$GITHUB_OUTPUT"
+          echo "$ROOT:$TAG $art"
+
+      - name: Sign
+        env:
+          ART: ${{ steps.push.outputs.digest }}
+          GH_ACTOR: ${{ github.actor }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
+          COSIGN_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
+        run: |
+          cosign login ghcr.io -u "$GH_ACTOR" --password-stdin <<< "$GH_TOKEN"
+          cosign sign --yes --new-bundle-format=false --key env://COSIGN_PRIVATE_KEY "$ROOT@$ART"
+          cosign verify --key "$PUBKEY" "$ROOT@$ART" > /dev/null
+
+  source:
+    needs: image
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    env:
+      DIGEST: ${{ needs.image.outputs.digest }}
+      SHORT: ${{ needs.image.outputs.short }}
+      MODE: ${{ needs.image.outputs.channel == 'true' && 'full' || 'base' }}
+      KERNEL_REF: ${{ needs.image.outputs.kernel_ref }}
+    steps:
+      - uses: ublue-os/remove-unwanted-software@cc0becac701cf642c8f0a6613bbdaf5dc36b259e
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman
+          tarball=oras_${ORAS_VERSION}_linux_arm64.tar.gz
+          curl -fsSL -o "$RUNNER_TEMP/$tarball" "https://github.com/oras-project/oras/releases/download/v$ORAS_VERSION/$tarball"
+          echo "$ORAS_SHA256  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP/bin" oras
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
+        with:
+          cosign-release: v2.6.3
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: srpms-${{ needs.image.outputs.short }}
+          path: ${{ runner.temp }}/srpms
+
+      - name: Source cache
+        if: env.MODE == 'full'
+        run: |
+          cache=$RUNNER_TEMP/cache
+          mkdir -p "$cache"
+          if ! refs=$(oras discover --artifact-type "$SOURCE_TYPE" --format json --depth 1 "$IMAGE:testing" | jq -r '.referrers[]?.digest'); then
+            echo "::notice::no source artifact on $IMAGE:testing, every source rpm comes from koji"
+            exit 0
+          fi
+          for d in $refs; do
+            layer=$(oras manifest fetch "$IMAGE@$d" | jq -r '.layers[] | select(.annotations["org.opencontainers.image.title"] == "SOURCES") | .digest')
+            [[ $layer == sha256:* && $layer != *$'\n'* ]] || continue
+            oras blob fetch --output "$RUNNER_TEMP/prev.SOURCES" "$IMAGE@$layer"
+            break
+          done
+          [[ -s $RUNNER_TEMP/prev.SOURCES ]] || { echo "::notice::no SOURCES on $IMAGE:testing"; exit 0; }
+          nevra='^([A-Za-z0-9][A-Za-z0-9._+~^-]*)-([A-Za-z0-9._+~^]+)-([A-Za-z0-9._+~^]+)\.src\.rpm$'
+          while read -r f sum _; do
+            [[ $f =~ $nevra && $f != */* && $f != *..* && $sum =~ ^[0-9a-f]{64}$ ]] || continue
+            (( $(jobs -rp | wc -l) < 8 )) || wait -n
+            { oras blob fetch --output "$cache/$f" "$IMAGE@sha256:$sum" > /dev/null 2>&1 || rm -f "$cache/$f"; } &
+          done < "$RUNNER_TEMP/prev.SOURCES"
+          wait
+          echo "::notice::$(find "$cache" -name '*.src.rpm' | wc -l) source rpms from $IMAGE:testing"
+
+      - name: Sources
+        env:
+          BLOCKIE_SOURCE_CACHE: ${{ env.MODE == 'full' && format('{0}/cache', runner.temp) || '' }}
+        run: build/source-artifact.sh "$RUNNER_TEMP/srpms/srpms.tsv" "$RUNNER_TEMP/source" "$MODE" "$KERNEL_REF"
+
+      - name: Attach
+        id: attach
+        env:
+          GH_ACTOR: ${{ github.actor }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          oras login ghcr.io -u "$GH_ACTOR" --password-stdin <<< "$GH_TOKEN"
+          cd "$RUNNER_TEMP/source"
+          mapfile -t files < <(cut -d' ' -f1 SOURCES)
+          art=$(oras attach --artifact-type "$SOURCE_TYPE" --format go-template --template '{{.digest}}' \
+            "$IMAGE@$DIGEST" "${files[@]}" SOURCES)
+          [[ $art == sha256:* ]] || { echo "::error::no artifact digest: $art"; exit 1; }
+          echo "digest=$art" >> "$GITHUB_OUTPUT"
+          echo "attached $IMAGE@$art"
+
+      - name: Check source
+        env:
+          ART: ${{ steps.attach.outputs.digest }}
+        run: |
+          names=$(printf '%s\n' "blockie-image-$SHORT.tar.gz" blockie-kernel-source.tar.gz)
+          if [[ $MODE == full ]]; then
+            own=$(awk '$1 == "Name:" { n = $2; print n } $1 == "%package" { print ($2 == "-n" ? $3 : n "-" $2) }' packages/*/*.spec | sort -u)
+            names+=$'\n'$(awk -F'\t' 'NR == FNR { own[$1] = 1; next } !($1 in own) && $2 != "(none)" { print $2 }' \
+              <(printf '%s\n' "$own") "$RUNNER_TEMP/srpms/srpms.tsv" | sort -u)
+          fi
+          cd "$RUNNER_TEMP/source"
+          [[ $(cut -d' ' -f1 SOURCES | sort) == "$(sort <<< "$names")" ]] || { echo "::error::SOURCES is not the $MODE set"; exit 1; }
+          refs=$(oras discover --artifact-type "$SOURCE_TYPE" --format json --depth 1 "$IMAGE@$DIGEST" \
+            | jq -r 'if (.referrers | type) == "array" then .referrers[].digest else error("no referrers list") end')
+          grep -qxF "$ART" <<< "$refs" || { echo "::error::$IMAGE@$ART is not a referrer of $DIGEST"; exit 1; }
+          oras manifest fetch "$IMAGE@$ART" > "$RUNNER_TEMP/source.json"
+          got=$(jq -r '.layers[] | select(.annotations["org.opencontainers.image.title"] != "SOURCES")
+            | "\(.annotations["org.opencontainers.image.title"]) \(.digest)"' "$RUNNER_TEMP/source.json" | sort)
+          [[ $got == "$(awk '{ print $1 " sha256:" $2 }' SOURCES | sort)" ]] || { echo "::error::layers differ from SOURCES"; exit 1; }
+          echo "$IMAGE@$ART: $MODE, $(wc -l < SOURCES) files"
+
+      - name: Sign source
+        env:
+          ART: ${{ steps.attach.outputs.digest }}
+          GH_ACTOR: ${{ github.actor }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
+          COSIGN_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
+        run: |
+          cosign login ghcr.io -u "$GH_ACTOR" --password-stdin <<< "$GH_TOKEN"
+          cosign sign --yes --new-bundle-format=false --key env://COSIGN_PRIVATE_KEY "$IMAGE@$ART"
+          cosign verify --key "$PUBKEY" "$IMAGE@$ART" > /dev/null
