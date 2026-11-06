@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+set -u
+
+script=$(readlink -f "${BLOBS_SCRIPT:-$(dirname "$0")/../files/usr/libexec/blockie/blockie-blobs}")
+if [[ $(id -u) == 0 ]]; then
+  echo "test-blockie-blobs: refuses to run as root"
+  exit 1
+fi
+top=$(mktemp -d "${TMPDIR:-/tmp}/test-blockie-blobs.XXXXXX")
+trap 'rm -rf "${top:?}"' EXIT
+fails=0
+
+res() {
+  if [[ $1 == 0 ]]; then
+    echo "ok   $2"
+  else
+    echo "FAIL $2"
+    fails=$((fails + 1))
+  fi
+}
+
+setup() {
+  d=$top/$1
+  mkdir -p "$d/blobs.d" "$d/store/sha256" "$d/gpu" "$d/run" "$d/share" "$d/sysroot/ostree/deploy/default/deploy"
+  printf 'invented gpu blob\n' > "$d/blob1"
+  h1=$(sha256sum < "$d/blob1" | cut -d' ' -f1)
+  cp "$d/blob1" "$d/store/sha256/$h1"
+  echo '{"file_format_version": "1.0.0"}' > "$d/share/icd.json"
+  conf "$d/blobs.d/test-gpu.conf" "$h1" "$(stat -c %s "$d/blob1")"
+}
+
+conf() {
+  printf 'FILE=libinvented.so\nURL=https://example.invalid/libinvented.so\nSHA256=%s\nSIZE=%s\nSONAME=libinvented.so.1\nLINKS=libEGL.so.1 libGLESv2.so.2\n' \
+    "$2" "$3" > "$1"
+}
+
+run() {
+  BLOCKIE_BLOBS_D=$d/blobs.d BLOCKIE_BLOBS=$d/store BLOCKIE_GPU=$d/gpu BLOCKIE_GPU_RUN=$d/run \
+    BLOCKIE_SYSROOT=$d/sysroot BLOCKIE_ICD_DIR=$d/share "$script" "$@" > "$d/out" 2>&1
+  rc=$?
+}
+
+lib() { echo "$d/gpu/test-gpu/lib"; }
+
+setup clean
+run
+[[ $rc == 0 && $(cat "$d/run/gpu.env") == "LD_LIBRARY_PATH=$(lib)" ]]
+res $? "check: gpu.env names the link farm"
+ok=0
+for l in libinvented.so.1 libEGL.so.1 libGLESv2.so.2; do
+  [[ -L $(lib)/$l && $(readlink "$(lib)/$l") == "$d/store/sha256/$h1" ]] || ok=1
+done
+[[ $(ls -A "$(lib)" | wc -l) == 3 && ! -e $d/run/gpu.env.new ]] || ok=1
+res $ok "check: soname and links point at the hash name, nothing else in the farm"
+
+setup rerun
+run
+sed -i 's/^LINKS=.*/LINKS=libEGL.so.1/' "$d/blobs.d/test-gpu.conf"
+mkdir -p "$d/gpu/old-gpu/lib"
+run
+[[ $rc == 0 && ! -e $(lib)/libGLESv2.so.2 && -L $(lib)/libEGL.so.1 && ! -e $d/gpu/old-gpu ]]
+res $? "rerun: a dropped link and an unlisted farm are removed"
+
+setup icd
+echo "VK_ICD=$d/share/icd.json" >> "$d/blobs.d/test-gpu.conf"
+run
+[[ $rc == 0 && $(cat "$d/run/gpu.env") == "$(printf 'LD_LIBRARY_PATH=%s\nVK_DRIVER_FILES=%s' "$(lib)" "$d/share/icd.json")" ]]
+res $? "VK_ICD in the ICD dir: VK_DRIVER_FILES in gpu.env"
+
+setup icd-outside
+echo "VK_ICD=$d/icd.json" >> "$d/blobs.d/test-gpu.conf"
+cp "$d/share/icd.json" "$d/icd.json"
+run
+[[ $rc == 1 && ! -e $d/run/gpu.env ]] && grep -q "VK_ICD" "$d/out"
+res $? "VK_ICD outside the ICD dir: refused, no gpu.env"
+
+setup empty
+rm -f "$d/blobs.d/test-gpu.conf"
+echo stale > "$d/run/gpu.env"
+run
+[[ $rc == 0 && ! -e $d/run/gpu.env ]] && grep -q "no blobs listed" "$d/out"
+res $? "empty blobs.d: ok, the stale gpu.env removed, none written"
+
+setup missing
+rm -f "$d/store/sha256/$h1"
+echo stale > "$d/run/gpu.env"
+run
+[[ $rc == 1 && ! -e $d/run/gpu.env ]] && grep -q "is not in" "$d/out"
+res $? "missing blob: unit fails, no gpu.env"
+
+setup wrong-hash
+printf 'invented gpu blbb\n' > "$d/store/sha256/$h1"
+run
+[[ $rc == 1 && ! -e $d/run/gpu.env ]] && grep -q "does not hash to its name" "$d/out"
+res $? "changed blob: refused"
+
+setup wrong-size
+conf "$d/blobs.d/test-gpu.conf" "$h1" 5
+run
+[[ $rc == 1 && ! -e $d/run/gpu.env ]] && grep -q "bytes, not 5" "$d/out"
+res $? "size mismatch: refused"
+
+setup symlink-blob
+rm -f "$d/store/sha256/$h1"
+ln -s "$d/blob1" "$d/store/sha256/$h1"
+run
+[[ $rc == 1 && ! -e $d/run/gpu.env ]]
+res $? "a symlink in place of a blob: refused"
+
+setup bad-link
+sed -i 's/^LINKS=.*/LINKS=..\/escape.so/' "$d/blobs.d/test-gpu.conf"
+run
+[[ $rc == 1 && ! -e $d/run/gpu.env && ! -e $d/gpu/escape.so ]] && grep -q "LINKS entry" "$d/out"
+res $? "a link name with a slash: refused"
+
+setup bad-sha
+conf "$d/blobs.d/test-gpu.conf" "../../etc/passwd" 1
+run
+[[ $rc == 1 && ! -e $d/run/gpu.env ]] && grep -q "SHA256" "$d/out"
+res $? "a SHA256 that is no hash: refused"
+
+setup prune
+dep=$d/sysroot/ostree/deploy/default/deploy
+h2=$(printf 'invented old blob\n' | tee "$d/store/sha256/x" | sha256sum | cut -d' ' -f1)
+mv "$d/store/sha256/x" "$d/store/sha256/$h2"
+h3=$(printf 'invented rollback blob\n' | tee "$d/store/sha256/y" | sha256sum | cut -d' ' -f1)
+mv "$d/store/sha256/y" "$d/store/sha256/$h3"
+: > "$d/store/sha256/$h2.part"
+mkdir -p "$dep/$(printf 'a%.0s' {1..64}).0/usr/share/blockie/blobs.d" "$dep/$(printf 'b%.0s' {1..64}).0/usr/share/blockie/blobs.d"
+conf "$dep/$(printf 'a%.0s' {1..64}).0/usr/share/blockie/blobs.d/test-gpu.conf" "$h1" 1
+conf "$dep/$(printf 'b%.0s' {1..64}).0/usr/share/blockie/blobs.d/test-gpu.conf" "$h3" 1
+run prune
+[[ $rc == 0 && -f $d/store/sha256/$h1 && -f $d/store/sha256/$h3 && ! -e $d/store/sha256/$h2 && -e $d/store/sha256/$h2.part ]]
+res $? "prune: keeps every deployment's blobs, removes an unlisted one, leaves a .part"
+
+setup prune-none
+run prune
+[[ $rc == 1 && -f $d/store/sha256/$h1 ]] && grep -q "no deployment" "$d/out"
+res $? "prune with no deployment found: refused, nothing removed"
+
+setup usage
+run fetch
+[[ $rc == 1 ]] && grep -q "usage" "$d/out"
+res $? "unknown subcommand: usage"
+
+if [[ $fails == 0 ]]; then
+  echo "test-blockie-blobs: all ok"
+  exit 0
+fi
+echo "test-blockie-blobs: $fails failed"
+exit 1

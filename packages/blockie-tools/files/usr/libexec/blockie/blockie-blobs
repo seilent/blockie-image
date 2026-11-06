@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+me=blockie-blobs
+die() { echo "$me: $*" >&2; exit 1; }
+
+confd=${BLOCKIE_BLOBS_D:-/usr/share/blockie/blobs.d}
+store=${BLOCKIE_BLOBS:-/var/lib/blockie/blobs}/sha256
+gpu=${BLOCKIE_GPU:-/var/lib/blockie/gpu}
+run=${BLOCKIE_GPU_RUN:-/run/blockie-gpu}
+deploys=${BLOCKIE_SYSROOT:-/sysroot}/ostree/deploy/default/deploy
+icddir=${BLOCKIE_ICD_DIR:-/usr/share/blockie/vulkan}
+name_re='^[A-Za-z0-9][A-Za-z0-9._+-]*$'
+
+field() { sed -n "s/^$1=//p" "$2" | tail -n 1; }
+
+prune() {
+  local d c h n=0
+  declare -A want=()
+  shopt -s nullglob
+  for d in "$deploys"/*/; do
+    [[ ${d%/} =~ /[0-9a-f]{64}\.[0-9]+$ ]] || continue
+    n=$((n + 1))
+    for c in "$d"usr/share/blockie/blobs.d/*.conf; do
+      h=$(field SHA256 "$c")
+      [[ $h =~ ^[0-9a-f]{64}$ ]] || die "$c: SHA256 '$h'"
+      want[$h]=1
+    done
+  done
+  (( n )) || die "no deployment under $deploys, nothing pruned"
+  for c in "$store"/*; do
+    h=${c##*/}
+    [[ $h =~ ^[0-9a-f]{64}$ && -f $c && ! -L $c ]] || continue
+    [[ -n ${want[$h]:-} ]] && continue
+    rm -f -- "$c"
+    echo "$me: pruned $h"
+  done
+  echo "$me: prune kept ${#want[@]} listed blobs from $n deployments"
+}
+
+relink() {
+  local dir=$1 target=$2 l=$3
+  ln -sfn "$target" "$dir/.$l.new"
+  mv -fT "$dir/.$l.new" "$dir/$l"
+}
+
+case ${1:-check} in
+  prune) prune; exit 0 ;;
+  check) ;;
+  *) die "usage: $me [check|prune] (prune only after the new deployment is staged)" ;;
+esac
+
+install -d -m 0755 "$run"
+rm -f "$run/gpu.env" "$run/gpu.env.new"
+
+shopt -s nullglob
+confs=("$confd"/*.conf)
+shopt -u nullglob
+if (( ! ${#confs[@]} )); then
+  echo "$me: no blobs listed in $confd, no gpu.env"
+  exit 0
+fi
+
+libs=()
+icds=()
+names=()
+for c in "${confs[@]}"; do
+  name=${c##*/}
+  name=${name%.conf}
+  [[ $name =~ $name_re ]] || die "$c: bad name"
+  h=$(field SHA256 "$c")
+  size=$(field SIZE "$c")
+  soname=$(field SONAME "$c")
+  read -r -a links <<< "$(field LINKS "$c")"
+  icd=$(field VK_ICD "$c")
+  [[ $h =~ ^[0-9a-f]{64}$ ]] || die "$c: SHA256 '$h'"
+  [[ $size =~ ^[0-9]+$ ]] || die "$c: SIZE '$size'"
+  [[ $soname =~ $name_re ]] || die "$c: SONAME '$soname'"
+  for l in "${links[@]}"; do
+    [[ $l =~ $name_re ]] || die "$c: LINKS entry '$l'"
+  done
+  [[ -z $icd || ( ${icd%/*} == "$icddir" && ${icd##*/} =~ $name_re && -f $icd ) ]] || die "$c: VK_ICD '$icd'"
+  f=$store/$h
+  [[ -f $f && ! -L $f ]] || die "$name: blob $h is not in $store"
+  [[ $(stat -c %s "$f") == "$size" ]] || die "$name: blob $h is $(stat -c %s "$f") bytes, not $size"
+  [[ $(sha256sum < "$f" | cut -d' ' -f1) == "$h" ]] || die "$name: blob $h does not hash to its name"
+  dir=$gpu/$name/lib
+  install -d -m 0755 "$dir"
+  want=" $soname ${links[*]} "
+  for l in "$dir"/* "$dir"/.*.new; do
+    [[ -e $l || -L $l ]] || continue
+    [[ $want == *" ${l##*/} "* ]] || rm -f -- "$l"
+  done
+  for l in $soname "${links[@]}"; do
+    relink "$dir" "$f" "$l"
+  done
+  names+=("$name")
+  libs+=("$dir")
+  [[ -z $icd ]] || icds+=("$icd")
+done
+
+for d in "$gpu"/*/; do
+  d=${d%/}
+  [[ -d $d && " ${names[*]} " != *" ${d##*/} "* ]] || continue
+  rm -rf -- "${d:?}"
+done
+
+{
+  echo "LD_LIBRARY_PATH=$(IFS=:; echo "${libs[*]}")"
+  (( ! ${#icds[@]} )) || echo "VK_DRIVER_FILES=$(IFS=:; echo "${icds[*]}")"
+} > "$run/gpu.env.new"
+mv -fT "$run/gpu.env.new" "$run/gpu.env"
+echo "$me: ${#names[@]} blobs checked, gpu.env for ${names[*]}"

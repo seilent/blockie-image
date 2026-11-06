@@ -74,5 +74,17 @@ jq -e '. == {
 grep -qx 'SystemMaxUse=200M' /usr/lib/systemd/journald.conf.d/50-blockie.conf || fail "journal size not capped"
 cmp -s <(printf '[Service]\nExecStart=\nExecStart=-udevadm trigger --type=devices --action=add --subsystem-match=input\n') \
   /usr/lib/systemd/system/systemd-udev-trigger.service.d/50-blockie.conf || fail "coldplug drop-in"
+cmp -s <(printf '[zram0]\nzram-size = ram\ncompression-algorithm = zstd\nswap-priority = 100\n') \
+  /usr/lib/systemd/zram-generator.conf || fail "zram-generator.conf"
+rpm -q zram-generator > /dev/null || fail "zram-generator missing"
+cmp -s <(printf '[Service]\nExecStart=-udevadm trigger --type=devices --action=add --subsystem-match=block --sysname-match=zram*\n') \
+  /usr/lib/systemd/system/systemd-udev-trigger.service.d/51-blockie-zram.conf || fail "zram coldplug drop-in"
+for u in blockie-boot-ok.service blockie-blobs.service; do
+  [[ -L /etc/systemd/system/multi-user.target.wants/$u ]] || fail "$u is not enabled"
+done
+for v in FAILED ACTIVE NOT_EXIT1; do
+  grep -q "^BLOCKIE_BOOT_OK_$v=" /usr/lib/blockie/boot-ok.conf || fail "boot-ok.conf lacks BLOCKIE_BOOT_OK_$v"
+done
+[[ -d /usr/share/blockie/blobs.d ]] || fail "no blobs.d"
 
 echo "image: ok $kver"

@@ -1,0 +1,13 @@
+[Unit]
+Description=Confirm the booted Blockie deployment
+After=multi-user.target
+ConditionKernelCommandLine=ostree
+RequiresMountsFor=/var
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/blockie/blockie-boot-ok
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,14 @@
+[Unit]
+Description=Check the pinned blobs and link them for the GPU
+After=local-fs.target
+RequiresMountsFor=/var/lib/blockie
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+RuntimeDirectory=blockie-gpu
+RuntimeDirectoryPreserve=yes
+ExecStart=/usr/libexec/blockie/blockie-blobs
+
+[Install]
+WantedBy=multi-user.target

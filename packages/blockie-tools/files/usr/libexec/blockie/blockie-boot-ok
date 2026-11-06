@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+me=blockie-boot-ok
+die() { echo "$me: $*" >&2; exit 1; }
+
+conf=${BLOCKIE_BOOT_OK_CONF:-/usr/lib/blockie/boot-ok.conf}
+statedir=${BLOCKIE_BOOT_STATE:-/var/lib/blockie/boot}
+cmdline=${BLOCKIE_CMDLINE:-/proc/cmdline}
+sysroot=${BLOCKIE_SYSROOT:-/sysroot}
+root=${BLOCKIE_ROOT:-/}
+deploys=$sysroot/ostree/deploy/default/deploy
+id_re='^[0-9a-f]{64}\.[0-9]+$'
+
+[[ -r $conf ]] || die "missing $conf"
+. "$conf"
+
+src=$(findmnt -no SOURCE /var) || die "/var is not mounted"
+[[ $src == *"[/ostree/deploy/default/var]" ]] || die "/var is $src, not the stateroot var"
+
+deploy=""
+pick=""
+read -r -a words < "$cmdline" || true
+for w in "${words[@]}"; do
+  case $w in
+    blockie.deploy=*) deploy=${w#*=} ;;
+    blockie.pick=*) pick=${w#*=} ;;
+  esac
+done
+[[ $deploy =~ $id_re ]] || die "the cmdline names no deployment ('$deploy')"
+[[ $pick == default || $pick == fallback || $pick == runconf ]] || die "the cmdline pick is '$pick'"
+[[ -d $deploys/$deploy && $root -ef $deploys/$deploy ]] || die "/ is not the deployment $deploy"
+
+ids=()
+default=""
+top=-1
+shopt -s nullglob
+for e in "$sysroot"/boot/loader/entries/*.conf; do
+  v=$(sed -n 's/^version[[:space:]]\+\([0-9]\+\)[[:space:]]*$/\1/p' "$e" | head -n 1)
+  p=$(sed -n 's/^options[[:space:]]\+//p' "$e" | tr ' ' '\n' | sed -n 's/^ostree=//p' | head -n 1)
+  [[ -n $v && -n $p ]] || continue
+  d=$(readlink -f "$sysroot$p") || continue
+  [[ ${d%/*} == "$deploys" && ${d##*/} =~ $id_re ]] || continue
+  ids+=("${d##*/}")
+  if (( 10#$v > top )); then
+    top=$((10#$v))
+    default=${d##*/}
+  fi
+done
+shopt -u nullglob
+[[ " ${ids[*]} " == *" $deploy "* ]] || die "no boot entry names $deploy"
+
+for u in $BLOCKIE_BOOT_OK_FAILED; do
+  ! systemctl is-failed --quiet "$u" || die "not confirmed: $u failed"
+done
+for u in $BLOCKIE_BOOT_OK_ACTIVE; do
+  systemctl is-active --quiet "$u" || die "not confirmed: $u is not active"
+done
+for u in $BLOCKIE_BOOT_OK_NOT_EXIT1; do
+  [[ $(systemctl show -p ExecMainStatus --value "$u") != 1 ]] || die "not confirmed: $u exited 1"
+done
+
+if [[ $pick == runconf && $deploy != "$default" ]]; then
+  echo "$me: runconf boot of $deploy, the default entry is $default: nothing written"
+  exit 0
+fi
+
+write() {
+  local f=$1 t
+  shift
+  t=$(mktemp "$f.XXXXXX")
+  if (( $# )); then
+    printf '%s\n' "$@" > "$t"
+  fi
+  chmod 0644 "$t"
+  sync "$t"
+  mv -fT "$t" "$f"
+  sync -f "$f"
+}
+
+install -d -m 0755 "$statedir"
+keep=()
+if [[ -f $statedir/tries ]]; then
+  while read -r id n rest; do
+    [[ $id =~ $id_re && $n =~ ^[0-9]+$ && -z $rest && $id != "$deploy" && " ${ids[*]} " == *" $id "* ]] || continue
+    keep+=("$id $n")
+  done < "$statedir/tries"
+fi
+write "$statedir/confirmed" "$deploy"
+write "$statedir/tries" ${keep[@]+"${keep[@]}"}
+
+if [[ $pick == fallback ]]; then
+  bootc rollback || die "confirmed $deploy, but bootc rollback failed: the default and the other tries lines stay"
+  write "$statedir/tries"
+  echo "$me: confirmed $deploy, rolled back to it"
+else
+  echo "$me: confirmed $deploy ($pick)"
+fi
