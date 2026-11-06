@@ -50,6 +50,11 @@ for g in wheel systemd-journal input video render audio; do
 done
 [[ $(getent passwd blockie | cut -d: -f6,7) == /var/home/blockie:/bin/bash ]] || fail "blockie home or shell"
 grep -qx 'd /var/home/blockie 0700 blockie blockie -' /usr/lib/tmpfiles.d/blockie.conf || fail "home tmpfiles line"
+for p in /var/cache/libX11 /var/cache/libX11/compose /var/lib/alsa /var/lib/bluetooth /var/lib/bluetooth/mesh; do
+  [[ -d $p && ! -L $p ]] || fail "$p is not a directory in the image"
+  l="d $p $(stat -c '%04a %U %G' "$p") -"
+  grep -qxF "$l" /usr/lib/tmpfiles.d/blockie.conf || fail "no tmpfiles line '$l'"
+done
 grep -qx 'enable blockie-\*' /usr/lib/systemd/system-preset/50-blockie.preset || fail "blockie preset"
 
 rpm -q systemd bootc ostree skopeo podman NetworkManager kmod > /dev/null || fail "base rpms missing"
