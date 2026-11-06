@@ -20,41 +20,43 @@ jobs:
     runs-on: ubuntu-24.04-arm
     permissions:
       contents: read
+      packages: read
     outputs:
-      packages: ${{ steps.list.outputs.packages }}
+      build: ${{ steps.plan.outputs.build }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
-      - name: List
-        id: list
+      - name: Install tools
+        run: build/ci-need.sh skopeo:skopeo
+
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
+        with:
+          cosign-release: v2.6.3
+
+      - name: Plan
+        id: plan
+        env:
+          GH_ACTOR: ${{ github.actor }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          plain=()
-          for name in $(git ls-files -- 'packages/*/build.sh' | cut -d/ -f2); do
-            [[ -z $(git ls-files -- "packages/$name/DEPS") ]] || { echo "::error::packages/$name has DEPS, which this workflow and the Justfile do not build yet"; exit 1; }
-            plain+=("$name")
-          done
-          (( ${#plain[@]} )) || { echo "::error::no packages"; exit 1; }
-          packages=$(printf '%s\n' "${plain[@]}" | jq -Rnc '[inputs]')
-          echo "packages=$packages" >> "$GITHUB_OUTPUT"
-          echo "packages $packages"
+          build/pkg-plan.sh "$RUNNER_TEMP/build.json"
+          echo "build=$(cat "$RUNNER_TEMP/build.json")" >> "$GITHUB_OUTPUT"
 
   build:
     needs: list
+    if: needs.list.outputs.build != '[]'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     permissions:
       contents: read
-      packages: read
     strategy:
       fail-fast: false
       matrix:
-        package: ${{ fromJSON(needs.list.outputs.packages) }}
+        include: ${{ fromJSON(needs.list.outputs.build) }}
     env:
       PKG: ${{ matrix.package }}
-      REPO: ghcr.io/seilent/blockie/pkg/${{ matrix.package }}
-      PUBKEY: system_files/usr/share/blockie/keys/blockie.pub
       JUST_VERSION: 1.58.0
       JUST_SHA256: 748237128c4c40cbdabc65e841d05ceba13cc23a91eaba395495894c1d9764df
     steps:
@@ -65,7 +67,7 @@ jobs:
 
       - name: Install tools
         run: |
-          build/ci-need.sh podman:podman skopeo:skopeo
+          build/ci-need.sh podman:podman
           tarball=just-$JUST_VERSION-aarch64-unknown-linux-musl.tar.gz
           curl -fsSL -o "$RUNNER_TEMP/$tarball" "https://github.com/casey/just/releases/download/$JUST_VERSION/$tarball"
           echo "$JUST_SHA256  $RUNNER_TEMP/$tarball" | sha256sum -c -
@@ -73,98 +75,18 @@ jobs:
           tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP/bin" just
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
 
-      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
-        with:
-          cosign-release: v2.6.3
-
-      - name: Hash
-        id: hash
-        run: |
-          hash=$(build/pkg-hash.sh "$PKG")
-          echo "hash=$hash" >> "$GITHUB_OUTPUT"
-          [[ -z $(git ls-files -- "packages/$PKG/LOCAL") ]] || echo "local=true" >> "$GITHUB_OUTPUT"
-
-      - name: Check registry
-        id: check
-        env:
-          HASH: ${{ steps.hash.outputs.hash }}
-          GH_ACTOR: ${{ github.actor }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          if err=$(skopeo inspect --no-creds --raw "docker://$REPO:$HASH" 2>&1 > /dev/null); then
-            echo "$REPO:$HASH exists"
-            echo "state=exists" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          if ! grep -qiE 'manifest unknown|404|403|denied|unauthorized' <<< "$err"; then
-            echo "::error::$err"
-            exit 1
-          fi
-          skopeo login ghcr.io -u "$GH_ACTOR" --password-stdin <<< "$GH_TOKEN"
-          if err=$(skopeo inspect --raw "docker://$REPO:$HASH" 2>&1 > /dev/null); then
-            echo "::error::$REPO:$HASH exists but is not public"
-            exit 1
-          fi
-          if ! grep -qiE 'manifest unknown|404|403' <<< "$err"; then
-            echo "::error::$err"
-            exit 1
-          fi
-          echo "state=missing" >> "$GITHUB_OUTPUT"
-          echo "build=true" >> "$GITHUB_OUTPUT"
-
-      - name: Verify existing
-        id: verify
-        if: steps.check.outputs.state == 'exists'
-        env:
-          HASH: ${{ steps.hash.outputs.hash }}
-        run: |
-          sig() {
-            local out
-            for _ in 1 2 3; do
-              if out=$(cosign verify --key "$PUBKEY" "$1" 2>&1 > /dev/null); then echo signed; return; fi
-              if grep -qE 'no signatures found|no matching signatures: (.*invalid signature|signature not found in transparency log)' <<< "$out"; then
-                echo unsigned
-                return
-              fi
-              echo "::warning::cosign verify $1: $out" >&2
-              sleep 10
-            done
-            echo "::error::cosign verify $1: $out" >&2
-            return 1
-          }
-          state=$(sig "$REPO:$HASH")
-          [[ $state == unsigned ]] || exit 0
-          echo "::warning::$REPO:$HASH has no valid signature, building and pushing a new one"
-          echo "build=true" >> "$GITHUB_OUTPUT"
-
-      - name: Wait for the build PC
-        id: local
-        if: >-
-          (steps.check.outputs.build == 'true' || steps.verify.outputs.build == 'true')
-          && steps.hash.outputs.local == 'true'
-        env:
-          HASH: ${{ steps.hash.outputs.hash }}
-          LOCAL: ${{ steps.hash.outputs.local }}
-        run: |
-          echo "::notice::$REPO:$HASH comes from the build PC (just pkg-push $PKG): $(head -n 1 "packages/$PKG/LOCAL")"
-          echo "skip=true" >> "$GITHUB_OUTPUT"
-
-
       - name: Build
-        if: (steps.check.outputs.build == 'true' || steps.verify.outputs.build == 'true') && steps.local.outputs.skip != 'true'
         run: just pkg "$PKG"
 
       - name: Save
-        if: (steps.check.outputs.build == 'true' || steps.verify.outputs.build == 'true') && steps.local.outputs.skip != 'true'
         env:
-          HASH: ${{ steps.hash.outputs.hash }}
-          STATE: ${{ steps.verify.outputs.build == 'true' && 'unsigned' || 'missing' }}
+          STATE: ${{ matrix.state }}
         run: |
+          [[ $STATE == missing || $STATE == unsigned ]] || { echo "::error::bad state '$STATE' for $PKG"; exit 1; }
           mkdir -p "$RUNNER_TEMP/save"
-          podman save --format oci-archive -o "$RUNNER_TEMP/save/$STATE.oci.tar" "localhost/blockie-pkg/$PKG:$HASH"
+          podman save --format oci-archive -o "$RUNNER_TEMP/save/$STATE.oci.tar" "localhost/blockie-pkg/$PKG:$(build/pkg-hash.sh "$PKG")"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
-        if: (steps.check.outputs.build == 'true' || steps.verify.outputs.build == 'true') && steps.local.outputs.skip != 'true'
         with:
           name: pkg-${{ matrix.package }}
           path: ${{ runner.temp }}/save
@@ -175,7 +97,7 @@ jobs:
 
   publish:
     needs: [list, build]
-    if: ${{ !cancelled() && needs.list.result == 'success' }}
+    if: ${{ !cancelled() && needs.list.result == 'success' && needs.list.outputs.build != '[]' }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     permissions:
@@ -184,7 +106,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        package: ${{ fromJSON(needs.list.outputs.packages) }}
+        include: ${{ fromJSON(needs.list.outputs.build) }}
     env:
       PKG: ${{ matrix.package }}
       REPO: ghcr.io/seilent/blockie/pkg/${{ matrix.package }}
