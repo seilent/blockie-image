@@ -1,12 +1,9 @@
 #!/usr/bin/env bash
 set -u
 
-script=$(readlink -f "${BOOT_OK_SCRIPT:-$(dirname "$0")/../files/usr/libexec/blockie/blockie-boot-ok}")
-if [[ $(id -u) == 0 ]]; then
-  echo "test-blockie-boot-ok: refuses to run as root"
-  exit 1
-fi
-top=$(mktemp -d "${TMPDIR:-/tmp}/test-blockie-boot-ok.XXXXXX")
+script=$(readlink -f "${BOOT_OK_SCRIPT:-/usr/libexec/blockie/blockie-boot-ok}")
+lib=$(readlink -f "${OSTREE_ROOT_LIB:-/repo-boot/ostree-root}")
+top=$(mktemp -d "${TMPDIR:-/tmp}/boot-ok.XXXXXX")
 trap 'rm -rf "${top:?}"' EXIT
 fails=0
 A=$(printf 'a%.0s' {1..64}).0
@@ -71,7 +68,7 @@ EOF
 
 run() {
   PATH="$d/bin:$PATH" BLOCKIE_BOOT_OK_CONF=$d/conf BLOCKIE_BOOT_STATE=$d/state BLOCKIE_CMDLINE=$d/cmdline \
-    BLOCKIE_SYSROOT=$s BLOCKIE_ROOT=$root "$script" > "$d/out" 2>&1
+    BLOCKIE_SYSROOT=$s BLOCKIE_ROOT=$root BLOCKIE_OSTREE_ROOT=$lib "$script" > "$d/out" 2>&1
   rc=$?
 }
 
@@ -184,14 +181,57 @@ run
 cd / || exit 1
 refused "a glob in a cmdline word is not expanded" "pick is 'd\*'"
 
+init_default() {
+  (. "$lib"; ostree_list "$s" | LC_ALL=C sort -n -r -k 1,1 | head -n 1 | cut -d' ' -f2)
+}
+
+setup tie
+sed -i 's/^version .*/version 1/' "$s"/boot/loader/entries/*.conf
+sed -i 's/pick=default/pick=runconf/' "$d/cmdline"
+run
+[[ $rc == 0 && ! -e $d/state/confirmed && $(init_default) == "$B" ]] \
+  && grep -qx "blockie-boot-ok: runconf boot of $A, the default entry is $B: nothing written" "$d/out"
+res $? "version tie: the default is init's pick (the higher id), a runconf boot of the other writes nothing"
+
+setup tokens
+printf 'title Blockie\nversion 2\noptions root=UUID=x ostree=/ostree/boot.1/default/111/0\tostree=/ostree/boot.1/default/222/0\noptions ostree=/ostree/boot.1/default/111/0\n' \
+  > "$s/boot/loader/entries/ostree-1-default.conf"
+rm -f "$s/boot/loader/entries/ostree-2-default.conf"
+run
+refused "two ostree= tokens: the last one counts, so $A has no entry" "no boot entry names"
+sed -i "s/blockie.deploy=$A/blockie.deploy=$B/; s/pick=default/pick=runconf/" "$d/cmdline"
+root=$dep/$B
+run
+[[ $rc == 0 && $(cat "$d/state/confirmed") == "$B" && $(init_default) == "$B" ]]
+res $? "two ostree= tokens: the runconf boot of the last one's deployment is the default and confirms"
+
+setup nested
+mkdir -p "$dep/x/$B"
+rm -f "$s/ostree/boot.1/default/222/0"
+ln -s "../../../deploy/default/deploy/x/$B" "$s/ostree/boot.1/default/222/0"
+sed -i 's/^version .*/version 5/' "$s/boot/loader/entries/ostree-2-default.conf"
+sed -i 's/pick=default/pick=runconf/' "$d/cmdline"
+run
+[[ $rc == 0 && ! -e $d/state/confirmed && $(init_default) == "$B" ]] \
+  && grep -qx "blockie-boot-ok: runconf boot of $A, the default entry is $B: nothing written" "$d/out"
+res $? "an entry two levels under deploy/ counts as init counts it"
+
+setup list-fails
+printf 'ostree_list() {\n    printf "%%s %%s %%s\\n" 1 %s x\n    return 1\n}\n' "$A" > "$d/lib"
+lib_real=$lib
+lib=$d/lib
+run
+lib=$lib_real
+refused "ostree_list printing one entry then failing: refused, nothing written" "ostree_list failed (rc 1)"
+
 setup no-conf
 rm -f "$d/conf"
 run
 refused "missing boot-ok.conf refused" "missing"
 
 if [[ $fails == 0 ]]; then
-  echo "test-blockie-boot-ok: all ok"
+  echo "boot-ok: all ok"
   exit 0
 fi
-echo "test-blockie-boot-ok: $fails failed"
+echo "boot-ok: $fails failed"
 exit 1

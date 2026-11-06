@@ -141,8 +141,8 @@ jobs:
         env:
           TAG: ${{ steps.version.outputs.push_tag }}
         run: |
-          for t in image units blobs audio wifi; do
-            podman run --rm -v "$PWD/tests:/tests:ro" "$IMAGE:$TAG" "/tests/$t.sh"
+          for t in image units blobs audio wifi boot-ok; do
+            podman run --rm -v "$PWD/tests:/tests:ro" -v "$PWD/boot:/repo-boot:ro" "$IMAGE:$TAG" "/tests/$t.sh"
           done
 
       - name: Source RPMs

@@ -96,7 +96,7 @@ while read -r t name id _; do
   esac
 done < <(cat /usr/lib/sysusers.d/*.conf 2> /dev/null || true)
 
-noalsa=(blockie-wifi.service blockie-regdom.service)
+noalsa=(blockie-wifi.service blockie-regdom.service blockie-blobs.service blockie-boot-ok.service)
 
 clients=0
 for f in /usr/lib/systemd/system/*.service /etc/systemd/system/*.service; do

@@ -29,10 +29,8 @@ chmod 0777 "$t"
 chmod -R a+rX .
 python3 -c 'import os, sys; os.setgroups([]); os.setgid(65534); os.setuid(65534); os.environ["TMPDIR"] = sys.argv[1]; os.environ["WIFI_SCRIPT"] = sys.argv[2]; os.execv(sys.argv[3], sys.argv[3:])' \
   "$t" "$PWD/files/usr/libexec/blockie/blockie-wifi" "$PWD/tests/test-blockie-wifi"
-for n in boot-ok blobs; do
-  python3 -c 'import os, sys; os.setgroups([]); os.setgid(65534); os.setuid(65534); os.environ["TMPDIR"] = sys.argv[1]; os.environ[sys.argv[2]] = sys.argv[3]; os.execv(sys.argv[4], sys.argv[4:])' \
-    "$t" "$(echo "$n" | tr a-z- A-Z_)_SCRIPT" "$PWD/files/usr/libexec/blockie/blockie-$n" "$PWD/tests/test-blockie-$n"
-done
+python3 -c 'import os, sys; os.setgroups([]); os.setgid(65534); os.setuid(65534); os.environ["TMPDIR"] = sys.argv[1]; os.environ["BLOBS_SCRIPT"] = sys.argv[2]; os.execv(sys.argv[3], sys.argv[3:])' \
+  "$t" "$PWD/files/usr/libexec/blockie/blockie-blobs" "$PWD/tests/test-blockie-blobs"
 rm -rf "${t:?}"
 
 %install

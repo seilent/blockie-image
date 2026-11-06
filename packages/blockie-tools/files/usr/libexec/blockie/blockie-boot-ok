@@ -9,11 +9,14 @@ statedir=${BLOCKIE_BOOT_STATE:-/var/lib/blockie/boot}
 cmdline=${BLOCKIE_CMDLINE:-/proc/cmdline}
 sysroot=${BLOCKIE_SYSROOT:-/sysroot}
 root=${BLOCKIE_ROOT:-/}
+lib=${BLOCKIE_OSTREE_ROOT:-/blockie/lib/ostree-root}
 deploys=$sysroot/ostree/deploy/default/deploy
 id_re='^[0-9a-f]{64}\.[0-9]+$'
 
 [[ -r $conf ]] || die "missing $conf"
 . "$conf"
+[[ -r $lib ]] || die "missing $lib"
+. "$lib"
 
 src=$(findmnt -no SOURCE /var) || die "/var is not mounted"
 [[ $src == *"[/ostree/deploy/default/var]" ]] || die "/var is $src, not the stateroot var"
@@ -31,23 +34,9 @@ done
 [[ $pick == default || $pick == fallback || $pick == runconf ]] || die "the cmdline pick is '$pick'"
 [[ -d $deploys/$deploy && $root -ef $deploys/$deploy ]] || die "/ is not the deployment $deploy"
 
-ids=()
-default=""
-top=-1
-shopt -s nullglob
-for e in "$sysroot"/boot/loader/entries/*.conf; do
-  v=$(sed -n 's/^version[[:space:]]\+\([0-9]\+\)[[:space:]]*$/\1/p' "$e" | head -n 1)
-  p=$(sed -n 's/^options[[:space:]]\+//p' "$e" | tr ' ' '\n' | sed -n 's/^ostree=//p' | head -n 1)
-  [[ -n $v && -n $p ]] || continue
-  d=$(readlink -f "$sysroot$p") || continue
-  [[ ${d%/*} == "$deploys" && ${d##*/} =~ $id_re ]] || continue
-  ids+=("${d##*/}")
-  if (( 10#$v > top )); then
-    top=$((10#$v))
-    default=${d##*/}
-  fi
-done
-shopt -u nullglob
+list=$(set +e +u +o pipefail; ostree_list "$sysroot") || die "ostree_list failed (rc $?)"
+default=$(printf '%s\n' "$list" | LC_ALL=C sort -n -r -k 1,1 | head -n 1 | cut -d' ' -f2)
+mapfile -t ids < <(printf '%s\n' "$list" | cut -d' ' -f2 | grep .)
 [[ " ${ids[*]} " == *" $deploy "* ]] || die "no boot entry names $deploy"
 
 for u in $BLOCKIE_BOOT_OK_FAILED; do
