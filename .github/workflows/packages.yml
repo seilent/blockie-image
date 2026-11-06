@@ -2,12 +2,25 @@ name: packages
 
 on:
   workflow_call:
+    inputs:
+      cold:
+        type: boolean
+        default: false
     secrets:
       SIGNING_SECRET:
         required: true
       SIGNING_PASSWORD:
         required: true
   workflow_dispatch:
+    inputs:
+      cold:
+        description: "Skip every cache restore and save"
+        type: boolean
+        default: false
+      proof:
+        description: "Build this package with a cold builder, then with the builder saved and loaded, and compare (no publish)"
+        type: string
+        default: ''
 
 permissions: {}
 
@@ -75,8 +88,44 @@ jobs:
           tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP/bin" just
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
 
+      - name: Builder key
+        id: builder
+        run: |
+          echo "BLOCKIE_REPO_STATE=$RUNNER_TEMP/repo-state" >> "$GITHUB_ENV"
+          if key=$(BLOCKIE_REPO_STATE=$RUNNER_TEMP/repo-state build/pkg-builder.sh key); then
+            echo "key=$key" >> "$GITHUB_OUTPUT"
+            echo "builder key $key"
+          else
+            echo "::warning::no repo state, the builder is built without a cache key"
+          fi
+
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        id: restore
+        if: steps.builder.outputs.key != '' && !inputs.cold
+        with:
+          path: ${{ runner.temp }}/builder.tar
+          key: pkg-builder-aarch64-${{ steps.builder.outputs.key }}
+
+      - name: Load builder
+        if: steps.restore.outputs.cache-hit == 'true'
+        run: |
+          podman load -i "$RUNNER_TEMP/builder.tar"
+          rm -f "$RUNNER_TEMP/builder.tar"
+
       - name: Build
         run: just pkg "$PKG"
+
+      - name: Save builder
+        if: github.ref == 'refs/heads/main' && steps.builder.outputs.key != '' && steps.restore.outputs.cache-hit != 'true' && !inputs.cold
+        env:
+          KEY: ${{ steps.builder.outputs.key }}
+        run: podman save -o "$RUNNER_TEMP/builder.tar" "localhost/blockie-pkg-builder:$KEY"
+
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        if: github.ref == 'refs/heads/main' && steps.builder.outputs.key != '' && steps.restore.outputs.cache-hit != 'true' && !inputs.cold
+        with:
+          path: ${{ runner.temp }}/builder.tar
+          key: pkg-builder-aarch64-${{ steps.builder.outputs.key }}
 
       - name: Save
         env:
@@ -233,3 +282,59 @@ jobs:
           cosign sign --yes --new-bundle-format=false --key env://COSIGN_PRIVATE_KEY "$REPO@$digest"
           cosign verify --key "$PUBKEY" "$REPO@$digest" > /dev/null
           echo "$REPO:$HASH $digest"
+
+  builder-proof:
+    if: github.event_name == 'workflow_dispatch' && inputs.proof != ''
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      PKG: ${{ inputs.proof }}
+      JUST_VERSION: 1.58.0
+      JUST_SHA256: 748237128c4c40cbdabc65e841d05ceba13cc23a91eaba395495894c1d9764df
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Install tools
+        run: |
+          build/ci-need.sh podman:podman
+          tarball=just-$JUST_VERSION-aarch64-unknown-linux-musl.tar.gz
+          curl -fsSL -o "$RUNNER_TEMP/$tarball" "https://github.com/casey/just/releases/download/$JUST_VERSION/$tarball"
+          echo "$JUST_SHA256  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP/bin" just
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Cold and warm builds
+        run: |
+          [[ $PKG =~ ^[a-z0-9][a-z0-9-]*$ && -n $(git ls-files -- "packages/$PKG/build.sh") ]] || { echo "::error::no package '$PKG'"; exit 1; }
+          export BLOCKIE_REPO_STATE=$RUNNER_TEMP/repo-state
+          key=$(build/pkg-builder.sh key)
+          echo "builder key $key"
+          cat "$BLOCKIE_REPO_STATE/state"
+          just pkg "$PKG" 2>&1 | tee "$RUNNER_TEMP/cold.log"
+          ! grep -q ' reused$' "$RUNNER_TEMP/cold.log" || { echo "::error::the cold build reused a builder"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/cold"
+          cp out/pkg/"$PKG"/*.rpm "$RUNNER_TEMP/cold/"
+          podman save -o "$RUNNER_TEMP/builder.tar" "localhost/blockie-pkg-builder:$key"
+          ls -l "$RUNNER_TEMP/builder.tar"
+          podman rmi -a -f > /dev/null
+          podman load -i "$RUNNER_TEMP/builder.tar"
+          just pkg "$PKG" 2>&1 | tee "$RUNNER_TEMP/warm.log"
+          grep -qxF "pkg-builder: localhost/blockie-pkg-builder:$key reused" "$RUNNER_TEMP/warm.log" || { echo "::error::the warm build did not reuse the loaded builder"; exit 1; }
+          cold=$(grep -o 'pkg-builder: localhost/blockie-pkg-builder rpms [0-9a-f]*' "$RUNNER_TEMP/cold.log")
+          warm=$(grep -o 'pkg-builder: localhost/blockie-pkg-builder rpms [0-9a-f]*' "$RUNNER_TEMP/warm.log")
+          echo "cold $cold"
+          echo "warm $warm"
+          [[ -n $cold && $cold == "$warm" ]] || { echo "::error::the builder package sets differ"; exit 1; }
+          n=0
+          for f in "$RUNNER_TEMP"/cold/*.rpm; do
+            cmp "$f" "out/pkg/$PKG/${f##*/}" || { echo "::error::${f##*/} differs between the cold and the warm build"; exit 1; }
+            echo "equal ${f##*/} $(sha256sum < "$f" | cut -d' ' -f1)"
+            n=$((n + 1))
+          done
+          (( n )) || { echo "::error::no RPM built"; exit 1; }

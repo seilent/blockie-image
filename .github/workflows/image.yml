@@ -4,6 +4,11 @@ on:
   push:
     branches: ['**']
   workflow_dispatch:
+    inputs:
+      cold:
+        description: "Skip every cache restore and save"
+        type: boolean
+        default: false
 
 permissions: {}
 
@@ -32,6 +37,8 @@ jobs:
       contents: read
       packages: write
     uses: ./.github/workflows/packages.yml
+    with:
+      cold: ${{ inputs.cold == true }}
     secrets:
       SIGNING_SECRET: ${{ secrets.SIGNING_SECRET }}
       SIGNING_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}

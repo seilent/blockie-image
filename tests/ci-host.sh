@@ -11,6 +11,8 @@ need=$here/build/ci-need.sh
 plan=$here/build/pkg-plan.sh
 cache=$here/build/source-cache.sh
 seal=$here/build/root-seal.sh
+state=$here/build/repo-state.sh
+builder=$here/build/pkg-builder.sh
 top=$(mktemp -d "${TMPDIR:-/tmp}/ci-host.XXXXXX")
 trap 'rm -rf "${top:?}"' EXIT
 fails=0
@@ -488,6 +490,151 @@ seal_setup r_nosum
 fake sha256sum "cat > /dev/null; echo 'garbage  -'"
 seal_run
 is "$rc" 1 && grep -qF '::error::root-seal: no ' "$d/err"; res $? "seal: an unparsable sha256 fails"
+
+state_setup() {
+  setup "$1"
+  local tool
+  for tool in realpath mkdir sed sha256sum cut mv cat; do
+    ln -sf "$(command -v "$tool")" "$bin/$tool"
+  done
+  mkdir -p "$d/mirror"
+  cat > "$bin/curl" << EOF
+#!$BASH
+url=\${*: -1}
+case \$url in
+  *'metalink?repo=fedora-44&arch=aarch64') exec cat '$d/meta.fedora' ;;
+  *'metalink?repo=updates-released-f44&arch=aarch64') exec cat '$d/meta.updates' ;;
+esac
+f='$d/mirror/'\$(printf '%s' "\$url" | sha256sum | cut -c1-16)
+[[ -f \$f ]] || exit 22
+cat "\$f"
+EOF
+  chmod 755 "$bin/curl"
+}
+
+serve() { printf '%s' "$2" > "$d/mirror/$(printf '%s' "$1" | sha256sum | cut -c1-16)"; }
+
+meta() {
+  local out=$1 want=$2 old=$3 u
+  shift 3
+  {
+    echo '<metalink><files><file name="repomd.xml"><verification>'
+    echo "<hash type=\"md5\">0123</hash><hash type=\"sha256\">$want</hash></verification>"
+    echo "<mm0:alternates><mm0:alternate><verification><hash type=\"sha256\">$old</hash></verification></mm0:alternate></mm0:alternates>"
+    echo '<resources maxconnections="1">'
+    for u in "$@"; do
+      echo "<url protocol=\"${u%%:*}\" type=\"${u%%:*}\" location=\"US\" preference=\"100\">$u/repodata/repomd.xml</url>"
+    done
+    echo '</resources></file></files></metalink>'
+  } > "$out"
+}
+
+hex() { printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
+
+state_run() {
+  out=$(PATH=$bin REPO_ARCH=aarch64 "$BASH" "$state" "$d/st" 2> "$d/err")
+  rc=$?
+}
+
+state_setup q_pick
+meta "$d/meta.fedora" "$(hex fnew)" "$(hex fold)" https://m1/f https://m2/f
+meta "$d/meta.updates" "$(hex unew)" "$(hex uold)" https://m1/u
+serve https://m1/f/repodata/repomd.xml fold
+serve https://m2/f/repodata/repomd.xml fnew
+serve https://m1/u/repodata/repomd.xml unew
+state_run
+is "$rc" 0 && is "$(< "$d/st/state")" "$(printf 'fedora %s https://m2/f/\nupdates %s https://m1/u/' "$(hex fnew)" "$(hex unew)")" \
+  && is "$(< "$d/st/blockie.repo")" "$(printf '[fedora]\nbaseurl=https://m2/f/\nmetalink=\nmirrorlist=\n[updates]\nbaseurl=https://m1/u/\nmetalink=\nmirrorlist=')"; res $? "repo state: the first mirror serving the current repomd is pinned"
+
+state_setup q_nomirror
+meta "$d/meta.fedora" "$(hex fnew)" "$(hex fold)" https://m1/f
+meta "$d/meta.updates" "$(hex unew)" "$(hex uold)" https://m1/u http://m2/u
+serve https://m1/f/repodata/repomd.xml fnew
+serve https://m1/u/repodata/repomd.xml uold
+serve http://m2/u/repodata/repomd.xml unew
+state_run
+is "$rc" 1 && grep -qF 'no mirror serves the updates repomd' "$d/err" && [[ ! -e $d/st/state && ! -e $d/st/blockie.repo ]]; res $? "repo state: an alternate or a plain http mirror is not taken, nothing is written"
+
+state_setup q_nometa
+meta "$d/meta.fedora" "$(hex fnew)" "$(hex fold)" https://m1/f
+serve https://m1/f/repodata/repomd.xml fnew
+state_run
+is "$rc" 1 && grep -qF 'no metalink for updates' "$d/err"; res $? "repo state: a missing metalink fails"
+
+builder_setup() {
+  setup "$1"
+  local tool
+  for tool in cut sha256sum sort mktemp rm realpath dirname cat; do
+    ln -sf "$(command -v "$tool")" "$bin/$tool"
+  done
+  ln -sf "$BASH" "$bin/bash"
+  r=$d/repo
+  mkdir -p "$r/build" "$r/packages/x" "$d/st"
+  cp "$builder" "$r/build/"
+  echo 'FROM fedora' > "$r/build/pkg.Containerfile"
+  echo 'FROM localhost/blockie-pkg-builder' > "$r/packages/x/Containerfile"
+  printf '#!%s\nexit 1\n' "$BASH" > "$r/build/repo-state.sh"
+  chmod 755 "$r/build/repo-state.sh"
+  printf 'fedora %s https://m1/f/\nupdates %s https://m1/u/\n' "$(hex f)" "$(hex u)" > "$d/st/state"
+  echo '[fedora]' > "$d/st/blockie.repo"
+  echo 1 > "$d/exists"
+  cat > "$bin/podman" << EOF
+#!$BASH
+echo "\$*" >> '$d/calls'
+case \$1 in
+  image) exit \$(< '$d/exists') ;;
+  run) printf 'b\na\n' ;;
+esac
+EOF
+  chmod 755 "$bin/podman"
+}
+
+builder_run() {
+  out=$(cd "$r" && PATH=$bin BLOCKIE_REPO_STATE=${st_env-$d/st} "$BASH" "$r/build/pkg-builder.sh" "$@" 2> "$d/err")
+  rc=$?
+}
+
+bkey() { (cd "$r" && PATH=$bin BLOCKIE_REPO_STATE=$d/st "$BASH" "$r/build/pkg-builder.sh" key); }
+
+base=localhost/blockie-pkg-builder
+lim='--memory=14g --cpu-period=100000 --cpu-quota=600000'
+
+builder_setup b_build
+k=$(bkey)
+builder_run build y
+is "$rc" 0 && is "$out" "$base $k" && grep -qxF "build --no-cache $lim -v $d/st:/etc/dnf/repos.override.d:ro,Z -t $base:$k -t $base -f build/pkg.Containerfile build" "$d/calls" \
+  && grep -qE "^pkg-builder: $base rpms [0-9a-f]{16}$" "$d/err" && [[ $k =~ ^[0-9a-f]{16}$ ]]; res $? "builder: a new repo state builds the keyed builder without the layer cache, with the pinned repos"
+
+builder_setup b_reuse
+echo 0 > "$d/exists"
+k=$(bkey)
+builder_run build y
+is "$rc" 0 && is "$out" "$base $k" && grep -qxF "tag $base:$k $base" "$d/calls" && ! grep -q '^build' "$d/calls"; res $? "builder: a keyed builder that exists is reused, nothing is built"
+
+builder_setup b_pkg
+k=$(bkey)
+builder_run build x
+is "$rc" 0 && is "$out" "$base-x $k" && grep -qxF "build --from $base:$k $lim -t $base-x -f packages/x/Containerfile packages/x" "$d/calls"; res $? "builder: a package builder is built from the keyed base"
+
+builder_setup b_nostate
+rm -f "$d/st/state"
+st_env='' builder_run build x
+is "$rc" 0 && is "$out" "$base-x -" && grep -qxF "build --no-cache $lim -t $base -f build/pkg.Containerfile build" "$d/calls" \
+  && grep -qxF "build $lim -t $base-x -f packages/x/Containerfile packages/x" "$d/calls" && grep -qF '::warning::pkg-builder: no repo state' "$d/err"; res $? "builder: no repo state builds without a key, a cache or the pinned repos"
+
+builder_setup b_key
+k1=$(bkey)
+printf 'fedora %s https://m9/f/\nupdates %s https://m9/u/\n' "$(hex f)" "$(hex u)" > "$d/st/state"
+k2=$(bkey)
+printf 'fedora %s https://m9/f/\nupdates %s https://m9/u/\n' "$(hex f)" "$(hex u2)" > "$d/st/state"
+k3=$(bkey)
+echo 'FROM fedora2' > "$r/build/pkg.Containerfile"
+k4=$(bkey)
+is "$k1" "$k2" && ! is "$k2" "$k3" && ! is "$k3" "$k4"; res $? "builder: the key follows the repomd sums and the Containerfile, not the mirror"
+
+builder_setup b_name
+builder_run build ../x
+is "$rc" 2 && is "$(< "$d/calls")" ''; res $? "builder: a bad package name is refused before podman"
 
 if (( fails )); then
   echo "ci-host: $fails failed"

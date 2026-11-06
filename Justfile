@@ -1,7 +1,6 @@
 set positional-arguments
 
 podman := env_var_or_default("PODMAN", "podman")
-builder := "localhost/blockie-pkg-builder"
 
 pkg name:
     #!/usr/bin/env bash
@@ -12,12 +11,8 @@ pkg name:
     [[ -z $(git status --porcelain -- "${inputs[@]}") ]] || dirty=1
     out=out/pkg/$1
     tag=localhost/blockie-pkg/$1:$hash
-    {{podman}} build --memory=14g --cpu-period=100000 --cpu-quota=600000 -t {{builder}} -f build/pkg.Containerfile build
-    img={{builder}}
-    if [[ -f packages/$1/Containerfile ]]; then
-      img={{builder}}-$1
-      {{podman}} build --memory=14g --cpu-period=100000 --cpu-quota=600000 -t "$img" -f "packages/$1/Containerfile" "packages/$1"
-    fi
+    sel=$(PODMAN="{{podman}}" build/pkg-builder.sh build "$1")
+    img=${sel% *}
     rm -rf "${out:?}"
     mkdir -p "$out"
     src=()
