@@ -123,13 +123,34 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "$push_tag"
 
+      - name: Dnf cache dir
+        id: dnf
+        run: |
+          dir=$RUNNER_TEMP/buildah-tmp/buildah-cache-$(id -u)/blockie-dnf
+          mkdir -p "$dir"
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        if: inputs.cold != true
+        with:
+          path: ${{ steps.dnf.outputs.dir }}
+          key: dnf-rpms-aarch64-${{ steps.dnf.outputs.date }}
+          restore-keys: dnf-rpms-aarch64-
+
       - name: Build
+        id: build
         env:
           KERNEL_REF: ${{ steps.kernel.outputs.ref }}
           VERSION: ${{ steps.version.outputs.version }}
           TAG: ${{ steps.version.outputs.push_tag }}
+          DNF_DIR: ${{ steps.dnf.outputs.dir }}
         run: |
-          podman build \
+          find "$DNF_DIR" -mindepth 2 -maxdepth 2 ! -name packages -exec rm -rf {} +
+          find "$DNF_DIR" -type f ! -name '*.rpm' -delete
+          echo "dnf cache before the build: $(find "$DNF_DIR" -name '*.rpm' | wc -l) rpms"
+          TMPDIR=$RUNNER_TEMP/buildah-tmp podman build \
+            --build-arg "BLOCKIE_DNF_OPTS=--setopt=keepcache=True --disablerepo=updates-archive" \
             --build-arg "KERNEL_REF=$KERNEL_REF" \
             --build-arg "BLOCKIE_VERSION=$VERSION" \
             --build-arg "BLOCKIE_REVISION=$GITHUB_SHA" \
@@ -143,6 +164,27 @@ jobs:
           [[ $n -gt 0 && ${got[*]:0:n} == "${want[*]}" ]] || { echo "::error::image layers do not start with the $base layers"; exit 1; }
           podman image inspect --format '{{.Size}}' "$IMAGE:$TAG" | awk '{ printf "image %.2f GB\n", $1 / 1e9 }'
           df -H /
+          find "$RUNNER_TEMP/buildah-tmp" -maxdepth 3 -type d
+          if [[ -d $DNF_DIR/. && -n $(ls -A "$DNF_DIR") ]]; then
+            sha256sum "$DNF_DIR"/*/repodata/repomd.xml || true
+            podman run --rm "$IMAGE:$TAG" rpm -qa --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}.rpm\n' | sort > "$RUNNER_TEMP/nevra"
+            rm -rf "${DNF_DIR:?}"/@commandline-*
+            find "$DNF_DIR" -mindepth 2 -maxdepth 2 ! -name packages -exec rm -rf {} +
+            find "$DNF_DIR" -type f ! -name '*.rpm' -delete
+            while read -r f; do
+              grep -qxF "${f##*/}" "$RUNNER_TEMP/nevra" || rm -f "$f"
+            done < <(find "$DNF_DIR" -name '*.rpm')
+            echo "dnf cache to save: $(find "$DNF_DIR" -name '*.rpm' | wc -l) rpms, $(du -sh "$DNF_DIR" | cut -f1)"
+            echo "save=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::no dnf cache at $DNF_DIR, nothing to save"
+          fi
+
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        if: github.ref == 'refs/heads/main' && inputs.cold != true && steps.build.outputs.save == 'true'
+        with:
+          path: ${{ steps.dnf.outputs.dir }}
+          key: dnf-rpms-aarch64-${{ steps.dnf.outputs.date }}
 
       - name: Test
         env:

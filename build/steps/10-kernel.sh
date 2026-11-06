@@ -12,7 +12,8 @@ for f in /rpms/blockie-kernel-*.rpm; do
   [[ -f $f && $f != *.src.rpm ]] && rpms+=("$f")
 done
 [[ ${#rpms[@]} -eq 1 ]] || { echo "10-kernel: expected one blockie-kernel rpm in /rpms" >&2; exit 1; }
-dnf -y install "${rpms[0]}"
+read -ra opts <<< "${BLOCKIE_DNF_OPTS:-}"
+dnf -y "${opts[@]}" install "${rpms[0]}"
 
 kver=$(rpm -qlp "${rpms[0]}" | sed -n 's|^/usr/lib/modules/\([^/]*\)$|\1|p')
 mods=(/usr/lib/modules/*)

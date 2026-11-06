@@ -22,7 +22,8 @@ for p in "${own[@]}"; do
   rpms+=("$(own_rpm "$p")")
 done
 
-dnf -y install \
+read -ra opts <<< "${BLOCKIE_DNF_OPTS:-}"
+dnf -y "${opts[@]}" install \
   "${rpms[@]}" \
   e2fsprogs \
   erofs-utils \

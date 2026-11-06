@@ -8,15 +8,21 @@ COPY system_files /system_files
 
 FROM registry.fedoraproject.org/fedora-bootc:44@sha256:4f7fb0a13ebd9a1e48380b1db60259a6fe398444a8277fe02e074338ef2d748e
 
+ARG BLOCKIE_DNF_OPTS
+
 RUN --mount=type=bind,from=ctx,source=/,target=/ctx \
     --mount=type=bind,from=kernel,source=/rpms,target=/rpms \
-    /ctx/steps/10-kernel.sh
+    --mount=type=cache,id=blockie-dnf,target=/var/cache/libdnf5 \
+    BLOCKIE_DNF_OPTS=${BLOCKIE_DNF_OPTS} /ctx/steps/10-kernel.sh
 
-RUN --mount=type=bind,from=ctx,source=/,target=/ctx /ctx/steps/20-release.sh
+RUN --mount=type=bind,from=ctx,source=/,target=/ctx \
+    --mount=type=cache,id=blockie-dnf,target=/var/cache/libdnf5 \
+    BLOCKIE_DNF_OPTS=${BLOCKIE_DNF_OPTS} /ctx/steps/20-release.sh
 
 RUN --mount=type=bind,from=ctx,source=/,target=/ctx \
     --mount=type=bind,from=pkgs,source=/,target=/pkgs \
-    /ctx/steps/30-packages.sh
+    --mount=type=cache,id=blockie-dnf,target=/var/cache/libdnf5 \
+    BLOCKIE_DNF_OPTS=${BLOCKIE_DNF_OPTS} /ctx/steps/30-packages.sh
 
 RUN --mount=type=bind,from=ctx,source=/,target=/ctx /ctx/steps/40-system-files.sh
 

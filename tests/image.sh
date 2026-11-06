@@ -88,4 +88,5 @@ for v in FAILED ACTIVE NOT_EXIT1; do
 done
 [[ -d /usr/share/blockie/blobs.d ]] || fail "no blobs.d"
 
+echo "image: dnf5 $(rpm -q dnf5)"
 echo "image: ok $kver"
