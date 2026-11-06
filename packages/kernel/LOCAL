@@ -1,0 +1,1 @@
+The full LTO vmlinux link peaks at 22 GB, above the 16 GB of the arm64 runner.
