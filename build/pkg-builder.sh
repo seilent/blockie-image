@@ -42,9 +42,9 @@ case $mode in
     img=$base
     if [[ -f packages/$name/Containerfile ]]; then
       img=$base-$name
-      from=()
-      [[ $k == - ]] || from=(--from "$base:$k")
-      "${podman[@]}" build "${from[@]}" "${limits[@]}" -t "$img" -f "packages/$name/Containerfile" "packages/$name" >&2
+      keyed=()
+      [[ $k == - ]] || keyed=(--from "$base:$k" -v "$st:/etc/dnf/repos.override.d:ro,Z")
+      "${podman[@]}" build "${keyed[@]}" "${limits[@]}" -t "$img" -f "packages/$name/Containerfile" "packages/$name" >&2
     fi
     echo "$img $k"
     ;;

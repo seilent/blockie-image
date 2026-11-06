@@ -18,7 +18,7 @@ on:
         type: boolean
         default: false
       proof:
-        description: "Build this package with a cold builder, then with the builder saved and loaded, and compare (no publish)"
+        description: "Build this package with a cold builder, then with the builder saved and loaded, and compare (no publish; a package without its own Containerfile, such as blk-wmt)"
         type: string
         default: ''
 

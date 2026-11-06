@@ -614,7 +614,7 @@ is "$rc" 0 && is "$out" "$base $k" && grep -qxF "tag $base:$k $base" "$d/calls" 
 builder_setup b_pkg
 k=$(bkey)
 builder_run build x
-is "$rc" 0 && is "$out" "$base-x $k" && grep -qxF "build --from $base:$k $lim -t $base-x -f packages/x/Containerfile packages/x" "$d/calls"; res $? "builder: a package builder is built from the keyed base"
+is "$rc" 0 && is "$out" "$base-x $k" && grep -qxF "build --from $base:$k -v $d/st:/etc/dnf/repos.override.d:ro,Z $lim -t $base-x -f packages/x/Containerfile packages/x" "$d/calls"; res $? "builder: a package builder is built from the keyed base with the pinned repos"
 
 builder_setup b_nostate
 rm -f "$d/st/state"
