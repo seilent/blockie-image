@@ -20,7 +20,8 @@ for u in blockie-wifi.service blockie-regdom.service; do
 done
 grep -qx 'After=blockie-wifi.service' /usr/lib/systemd/system/blockie-regdom.service || fail "regdom not after wifi"
 grep -qx 'ExecStart=/usr/bin/iw reg set JP' /usr/lib/systemd/system/blockie-regdom.service || fail "regdom country"
-grep -qxF "ExecStartPost=/bin/sh -c 'iw reg get | grep -q \"^country JP\"'" /usr/lib/systemd/system/blockie-regdom.service ||
+grep -qxF "ExecStartPost=/bin/sh -c 'iw reg get | awk \"/^global/ { g = 1; next } g && /^country / { print; exit }\" | grep -q \"^country JP:\"'" \
+  /usr/lib/systemd/system/blockie-regdom.service ||
   fail "regdom does not check the country"
 for l in RefuseManualStop=yes IgnoreOnIsolate=yes RemainAfterExit=yes ConditionPathIsDirectory=/run/blockie TimeoutStartSec=600; do
   grep -qxF "$l" /usr/lib/systemd/system/blockie-wifi.service || fail "blockie-wifi.service lacks $l"
