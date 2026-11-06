@@ -1,0 +1,62 @@
+#!/bin/sh
+set -uf
+trap '' HUP
+
+PATH=/blockie/bin:$PATH:/usr/sbin:/usr/bin:/sbin:/bin
+mods=${BT_MODULES:-/vendor/lib/modules}
+run=${BT_RUN:-/run/blockie}
+proc=${BT_PROC:-/proc}
+dev=${BT_DEV:-/dev}
+logs=${BT_LOG:-/dev/kmsg /dev/pmsg0}
+node=${BT_NODE:-c0:0}
+wait_s=${BT_WAIT:-10}
+nonce=${BLOCKIE_NONCE:-$(cat "$run/nonce" 2> /dev/null)}
+ko=bt_drv_connac1x
+case $nonce in
+"" | *[!0-9a-f]*) nonce=- ;;
+esac
+
+m() {
+    line="blockie: ${nonce:--} bt up=$(cut -d' ' -f1 "$proc/uptime") $*"
+    echo "$line"
+    for f in $logs; do
+        [ -w "$f" ] && echo "$line" >> "$f" 2> /dev/null
+    done
+}
+
+end() {
+    rc=$1
+    shift
+    m "pre result rc=$rc $*"
+    exit "$rc"
+}
+
+loaded() {
+    grep -q "^$1 " "$proc/modules"
+}
+
+m "pre start mods=$mods"
+loaded wmt_drv || end 1 why=no_wmt_drv
+if loaded "$ko"; then
+    m "pre insmod ko=$ko already=1"
+else
+    [ -f "$mods/$ko.ko" ] || end 1 why=no_module
+    out=$(insmod "$mods/$ko.ko" 2>&1)
+    rc=$?
+    m "pre insmod ko=$ko rc=$rc" $out
+    if [ "$rc" != 0 ]; then
+        case $out in
+        *"File exists"*) ;;
+        *) end 2 why=insmod ;;
+        esac
+    fi
+fi
+i=0
+while [ ! -c "$dev/stpbt" ] && [ "$i" -lt "$wait_s" ]; do
+    sleep 1
+    i=$((i + 1))
+done
+[ -c "$dev/stpbt" ] || end 6 why=no_stpbt wait_s="$wait_s"
+got=$(stat -L -c %t:%T "$dev/stpbt" 2> /dev/null)
+[ "$got" = "$node" ] || end 6 why=stpbt_node node="${got:--}"
+end 0 stpbt=yes after_s="$i"

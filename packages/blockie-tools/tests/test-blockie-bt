@@ -1,0 +1,121 @@
+#!/bin/sh
+set -u
+
+script=$(readlink -f "${BT_SCRIPT:-$(dirname "$0")/../files/usr/libexec/blockie/blockie-bt}")
+if [ "$(id -u)" = 0 ]; then
+    echo "test-blockie-bt: refuses to run as root"
+    exit 1
+fi
+top=$(mktemp -d "${TMPDIR:-/tmp}/test-blockie-bt.XXXXXX")
+trap 'rm -rf "${top:?}"' EXIT
+fails=0
+
+res() {
+    if [ "$1" = 0 ]; then
+        echo "ok   $2"
+    else
+        echo "FAIL $2"
+        fails=$((fails + 1))
+    fi
+}
+
+setup() {
+    d=$top/$1
+    mkdir -p "$d/bin" "$d/proc" "$d/dev" "$d/mods" "$d/run"
+    echo "123.45 100.00" > "$d/proc/uptime"
+    echo "wmt_drv 16384 0 - Live 0x0" > "$d/proc/modules"
+    echo 0123456789abcdef > "$d/run/nonce"
+    : > "$d/mods/bt_drv_connac1x.ko"
+    : > "$d/calls"
+    : > "$d/kmsg"
+    ln -s /dev/null "$d/dev/stpbt"
+    cat > "$d/bin/insmod" << 'EOF'
+#!/bin/sh
+echo "insmod $*" >> "$FAKE_DIR/calls"
+case ${FAKE_INSMOD:-ok} in
+fail) echo "insmod: can't insert '$1': Operation not permitted"; exit 1 ;;
+exists) echo "insmod: can't insert '$1': File exists"; exit 1 ;;
+esac
+echo "$(basename "$1" .ko) 16384 0 - Live 0x0" >> "$FAKE_DIR/proc/modules"
+EOF
+    chmod 755 "$d/bin/insmod"
+}
+
+go() {
+    env PATH="$d/bin:$PATH" FAKE_DIR="$d" BT_MODULES="$d/mods" BT_RUN="$d/run" BT_PROC="$d/proc" BT_DEV="$d/dev" \
+        BT_LOG="$d/kmsg" BT_NODE=1:3 BT_WAIT=1 "$@" sh "$script" > "$d/out" 2>&1
+    echo $?
+}
+
+has() {
+    grep -q -F -e "$1" "$d/kmsg"
+    echo $?
+}
+
+setup ok
+rc=$(go)
+[ "$rc" = 0 ] && grep -q -x "insmod $d/mods/bt_drv_connac1x.ko" "$d/calls" && [ "$(has 'pre result rc=0 stpbt=yes')" = 0 ]
+res $? "inserts bt_drv_connac1x and finds /dev/stpbt"
+[ "$(has 'blockie: 0123456789abcdef bt up=123.45 pre start')" = 0 ] && grep -q 'pre result rc=0' "$d/out"
+res $? "markers carry the nonce and uptime, to the log and stdout"
+
+setup badnonce
+printf 'ab\nblockie: forged\n' > "$d/run/nonce"
+rc=$(go)
+[ "$rc" = 0 ] && [ "$(has 'blockie: - bt up=')" = 0 ] && [ "$(has 'forged')" = 1 ]
+res $? "a nonce that is not hex is written as -"
+
+setup loaded
+echo "bt_drv_connac1x 16384 0 - Live 0x0" >> "$d/proc/modules"
+rc=$(go)
+[ "$rc" = 0 ] && [ ! -s "$d/calls" ] && [ "$(has 'already=1')" = 0 ]
+res $? "an already loaded module is not inserted again"
+
+setup exists
+rc=$(go env FAKE_INSMOD=exists)
+[ "$rc" = 0 ] && [ "$(has 'pre result rc=0')" = 0 ]
+res $? "insmod File exists counts as loaded"
+
+setup nowmt
+: > "$d/proc/modules"
+rc=$(go)
+[ "$rc" = 1 ] && [ ! -s "$d/calls" ] && [ "$(has 'why=no_wmt_drv')" = 0 ]
+res $? "no wmt_drv exits 1 before any insmod"
+
+setup nomod
+rm -f "$d/mods/bt_drv_connac1x.ko"
+rc=$(go)
+[ "$rc" = 1 ] && [ ! -s "$d/calls" ] && [ "$(has 'why=no_module')" = 0 ]
+res $? "a missing module file exits 1"
+
+setup insfail
+rc=$(go env FAKE_INSMOD=fail)
+[ "$rc" = 2 ] && [ "$(has 'why=insmod')" = 0 ] && [ "$(has 'Operation not permitted')" = 0 ]
+res $? "a failed insmod exits 2 with its message"
+
+setup nonode
+rm -f "$d/dev/stpbt"
+rc=$(go)
+[ "$rc" = 6 ] && [ "$(has 'why=no_stpbt wait_s=1')" = 0 ]
+res $? "no /dev/stpbt within the wait exits 6"
+
+setup wrongnode
+rm -f "$d/dev/stpbt"
+ln -s /dev/zero "$d/dev/stpbt"
+rc=$(go)
+[ "$rc" = 6 ] && [ "$(has 'why=stpbt_node node=1:5')" = 0 ]
+res $? "a char device with another number exits 6"
+
+setup regular
+rm -f "$d/dev/stpbt"
+: > "$d/dev/stpbt"
+rc=$(go)
+[ "$rc" = 6 ] && [ "$(has 'why=no_stpbt')" = 0 ]
+res $? "a regular file at /dev/stpbt exits 6"
+
+if [ "$fails" = 0 ]; then
+    echo "0 failures"
+else
+    echo "$fails failures"
+    exit 1
+fi

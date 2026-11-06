@@ -5,3 +5,9 @@ https://github.com/MotorolaMobilityLLC/vendor-mediatek-kernel_modules-connectivi
 2993f4be). The NVRAM and Wi-Fi power on writes follow MediaTek's wmt_cdev_wifi.c (GPL-2.0, Dual BSD/GPL module) as
 published in https://github.com/MotorolaMobilityLLC/vendor-mediatek-kernel_modules-connectivity-wlan-adaptor
 (android-15-release-vvob35, 11353556).
+packages/blk-bt: written from MediaTek's stp_chrdev_bt.c (Dual BSD/GPL) as published in
+https://github.com/MotorolaMobilityLLC/vendor-mediatek-kernel_modules-connectivity-bt-mt66xx (2a851b31), the Linux
+hci_ldisc and hci_h4 drivers and the Bluetooth Core specification. The firmware quirks it handles (the Read
+Synchronization Train Parameters reply, the LE command bits in Read Local Supported Commands, the BD address write
+after HCI Reset) were found by https://github.com/snowopsdev/omarchy-iplay50-mini-pro (b7fa1570),
+https://github.com/Barley-Project/tb330fu-ubuntu (684d207f) and https://github.com/HuskerMinion/techo5 (2fa63874).

@@ -1,0 +1,19 @@
+[Unit]
+Description=Bridge the MT6768 Bluetooth to the kernel HCI through blk-bt
+Requires=blockie-wifi.service
+After=blockie-wifi.service
+Before=bluetooth.service
+ConditionPathExists=/vendor/lib/modules/bt_drv_connac1x.ko
+ConditionPathExists=/sys/class/net/wlan0
+StartLimitIntervalSec=600
+StartLimitBurst=3
+
+[Service]
+Type=notify
+Restart=no
+ExecStartPre=/usr/libexec/blockie/blockie-bt
+ExecStart=/usr/libexec/blockie/blk-bt run
+ExecStopPost=/usr/libexec/blockie/blk-bt stop-post
+
+[Install]
+WantedBy=multi-user.target

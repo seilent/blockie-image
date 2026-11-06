@@ -1,0 +1,878 @@
+#!/usr/bin/env python3
+import fcntl
+import os
+import select
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import tty
+
+BIN = os.path.abspath(sys.argv[1]) if len(sys.argv) == 2 else sys.exit("usage: test-bt <blk-bt test build>")
+BOOT = "6f1c5e2a-0d3b-4c8e-9a71-2b4f0e9d1c33"
+ADDR = bytes([0x02, 0x11, 0x22, 0x33, 0x44, 0x55])
+fails = []
+procs = []
+
+
+def check(ok, what):
+    print(("ok   " if ok else "FAIL ") + what, flush=True)
+    if not ok:
+        fails.append(what)
+
+
+def record(size=440, addr=ADDR):
+    r = bytearray(size)
+    r[0:6] = addr
+    for i in range(6, min(size, 438)):
+        r[i] = (i * 7 + 3) & 0xFF
+    return bytes(r)
+
+
+def cc(op, status=0, params=b""):
+    body = bytes([1, op & 0xFF, op >> 8, status]) + params
+    return bytes([0x04, 0x0E, len(body)]) + body
+
+
+def cmd(op, params=b""):
+    return bytes([0x01, op & 0xFF, op >> 8, len(params)]) + params
+
+
+def dummy(path, name):
+    exe = os.path.join(path, name)
+    shutil.copy(shutil.which("sleep"), exe)
+    p = subprocess.Popen([exe, "1000"])
+    procs.append(p)
+    return p
+
+
+class Ctl(threading.Thread):
+    def __init__(self, fd):
+        super().__init__(daemon=True)
+        self.fd = fd
+        self.buf = b""
+        self.got = []
+        self.events = []
+        self.mute = set()
+        self.status = {}
+        self.delay = {}
+        self.bdaddr = bytes(reversed(ADDR))
+        self.cmds = bytes(64)
+        self.acl_mtu = 1021
+        self.halt = False
+        self.lock = threading.Lock()
+
+    def send(self, b):
+        os.write(self.fd, b)
+
+    def answer(self, pkt):
+        op = pkt[1] | (pkt[2] << 8)
+        if op in self.mute:
+            return
+        if op in self.delay:
+            time.sleep(self.delay[op])
+        st = self.status.get(op, 0)
+        if op == 0x1009:
+            out = cc(op, st, self.bdaddr)
+        elif op == 0x1002:
+            out = cc(op, st, self.cmds)
+        elif op == 0x1005:
+            out = cc(op, st, bytes([self.acl_mtu & 0xFF, self.acl_mtu >> 8, 0x40, 8, 0, 0, 0]))
+        else:
+            out = cc(op, st)
+        with self.lock:
+            self.events.append(("answer", op, time.monotonic()))
+        self.send(out)
+
+    def run(self):
+        while not self.halt:
+            r, _, _ = select.select([self.fd], [], [], 0.05)
+            if not r:
+                continue
+            try:
+                d = os.read(self.fd, 65536)
+            except OSError:
+                return
+            self.buf += d
+            while self.buf:
+                t = self.buf[0]
+                if t == 1 and len(self.buf) >= 4 and len(self.buf) >= 4 + self.buf[3]:
+                    n = 4 + self.buf[3]
+                elif t == 2 and len(self.buf) >= 5 and len(self.buf) >= 5 + (self.buf[3] | self.buf[4] << 8):
+                    n = 5 + (self.buf[3] | self.buf[4] << 8)
+                elif t in (1, 2):
+                    break
+                else:
+                    n = 1
+                pkt, self.buf = self.buf[:n], self.buf[n:]
+                with self.lock:
+                    self.got.append(pkt)
+                    self.events.append(("got", pkt, time.monotonic()))
+                if pkt[0] == 1:
+                    self.answer(pkt)
+
+    def ops(self):
+        with self.lock:
+            return [p[1] | (p[2] << 8) for p in self.got if p[0] == 1]
+
+
+class Env:
+    def __init__(self, top, name, opens=None, power=True, launcher="yes", alive=True, wifi="on", wlan0=True, nv=440, addr=ADDR):
+        self.d = os.path.join(top, name)
+        os.makedirs(self.d)
+        self.run = os.path.join(self.d, "run")
+        self.state = os.path.join(self.run, "wmt", BOOT)
+        os.makedirs(self.state)
+        self.dev = os.path.join(self.d, "dev")
+        os.makedirs(self.dev)
+        self.sys = os.path.join(self.d, "sys")
+        if wlan0:
+            os.makedirs(os.path.join(self.sys, "class", "net", "wlan0"))
+        else:
+            os.makedirs(os.path.join(self.sys, "class", "net"))
+        self.bin = os.path.join(self.d, "bin")
+        os.makedirs(self.bin)
+        self.boot = os.path.join(self.d, "boot_id")
+        with open(self.boot, "w") as f:
+            f.write(BOOT + "\n")
+        self.kmsg = os.path.join(self.d, "kmsg")
+        open(self.kmsg, "w").close()
+        self.trace = os.path.join(self.d, "trace")
+        self.ctlfile = os.path.join(self.d, "ctl")
+        open(self.ctlfile, "w").close()
+        self.nv = os.path.join(self.d, "BT_Addr")
+        if nv is not None:
+            with open(self.nv, "wb") as f:
+                f.write(record(nv, addr))
+        if power:
+            self.put("once.power", "1")
+        if launcher is not None:
+            self.put("launcher", launcher)
+        if alive:
+            self.put("pid", str(dummy(self.bin, "blk-wmt").pid))
+        else:
+            self.put("pid", "999999")
+        if wifi is not None:
+            self.put("wifi", wifi)
+        if opens is not None:
+            self.put("bt.opens", str(opens))
+        m, s = os.openpty()
+        tty.setraw(s)
+        tty.setraw(m)
+        self.cm = m
+        self.cs = s
+        self.slave = os.ttyname(s)
+        os.symlink(self.slave, os.path.join(self.dev, "stpbt"))
+        self.ctl = Ctl(m)
+        self.ctl.start()
+
+    def put(self, name, v):
+        with open(os.path.join(self.state, name), "w") as f:
+            f.write(v + "\n")
+
+    def get(self, name):
+        try:
+            with open(os.path.join(self.state, name)) as f:
+                return f.read().strip()
+        except OSError:
+            return None
+
+    def tracelines(self):
+        try:
+            with open(self.trace) as f:
+                return f.read().splitlines()
+        except OSError:
+            return []
+
+    def start(self, *args, extra=None, devnum=True):
+        env = dict(os.environ)
+        env.update({"FAKE_TRACE": self.trace, "FAKE_STPBT": self.slave, "FAKE_CTL": self.ctlfile, "FAKE_STATE": self.state})
+        env.pop("NOTIFY_SOCKET", None)
+        if extra:
+            env.update(extra)
+        rdev = os.stat(self.slave).st_rdev
+        num = ["--stpbt-dev", "%d:%d" % (os.major(rdev), os.minor(rdev))] if devnum else []
+        argv = [BIN, "-r", self.run, "-d", self.dev, "-s", self.sys, "-b", self.boot, "-k", self.kmsg, "-n", self.nv, *num, *args, "run"]
+        self.p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        self.out = b""
+        os.set_blocking(self.p.stdout.fileno(), False)
+        self.host = None
+        self.hbuf = b""
+        return self
+
+    def pump(self, t=0.05):
+        r, _, _ = select.select([self.p.stdout], [], [], t)
+        if r:
+            try:
+                d = os.read(self.p.stdout.fileno(), 65536)
+            except BlockingIOError:
+                d = b""
+            self.out += d
+
+    def wait_mark(self, s, timeout=5):
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            if s.encode() in self.out:
+                return True
+            if self.p.poll() is not None:
+                self.pump(0.2)
+                return s.encode() in self.out
+            self.pump()
+        return s.encode() in self.out
+
+    def attach(self, timeout=5):
+        if not self.wait_mark("hci=", timeout):
+            return False
+        for line in self.tracelines():
+            if line.startswith("ioctl TIOCSETD"):
+                path = line.split()[3]
+                self.host = os.open(path, os.O_RDWR | os.O_NOCTTY)
+                tty.setraw(self.host)
+                return True
+        return False
+
+    def hsend(self, b):
+        os.write(self.host, b)
+
+    def hread(self, n, timeout=3):
+        end = time.monotonic() + timeout
+        while len(self.hbuf) < n and time.monotonic() < end:
+            r, _, _ = select.select([self.host], [], [], 0.05)
+            if r:
+                try:
+                    self.hbuf += os.read(self.host, 65536)
+                except OSError:
+                    break
+            self.pump(0)
+        b, self.hbuf = self.hbuf[:n], self.hbuf[n:]
+        return b
+
+    def hdrain(self, timeout=0.5):
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            r, _, _ = select.select([self.host], [], [], 0.05)
+            if r:
+                try:
+                    d = os.read(self.host, 65536)
+                except OSError:
+                    break
+                if not d:
+                    break
+                self.hbuf += d
+        b, self.hbuf = self.hbuf, b""
+        return b
+
+    def finish(self, sig=None, timeout=10):
+        if sig and self.p.poll() is None:
+            self.p.send_signal(sig)
+        try:
+            self.p.wait(timeout)
+        except subprocess.TimeoutExpired:
+            self.p.kill()
+            self.p.wait()
+        self.pump(0.1)
+        self.out += self.p.stdout.read() or b""
+        self.err = self.p.stderr.read()
+        self.ctl.halt = True
+        if self.host is not None:
+            os.close(self.host)
+        return self.p.returncode
+
+    def text(self):
+        return self.out.decode(errors="replace")
+
+
+def fc1a():
+    return bytes([0x01, 0x1A, 0xFC, 0x06]) + bytes(reversed(ADDR))
+
+
+def writes(e):
+    return [bytes.fromhex(line[2:]) for line in e.tracelines() if line.startswith("w ")]
+
+
+def up(top, name, *args, extra=None, **kw):
+    e = Env(top, name, **kw)
+    e.start(*args, extra=extra)
+    ok = e.attach()
+    return e, ok
+
+
+def main():
+    if os.getuid() == 0:
+        sys.exit("test-bt: refuses to run as root")
+    top = tempfile.mkdtemp(prefix="test-bt.", dir=os.environ.get("TMPDIR"))
+    try:
+        tests(top)
+    finally:
+        for p in procs:
+            p.kill()
+            p.wait()
+        shutil.rmtree(top)
+    if fails:
+        print("%d failures" % len(fails))
+        sys.exit(1)
+    print("0 failures")
+
+
+def tests(top):
+    r = subprocess.run([BIN], capture_output=True)
+    check(r.returncode == 1 and b"usage: blk-bt" in r.stderr, "usage exits 1")
+    r = subprocess.run([BIN, "start"], capture_output=True)
+    check(r.returncode == 1, "an unknown command exits 1")
+
+    refusals = [
+        ("no_power_on", dict(power=False)),
+        ("launcher", dict(launcher="no")),
+        ("launcher_dead", dict(alive=False)),
+        ("wifi", dict(wifi=None)),
+        ("wifi", dict(wifi="failed")),
+        ("no_wlan0", dict(wlan0=False)),
+        ("opens", dict(opens=20)),
+    ]
+    for i, (why, kw) in enumerate(refusals):
+        e = Env(top, "gate%d" % i, **kw)
+        e.start()
+        rc = e.finish(timeout=10)
+        check(rc == 4 and ("refused why=" + why).encode() in e.out and not writes(e), "gate refuses %s with exit 4, nothing sent" % why)
+    e = Env(top, "gatebtempty")
+    open(os.path.join(e.state, "bt"), "w").close()
+    e.start()
+    rc = e.finish(timeout=10)
+    check(rc == 4 and b"why=bt_empty" in e.out and not writes(e), "an empty bt marker refuses, exit 4")
+    e = Env(top, "gateopens")
+    e.put("bt.opens", "abc")
+    e.start()
+    rc = e.finish(timeout=10)
+    check(rc == 4 and b"why=opens_unreadable" in e.out and not writes(e), "an unreadable bt.opens refuses, exit 4")
+    e = Env(top, "gatenode")
+    e.start(devnum=False)
+    rc = e.finish(timeout=10)
+    check(rc == 1 and b"why=stpbt_node" in e.out and not writes(e), "a /dev/stpbt that is not 192:0 refuses, exit 1")
+    e = Env(top, "nvlink")
+    os.rename(e.nv, e.nv + ".real")
+    os.symlink(e.nv + ".real", e.nv)
+    e.start()
+    rc = e.finish(timeout=10)
+    check(rc == 1 and b"why=nvram" in e.out and not writes(e), "a symlinked BT_Addr is refused, exit 1")
+    e = Env(top, "nvfifo")
+    os.unlink(e.nv)
+    os.mkfifo(e.nv)
+    t0 = time.monotonic()
+    e.start()
+    rc = e.finish(timeout=10)
+    check(rc == 1 and b"why=nvram" in e.out and time.monotonic() - t0 < 5, "a FIFO at BT_Addr is refused without blocking")
+    for v in ("failed", "reset"):
+        e = Env(top, "gatebt" + v)
+        e.put("bt", v)
+        e.start()
+        rc = e.finish(timeout=10)
+        check(rc == 4 and ("why=bt_" + v).encode() in e.out and not writes(e), "a bt=%s marker refuses every open, exit 4" % v)
+    e = Env(top, "gatelock")
+    lf = open(os.path.join(e.state, "bt.lock"), "w")
+    fcntl.flock(lf, fcntl.LOCK_EX)
+    e.start()
+    rc = e.finish(timeout=10)
+    lf.close()
+    check(rc == 4 and b"why=locked" in e.out and not writes(e), "a held bt.lock refuses with exit 4")
+    e = Env(top, "gatepid")
+    e.put("bt.pid", str(dummy(e.bin, "blk-bt").pid))
+    e.start()
+    rc = e.finish(timeout=10)
+    check(rc == 4 and b"why=bt_running" in e.out and not writes(e), "a live bt.pid named blk-bt refuses with exit 4")
+    e = Env(top, "gatenorun")
+    shutil.rmtree(e.run)
+    e.start()
+    rc = e.finish(timeout=10)
+    check(rc == 1 and b"why=no_rundir" in e.out, "no run dir exits 1")
+    e = Env(top, "gateboot")
+    with open(e.boot, "w") as f:
+        f.write("nonsense\n")
+    e.start()
+    rc = e.finish(timeout=10)
+    check(rc == 1 and b"why=boot_id" in e.out, "a bad boot id exits 1")
+
+    for size in (437, 439, 441):
+        e = Env(top, "nv%d" % size, nv=size)
+        e.start()
+        rc = e.finish(timeout=10)
+        check(rc == 1 and b"why=nvram" in e.out and not writes(e), "BT_Addr of %d bytes refused with exit 1" % size)
+    for addr, what in ((bytes(6), "all zero"), (b"\xff" * 6, "all FF")):
+        e = Env(top, "nvaddr" + what.replace(" ", ""), addr=addr)
+        e.start()
+        rc = e.finish(timeout=10)
+        check(rc == 1 and b"why=nvram_address" in e.out and not writes(e), "an %s address refused with exit 1" % what)
+    e = Env(top, "nvnone", nv=None)
+    e.start()
+    rc = e.finish(timeout=10)
+    check(rc == 1 and b"why=no_nvram" in e.out, "no BT_Addr refused with exit 1")
+    for name in ("bt.pid", "bt.opens"):
+        e = Env(top, "sw" + name.replace(".", ""))
+        e.start(extra={"FAKE_ENOSPC": name})
+        rc = e.finish(timeout=10)
+        check(rc == 1 and b"why=state_write" in e.out and not writes(e) and e.get("bt.pid") is None, "a failed %s write refuses with exit 1 before the open, no bt.pid left" % name)
+
+    for size in (438, 440):
+        e, ok = up(top, "basic%d" % size, nv=size)
+        w = writes(e)
+        check(ok and w and w[0] == fc1a(), "BT_Addr of %d bytes: FC1A is the first frame, address bytes 5 to 0" % size)
+        check(e.get("bt.opens") == "1" and e.get("bt.pid") == str(e.p.pid), "bt.opens counted and bt.pid written (%d)" % size)
+        check(e.ctl.ops() == [0xFC1A], "switches off by default: only FC1A before the pty (%d)" % size)
+        rc = e.finish(signal.SIGTERM)
+        t = e.tracelines()
+        closes = [x for x in t if x.startswith("close ")]
+        check(rc == 0 and b"result rc=0 stop=signal" in e.out, "SIGTERM stops cleanly with exit 0 (%d)" % size)
+        check(closes[:3] == ["close pts bt=none", "close ptm bt=none", "close stpbt bt=none"], "clean stop closes the pty, then stpbt (%d)" % size)
+        check(e.get("bt.pid") is None and e.get("bt") is None, "clean stop removes bt.pid and writes no marker (%d)" % size)
+        ioc = [x.split()[1] + (" " + x.split()[2] if len(x.split()) > 2 else "") for x in t if x.startswith("ioctl ")]
+        want = ["TIOCEXCL", "TIOCSETD 15", "HCIUARTSETFLAGS 2", "HCIUARTSETPROTO 0", "HCIUARTGETDEVICE"]
+        check(ioc == want, "pty ioctls in order: TIOCEXCL, TIOCSETD 15, SETFLAGS 2 before SETPROTO 0, GETDEVICE (%d)" % size)
+        check(not any(x.startswith("r-over") for x in t), "no stpbt read asks for more than 2048 bytes (%d)" % size)
+        check("stpbt nonblock=1" in t, "stpbt is open with O_NONBLOCK (%d)" % size)
+        fl = [i for i, x in enumerate(t) if x.startswith("flock ")]
+        rd = [i for i, x in enumerate(t) if x.startswith("read ") and x != "read nonce"]
+        check(fl and rd and fl[0] < rd[0], "the flock comes before every state read (%d)" % size)
+
+    e = Env(top, "switches")
+    e.ctl.delay = {0xFC1A: 0.2, 0xFC79: 0.2, 0xFC93: 0.2}
+    e.start("--fc79", "--fc93", "--fc7a")
+    ok = e.attach(8)
+    rec = record()
+    w = writes(e)
+    exp = [fc1a(), bytes([1, 0x79, 0xFC, 8]) + rec[12:18] + rec[36:38], bytes([1, 0x93, 0xFC, 16]) + rec[27:30] + rec[38:41] + rec[41:51],
+           bytes([1, 0x7A, 0xFC, 7]) + rec[18:25]]
+    check(ok and w[:4] == exp, "--fc79 --fc93 --fc7a send their exact bytes in the HAL order")
+    ev = e.ctl.events
+    order = [(k, x[1] | (x[2] << 8) if k == "got" else x) for k, x, _ in ev]
+    seq_ok = all(order.index(("answer", a)) < order.index(("got", b)) for a, b in ((0xFC1A, 0xFC79), (0xFC79, 0xFC93), (0xFC93, 0xFC7A)))
+    check(seq_ok, "each vendor command waits for the previous completion")
+    check(b"init fc1a=ok fc79=ok fc93=ok fc7a=ok" in e.out, "init marker lists the switches")
+    e.finish(signal.SIGTERM)
+
+    e = Env(top, "fc1amute")
+    e.ctl.mute = {0xFC1A}
+    e.start()
+    rc = e.finish(timeout=15)
+    check(rc == 2 and b"why=fc1a_timeout" in e.out and e.get("bt") == "failed", "no FC1A completion within 8 s fails, bt=failed, exit 2")
+    e = Env(top, "fc1abad")
+    e.ctl.status = {0xFC1A: 0x12}
+    e.start()
+    rc = e.finish(timeout=10)
+    check(rc == 2 and b"why=own_status" in e.out and e.get("bt") == "failed", "a nonzero FC1A status fails with exit 2")
+    e = Env(top, "fc79bad")
+    e.ctl.status = {0xFC79: 0x01}
+    e.start("--fc79")
+    rc = e.finish(timeout=10)
+    check(rc == 2 and b"own op=0xfc79 status=0x01" in e.out, "a nonzero switched command status takes the failure path")
+
+    for name, ioc in (("ldisc", "TIOCSETD"), ("flags", "HCIUARTSETFLAGS"), ("proto", "HCIUARTSETPROTO")):
+        e = Env(top, "ioc" + name)
+        e.start(extra={"FAKE_FAIL_IOCTL": ioc})
+        rc = e.finish(timeout=10)
+        check(rc == 2 and e.get("bt") == "failed" and "close stpbt bt=failed" in e.tracelines(), "a failed %s fails, the marker is on disk before stpbt closes" % ioc)
+
+    for kind in ("path", "abstract"):
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        addr = os.path.join(top, "notify.sock") if kind == "path" else "@blk-bt-test-%d" % os.getpid()
+        if kind == "path":
+            if os.path.exists(addr):
+                os.unlink(addr)
+            s.bind(addr)
+        else:
+            s.bind("\0" + addr[1:])
+        e = Env(top, "notify" + kind)
+        e.start(extra={"NOTIFY_SOCKET": addr})
+        ok = e.attach()
+        s.settimeout(3)
+        try:
+            msg = s.recv(64)
+        except OSError:
+            msg = b""
+        e.wait_mark("notify=ready", 3)
+        t = e.text()
+        check(ok and msg == b"READY=1" and 0 <= t.find("hci=") < t.find("notify=ready"), "READY=1 to a %s NOTIFY_SOCKET after hci=" % kind)
+        e.finish(signal.SIGTERM)
+        s.close()
+
+    e, ok = up(top, "frame")
+    e.ctl.send(bytes([0x04, 0xFF, 0x03]))
+    time.sleep(0.05)
+    e.ctl.send(bytes([0xAA, 0xBB, 0xCC]))
+    e.ctl.send(bytes([0x04, 0xFF, 0x01, 0x01, 0x04, 0xFF, 0x01, 0x02]))
+    got = e.hread(14)
+    check(ok and got == bytes([4, 0xFF, 3, 0xAA, 0xBB, 0xCC, 4, 0xFF, 1, 1, 4, 0xFF, 1, 2]), "split and packed controller packets reach the host whole and in order")
+    acl = bytes([0x02, 0x01, 0x20, 0x04, 0x00]) + b"\x00\x04\x00\x05"
+    e.ctl.send(acl)
+    check(e.hread(len(acl)) == acl, "controller ACL forwarded")
+    e.hsend(cmd(0x1001))
+    time.sleep(0.3)
+    check(e.ctl.ops()[-1] == 0x1001 and writes(e)[-1] == cmd(0x1001), "a host command reaches the chip as one frame")
+    hacl = bytes([0x02, 0x01, 0x00, 0x03, 0x00, 0x01, 0x02, 0x03])
+    e.hsend(hacl)
+    time.sleep(0.3)
+    check(writes(e)[-1] == hacl, "a host ACL reaches the chip as one frame")
+    e.finish(signal.SIGTERM)
+    for name, pkt, why in (("sco", bytes([0x03, 0x01, 0x00, 253]) + bytes(253), "ctl_over_limit"),
+                           ("acl", bytes([0x02, 0x01, 0x00, 0x01, 0x04]) + bytes(1025), "ctl_over_limit"),
+                           ("aclbig", bytes([0x02, 0x01, 0x00, 0xD0, 0x07]) + bytes(2000), "ctl_over_limit"),
+                           ("type", bytes([0x07, 0x00]), "ctl_unknown_type")):
+        e, ok = up(top, "bad" + name)
+        e.ctl.send(pkt)
+        rc = e.finish(timeout=10)
+        check(ok and rc == 2 and why.encode() in e.out and e.get("bt") == "failed", "controller %s takes the failure path (%s)" % (name, why))
+
+    e, ok = up(top, "reset")
+    e.ctl.delay = {0xFC1A: 0.4}
+    t0 = time.monotonic()
+    e.hsend(cmd(0x0C03))
+    time.sleep(0.15)
+    e.hsend(cmd(0x1001))
+    e.ctl.send(bytes([0x04, 0xFF, 0x01, 0x07]))
+    got = e.hread(7 + 4 + 7, 4)
+    ops = e.ctl.ops()
+    check(ops[:3] == [0xFC1A, 0x0C03, 0xFC1A], "a host Reset complete triggers FC1A again")
+    check(got[:7] == cc(0x0C03) and got[7:11] == bytes([4, 0xFF, 1, 7]) and got[11:18] == cc(0x1001), "Reset complete held until FC1A completes, events queued behind it in order, then the next command")
+    t_fc = [t for k, x, t in e.ctl.events if k == "answer" and x == 0xFC1A][-1]
+    t_rd = [t for k, x, t in e.ctl.events if k == "got" and x[0] == 1 and (x[1] | x[2] << 8) == 0x1001]
+    check(t_rd and t_rd[0] >= t_fc, "host commands wait while the bridge's FC1A is out")
+    check(cc(0xFC1A) not in got and cc(0xFC1A) not in e.hdrain(0.3), "FC1A completions never reach the host")
+    e.finish(signal.SIGTERM)
+
+    e, ok = up(top, "resetnofc", "--no-reset-fc1a")
+    e.hsend(cmd(0x0C03))
+    got = e.hread(7)
+    time.sleep(0.2)
+    check(ok and got == cc(0x0C03) and e.ctl.ops() == [0xFC1A, 0x0C03], "--no-reset-fc1a forwards the Reset complete, no FC1A after it")
+    e.finish(signal.SIGTERM)
+
+    e, ok = up(top, "resetmute")
+    e.ctl.mute = {0xFC1A}
+    e.hsend(cmd(0x0C03))
+    rc = e.finish(timeout=15)
+    check(ok and rc == 2 and b"why=fc1a_timeout" in e.out and e.get("bt") == "failed", "FC1A after Reset with no completion in 5 s fails with exit 2")
+    t = e.tracelines()
+    check([x for x in t if x.startswith("close ")][:3] == ["close pts bt=failed", "close ptm bt=failed", "close stpbt bt=failed"], "failure closes the pty, then stpbt, with the marker already on disk")
+
+    e, ok = up(top, "termown")
+    e.ctl.mute = {0xFC1A}
+    e.hsend(cmd(0x0C03))
+    time.sleep(0.5)
+    rc = e.finish(signal.SIGTERM, timeout=10)
+    check(ok and rc == 2 and b"why=stop_with_own_command" in e.out and e.get("bt") == "failed", "SIGTERM while FC1A after Reset is unanswered: bt=failed, exit 2")
+    e = Env(top, "termstart")
+    e.ctl.mute = {0xFC1A}
+    e.start()
+    seen = e.wait_mark("open done", 5)
+    time.sleep(0.5)
+    rc = e.finish(signal.SIGTERM, timeout=10)
+    check(seen and rc == 2 and b"why=stop_with_own_command" in e.out and e.get("bt") == "failed", "SIGTERM while the startup FC1A is unanswered: bt=failed, exit 2")
+
+    e, ok = up(top, "eintr")
+    with open(e.ctlfile, "w") as f:
+        f.write("eintr")
+    e.hsend(cmd(0x1001))
+    time.sleep(1.5)
+    open(e.ctlfile, "w").close()
+    time.sleep(0.5)
+    t = e.tracelines()
+    check(ok and "w-eintr" in t and e.ctl.ops()[-1] == 0x1001 and e.p.poll() is None, "EINTR on a chip write is retried past the 1 s EAGAIN limit")
+    e.finish(signal.SIGTERM)
+
+    e, ok = up(top, "late")
+    e.ctl.mute = {0xFC1A}
+    e.hsend(cmd(0x0C03))
+    time.sleep(0.3)
+    e.ctl.send(cc(0xFC1A))
+    got = e.hread(7)
+    check(ok and got == cc(0x0C03) and cc(0xFC1A) not in got + e.hdrain(0.3), "a late FC1A completion releases the Reset and is swallowed")
+    e.finish(signal.SIGTERM)
+
+    e, ok = up(top, "local")
+    e.hsend(cmd(0x0C77))
+    got = e.hread(14)
+    check(ok and got == bytes([4, 0x0E, 0x0B, 1, 0x77, 0x0C]) + bytes(8), "Read Sync Train Params answered locally")
+    e.hsend(cmd(0xFD5B))
+    got = e.hread(7)
+    check(got == bytes([4, 0x0E, 4, 1, 0x5B, 0xFD, 1]), "a host 0xFD5B answered locally with status 0x01")
+    time.sleep(0.2)
+    check(0x0C77 not in e.ctl.ops() and 0xFD5B not in e.ctl.ops(), "neither 0x0C77 nor 0xFD5B reaches the chip")
+    e.finish(signal.SIGTERM)
+
+    for name, orig, args, want, mk in (("zero", bytes(4), (), bytes([0xF7, 0xFF, 0xFF, 0x0F]), b"le_patch=applied orig=00000000"),
+                                       ("partial", bytes([1, 0, 0, 0x20]), (), bytes([0xF7, 0xFF, 0xFF, 0x2F]), b"le_patch=applied orig=01000020"),
+                                       ("ifzero", bytes([1, 0, 0, 0]), ("--le-patch-if-zero",), bytes([1, 0, 0, 0]), b"le_patch=skipped orig=01000000")):
+        e = Env(top, "le" + name)
+        c = bytearray(64)
+        c[25:29] = orig
+        c[0] = 0xAB
+        e.ctl.cmds = bytes(c)
+        e.start(*args)
+        ok = e.attach()
+        e.hsend(cmd(0x1002))
+        got = e.hread(71)
+        check(ok and len(got) == 71 and got[32:36] == want and got[7] == 0xAB and mk in e.out, "LE patch %s: octets 25 to 28 %s" % (name, want.hex()))
+        e.finish(signal.SIGTERM)
+    e = Env(top, "lestatus")
+    e.ctl.status = {0x1002: 0x01}
+    e.start()
+    ok = e.attach()
+    e.hsend(cmd(0x1002))
+    got = e.hread(71)
+    check(ok and got[32:36] == bytes(4) and b"le_patch" not in e.out, "no LE patch on a failed Read Local Supported Commands")
+    e.finish(signal.SIGTERM)
+
+    e, ok = up(top, "bdyes")
+    e.hsend(cmd(0x1009))
+    got = e.hread(13)
+    check(ok and got[7:13] == bytes(reversed(ADDR)) and b"bdaddr_match=yes" in e.out, "Read BD_ADDR matching the record: bdaddr_match=yes")
+    e.finish(signal.SIGTERM)
+    e = Env(top, "bdno")
+    e.ctl.bdaddr = bytes(6)
+    e.start()
+    ok = e.attach()
+    e.hsend(cmd(0x1009))
+    rc = e.finish(timeout=10)
+    check(ok and rc == 2 and b"bdaddr_match=no" in e.out and b"why=bdaddr_mismatch" in e.out, "a BD_ADDR mismatch fails with exit 2")
+    e = Env(top, "bdnosw")
+    e.ctl.bdaddr = bytes(6)
+    e.start("--no-reset-fc1a")
+    ok = e.attach()
+    e.hsend(cmd(0x1009))
+    got = e.hread(13)
+    check(ok and b"bdaddr_match=no" in e.out and got[3:7] == bytes([1, 0x09, 0x10, 0]) and e.p.poll() is None, "under --no-reset-fc1a a mismatch is a marker only")
+    e.finish(signal.SIGTERM)
+
+    for code in (0x00, 0x05):
+        e, ok = up(top, "hwerr%d" % code)
+        e.ctl.send(bytes([0x04, 0x10, 0x01, code]))
+        got = e.hdrain(0.5)
+        rc = e.finish(timeout=10)
+        t = e.tracelines()
+        check(ok and rc == 5 and e.get("bt") == "reset" and b"hw_error=yes" in e.out, "Hardware Error code 0x%02x: exit 5, bt=reset" % code)
+        check([x for x in t if x.startswith("close ")][:3] == ["close pts bt=reset", "close ptm bt=reset", "close stpbt bt=reset"], "reset path closes the pty, then stpbt, marker first (0x%02x)" % code)
+        check(bytes([0x04, 0x10]) not in got, "the Hardware Error never reaches the host (0x%02x)" % code)
+        e2 = Env(top, "hwerrgate%d" % code)
+        e2.put("bt", "reset")
+        e2.start()
+        check(e2.finish(timeout=10) == 4, "after a reset no reopen this boot (0x%02x)" % code)
+
+    e, ok = up(top, "eio")
+    with open(e.ctlfile, "w") as f:
+        f.write("eio")
+    e.hsend(cmd(0x1001))
+    seen = e.wait_mark("reset trigger=write_eio")
+    check(ok and seen and e.get("bt") == "reset", "write EIO writes bt=reset at once")
+    e.ctl.send(bytes([0x04, 0x10, 0x01, 0x00]))
+    got = e.hdrain(0.5)
+    rc = e.finish(timeout=10)
+    check(rc == 5 and e.get("bt") == "reset" and b"hw_error=yes" in e.out and bytes([4, 0x10]) not in got, "write EIO then the Hardware Error: exit 5, bt=reset, nothing forwarded")
+
+    e, ok = up(top, "kill9")
+    with open(e.ctlfile, "w") as f:
+        f.write("eio")
+    e.hsend(cmd(0x1001))
+    seen = e.wait_mark("reset trigger=write_eio")
+    e.p.kill()
+    e.finish(timeout=5)
+    check(ok and seen and e.get("bt") == "reset", "kill -9 during the Hardware Error wait leaves bt=reset")
+    e2 = Env(top, "kill9b")
+    e2.put("bt", e.get("bt") or "missing")
+    e2.start()
+    check(e2.finish(timeout=10) == 4 and b"why=bt_reset" in e2.out, "a new instance after that refuses with exit 4")
+
+    def post(e, extra=None, **envs):
+        env = dict(os.environ)
+        for k in ("SERVICE_RESULT", "EXIT_CODE", "EXIT_STATUS", "NOTIFY_SOCKET"):
+            env.pop(k, None)
+        e.ptrace = os.path.join(e.d, "posttrace")
+        env.update({"FAKE_TRACE": e.ptrace, "FAKE_STPBT": e.slave, "FAKE_STATE": e.state})
+        env.update(envs)
+        if extra:
+            env.update(extra)
+        try:
+            r = subprocess.run([BIN, "-r", e.run, "-d", e.dev, "-s", e.sys, "-b", e.boot, "-k", e.kmsg, "stop-post"], capture_output=True, env=env, timeout=10)
+            rc, out = r.returncode, r.stdout
+        except subprocess.TimeoutExpired as x:
+            rc, out = -1, x.stdout or b""
+        try:
+            with open(e.ptrace) as f:
+                t = f.read().splitlines()
+        except OSError:
+            t = []
+        e.plocked = any(x.startswith("flock ") for x in t)
+        e.pstpbt = [x for x in t if x.startswith(("w ", "w-", "r-", "stpbt", "close stpbt", "ioctl"))]
+        return rc, out
+    e = Env(top, "postsuccess")
+    rc, out = post(e, SERVICE_RESULT="success", EXIT_CODE="exited", EXIT_STATUS="0")
+    check(rc == 0 and e.get("bt") is None and b" stop_post end=success\n" in out and not e.pstpbt, "stop-post after success writes nothing")
+    e = Env(top, "postunset")
+    rc, out = post(e)
+    check(rc == 0 and e.get("bt") is None and b" stop_post end=none\n" in out and not e.pstpbt, "stop-post outside systemd (no SERVICE_RESULT) writes nothing")
+    e = Env(top, "postsignal")
+    rc, out = post(e, SERVICE_RESULT="signal", EXIT_CODE="killed", EXIT_STATUS="KILL")
+    check(rc == 0 and e.get("bt") == "failed" and b" stop_post bt=failed end=signal code=killed\n" in out and b"KILL" not in out, "stop-post after a signal death writes bt=failed with the result class only")
+    check(e.plocked and not e.pstpbt, "stop-post takes bt.lock and never touches /dev/stpbt")
+    for res, ec, es in (("core-dump", "dumped", "ABRT"), ("timeout", "killed", "TERM"), ("watchdog", "killed", "ABRT"), ("exit-code", None, None),
+                        ("exit-code", "exited", "1"), ("exit-code", "exited", "2"), ("exit-code", "exited", "4"), ("exit-code", "exited", "5")):
+        e = Env(top, "post%s%s" % (res, es or "nomain"))
+        envs = {"SERVICE_RESULT": res}
+        if ec:
+            envs.update({"EXIT_CODE": ec, "EXIT_STATUS": es})
+        rc, out = post(e, **envs)
+        want = b" stop_post bt=failed end=%s code=%s\n" % (res.encode(), (ec or "none").encode())
+        check(rc == 0 and e.get("bt") == "failed" and want in out and not e.pstpbt, "stop-post after %s %s writes bt=failed" % (res, es or "with no main process (a failed ExecStartPre)"))
+    for v in ("reset", "failed", ""):
+        e = Env(top, "postpresent" + v)
+        e.put("bt", v)
+        rc, out = post(e, SERVICE_RESULT="signal", EXIT_CODE="killed", EXIT_STATUS="KILL")
+        check(rc == 0 and e.get("bt") == v and (b" stop_post bt=%s untouched end=signal\n" % (v or "empty").encode()) in out, "stop-post leaves an existing bt=%s untouched" % (v or "<empty>"))
+    e = Env(top, "postlocked")
+    lf = open(os.path.join(e.state, "bt.lock"), "w")
+    fcntl.flock(lf, fcntl.LOCK_EX)
+    rc, out = post(e, SERVICE_RESULT="signal", EXIT_CODE="killed", EXIT_STATUS="KILL")
+    lf.close()
+    check(rc == 0 and e.get("bt") == "failed" and b" stop_post bt=failed end=signal code=killed lock=busy\n" in out, "stop-post with bt.lock held still writes bt=failed and says lock=busy")
+    e = Env(top, "postenospc")
+    rc, out = post(e, extra={"FAKE_ENOSPC": "bt"}, SERVICE_RESULT="signal", EXIT_CODE="killed", EXIT_STATUS="KILL")
+    check(rc == 1 and b" stop_post state_write=failed end=signal code=killed\n" in out and os.path.lexists(os.path.join(e.state, "bt")), "stop-post with a failed marker write exits 1 and leaves a bt file the gate refuses")
+    e = Env(top, "postnostate")
+    shutil.rmtree(e.state)
+    rc, out = post(e, SERVICE_RESULT="signal", EXIT_CODE="killed", EXIT_STATUS="KILL")
+    check(rc == 1 and b"why=no_state" in out and not os.path.lexists(e.state), "stop-post with no state dir exits 1 and creates nothing")
+    e, ok = up(top, "postkill")
+    e.p.kill()
+    e.finish(timeout=5)
+    before = e.get("bt")
+    rc, out = post(e, SERVICE_RESULT="signal", EXIT_CODE="killed", EXIT_STATUS="KILL")
+    e.start()
+    rc2 = e.finish(timeout=10)
+    check(ok and before is None and rc == 0 and e.get("bt") == "failed" and rc2 == 4 and b"why=bt_failed" in e.out, "kill -9 leaves no marker; stop-post writes bt=failed and the next start is refused with exit 4")
+    e = Env(top, "postearly")
+    e.ctl.delay = {0xFC1A: 3}
+    e.start()
+    seen = e.wait_mark("open done", 5)
+    e.p.kill()
+    e.finish(timeout=5)
+    early = e.out
+    rc, out = post(e, SERVICE_RESULT="signal", EXIT_CODE="killed", EXIT_STATUS="KILL")
+    e.start()
+    rc2 = e.finish(timeout=10)
+    check(seen and b"init fc1a" not in early and b"hci=" not in early and rc == 0 and rc2 == 4 and b"why=bt_failed" in e.out, "kill -9 before READY (during the startup FC1A wait), then stop-post: the next start is refused")
+
+    e, ok = up(top, "eioterm")
+    with open(e.ctlfile, "w") as f:
+        f.write("eio")
+    e.hsend(cmd(0x1001))
+    seen = e.wait_mark("reset trigger=write_eio")
+    time.sleep(0.3)
+    rc = e.finish(signal.SIGTERM, timeout=10)
+    check(ok and seen and rc == 5 and e.get("bt") == "reset" and b"stop=signal" in e.out, "SIGTERM during the Hardware Error wait keeps bt=reset")
+
+    e = Env(top, "slavehup")
+    e.start(extra={"FAKE_DROP_SLAVE": "1"})
+    gone = e.wait_mark("result rc=", 5)
+    rc = e.finish(timeout=5)
+    check(gone and rc == 2 and (b"why=pty_poll" in e.out or b"why=pty_read" in e.out) and e.get("bt") == "failed", "a hung up pty master fails with exit 2 instead of spinning")
+
+    for mtu, good in ((1021, True), (1991, True), (1992, False)):
+        e = Env(top, "mtu%d" % mtu)
+        e.ctl.acl_mtu = mtu
+        e.start()
+        ok = e.attach()
+        e.hsend(cmd(0x1005))
+        if good:
+            got = e.hread(14)
+            check(ok and got[7:9] == bytes([mtu & 0xFF, mtu >> 8]) and e.wait_mark("acl_mtu=%d" % mtu, 2) and e.p.poll() is None, "Read Buffer Size ACL length %d recorded and forwarded" % mtu)
+            e.finish(signal.SIGTERM)
+        else:
+            rc = e.finish(timeout=10)
+            check(ok and rc == 2 and b"acl_mtu=1992" in e.out and b"why=acl_mtu" in e.out, "Read Buffer Size ACL length 1992 fails with exit 2")
+
+    e, ok = up(top, "eionohw")
+    with open(e.ctlfile, "w") as f:
+        f.write("eio")
+    e.hsend(cmd(0x1001))
+    rc = e.finish(timeout=40)
+    check(ok and rc == 5 and e.get("bt") == "failed" and b"hw_error=no" in e.out, "write EIO without a Hardware Error in 30 s: bt=failed, exit 5")
+
+    e, ok = up(top, "eagain")
+    with open(e.ctlfile, "w") as f:
+        f.write("eagain")
+    e.hsend(cmd(0x1001))
+    time.sleep(0.1)
+    e.ctl.send(bytes([0x04, 0xFF, 0x01, 0x09]))
+    got = e.hread(4, 1)
+    time.sleep(0.2)
+    open(e.ctlfile, "w").close()
+    time.sleep(0.4)
+    t = e.tracelines()
+    check(ok and got == bytes([4, 0xFF, 1, 9]) and "w-eagain" in t and e.ctl.ops()[-1] == 0x1001, "EAGAIN retried while controller reads keep draining")
+    e.finish(signal.SIGTERM)
+    e, ok = up(top, "eagainlong")
+    with open(e.ctlfile, "w") as f:
+        f.write("eagain")
+    e.hsend(cmd(0x1001))
+    rc = e.finish(timeout=10)
+    check(ok and rc == 2 and b"why=eagain" in e.out, "EAGAIN for over 1 s fails with exit 2")
+
+    e, ok = up(top, "partial")
+    e.hsend(bytes([0x01, 0x03]))
+    time.sleep(0.3)
+    e.hsend(cmd(0x1001))
+    time.sleep(0.3)
+    check(ok and e.wait_mark("host partial bytes=2 dropped", 2) and 0x1001 not in e.ctl.ops(), "a partial host packet is dropped after 100 ms, and bytes are discarded until a Reset")
+    e.hsend(cmd(0x0C03))
+    got = e.hread(7)
+    check(got == cc(0x0C03) and e.ctl.ops()[-2:] == [0x0C03, 0xFC1A], "the next Reset resynchronises the host stream")
+    e.finish(signal.SIGTERM)
+    check(b"host_partial=1" in e.out, "stats count the dropped partial")
+    e, ok = up(top, "hostbig")
+    big = bytes([0x02, 0x01, 0x00, 0xC8, 0x07]) + bytes(1992)
+    e.hsend(big)
+    time.sleep(0.4)
+    e.hsend(cmd(0x0C03))
+    got = e.hread(7)
+    check(ok and big not in writes(e) and e.wait_mark("host resync type=0x02 why=length", 2) and got == cc(0x0C03), "a host ACL over 1996 bytes never reaches the chip and the next Reset resyncs")
+    e.finish(signal.SIGTERM)
+    e, ok = up(top, "hosttype")
+    e.hsend(bytes([0x09, 0x01, 0x02]) + cmd(0x1001) + cmd(0x0C03))
+    got = e.hread(7)
+    check(ok and got == cc(0x0C03) and 0x1001 not in e.ctl.ops() and b"host resync type=0x09" in e.out, "an unknown host type byte resyncs on the next Reset")
+    e.finish(signal.SIGTERM)
+
+    e, ok = up(top, "flood")
+    n = 4000
+    sender = threading.Thread(target=lambda: [e.ctl.send(bytes([0x04, 0xFF, 0xC0, i & 0xFF, i >> 8]) + bytes(0xBE)) for i in range(n)], daemon=True)
+    sender.start()
+    time.sleep(2)
+    got = e.hread(n * 195, 40)
+    sender.join(5)
+    order_ok = len(got) == n * 195 and all(got[i * 195 + 3] == (i & 0xFF) and got[i * 195 + 4] == (i >> 8) for i in range(n))
+    e.finish(signal.SIGTERM)
+    check(ok and order_ok, "a slow host loses nothing: %d events of 195 bytes in order" % n)
+    full = [x for x in e.text().split() if x.startswith("pty_full=")]
+    check(full and int(full[0].split("=")[1]) >= 1, "the full output queue paused stpbt reads (%s)" % (full[0] if full else "none"))
+
+    e = Env(top, "swfail")
+    e.start(extra={"FAKE_ENOSPC": "bt"})
+    ok = e.attach()
+    e.ctl.send(bytes([0x04, 0x10, 0x01, 0x00]))
+    rc = e.finish(timeout=10)
+    check(ok and rc == 5 and b"state_write=failed" in e.out, "a failed marker write keeps exit 5 and says state_write=failed")
+
+    leak = [ADDR.hex(), bytes(reversed(ADDR)).hex(), ":".join("%02x" % b for b in ADDR), ":".join("%02x" % b for b in reversed(ADDR))]
+    outs = b""
+    for name in os.listdir(top):
+        d = os.path.join(top, name)
+        for f in ("kmsg",):
+            p = os.path.join(d, f)
+            if os.path.exists(p):
+                with open(p, "rb") as h:
+                    outs += h.read()
+    check(not any(s.encode() in outs.lower() for s in leak), "no marker in any run holds the address")
+
+
+main()
