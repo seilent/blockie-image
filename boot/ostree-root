@@ -1,0 +1,204 @@
+ot_state=ostree/deploy/default/var/lib/blockie/boot
+ot_deploys=ostree/deploy/default/deploy
+ot_id='[0-9a-f]\{64\}\.[0-9]\{1,\}'
+
+ostree_list() {
+    local e v o p t d
+    for e in "$1"/boot/loader/entries/*.conf; do
+        [ -f "$e" ] || continue
+        v=$(sed -n 's/^version[[:space:]]\{1,\}\([0-9]\{1,\}\)[[:space:]]*$/\1/p' "$e" | head -n 1)
+        o=$(sed -n 's/^options[[:space:]]\{1,\}//p' "$e" | head -n 1)
+        p=
+        for t in $o; do
+            case $t in ostree=*) p=${t#ostree=} ;; esac
+        done
+        [ -n "$v" ] && [ -n "$p" ] || continue
+        d=$(readlink -f "$1$p") || continue
+        case $d in "$1/$ot_deploys"/*) ;; *) continue ;; esac
+        d=${d##*/}
+        printf '%s' "$d" | grep -qx "$ot_id" || continue
+        printf '%s %s %s\n' "$v" "$d" "$e"
+    done
+}
+
+ostree_composefs() {
+    sed -n '/^\[composefs\]/,/^\[/s/^[[:space:]]*enabled[[:space:]]*=[[:space:]]*\([A-Za-z0-9]*\)[[:space:]]*$/\1/p' "$1" | tail -n 1
+}
+
+ostree_check() {
+    local d m
+    d=$1
+    m=
+    [ -x "$d/usr/lib/systemd/systemd" ] || m="$m,systemd"
+    [ -x "$d/usr/lib/ostree/ostree-prepare-root" ] || m="$m,prepare_root"
+    [ -f "$d/usr/lib/ld-linux-aarch64.so.1" ] || m="$m,loader"
+    if [ -f "$d/usr/lib/ostree/prepare-root.conf" ]; then
+        [ "$(ostree_composefs "$d/usr/lib/ostree/prepare-root.conf")" = no ] || m="$m,composefs"
+    else
+        m="$m,conf"
+    fi
+    grep -qx 'SELINUX=disabled' "$d/etc/selinux/config" 2> /dev/null || m="$m,selinux"
+    echo "${m#,}"
+}
+
+ostree_tries_write() {
+    local f
+    f=$1/$ot_state/tries
+    mkdir -p "$1/$ot_state" || return 1
+    {
+        [ "$ot_unparsable" = 1 ] || awk -v d="$2" '$1 != d' "$f" 2> /dev/null
+        echo "$2 $3"
+    } > "$f.new" && sync && mv "$f.new" "$f" && sync
+}
+
+ostree_set() {
+    ot_pick=$2
+    ot_by=$3
+    ot_why=$4
+    ot_dir=$1/$ot_deploys/$2
+    ot_entry=$(printf '%s\n' "$ot_list" | awk -v d="$2" '$2 == d {print $3; exit}')
+}
+
+ostree_pick() {
+    local s c d n m cok
+    s=$1
+    ot_pick=
+    ot_by=
+    ot_why=none
+    ot_dir=
+    ot_entry=
+    ot_fail=
+    ot_unparsable=0
+    ot_entries=0
+    ot_default=-
+    ot_confirmed=none
+    ot_tries=0
+    case $(readlink "$s/boot/loader" 2> /dev/null) in
+        loader.0 | loader.1) ;;
+        *) ot_fail=no_loader; return 1 ;;
+    esac
+    ot_list=$(ostree_list "$s")
+    ot_entries=$(printf '%s' "$ot_list" | grep -c .)
+    [ "$ot_entries" -gt 0 ] || { ot_fail=no_entry; return 1; }
+    d=$(printf '%s\n' "$ot_list" | sort -n -r -k 1,1 | head -n 1 | cut -d' ' -f2)
+    ot_default=$d
+    c=$(head -n 1 "$s/$ot_state/confirmed" 2> /dev/null)
+    printf '%s' "$c" | grep -qx "$ot_id" || c=
+    [ -n "$c" ] && ot_confirmed=$c
+    cok=0
+    if [ -n "$c" ] && printf '%s\n' "$ot_list" | cut -d' ' -f2 | grep -qxF "$c" && [ -z "$(ostree_check "$s/$ot_deploys/$c")" ]; then
+        cok=1
+    fi
+    if [ -n "$2" ]; then
+        printf '%s\n' "$ot_list" | cut -d' ' -f2 | grep -qxF "$2" || { ot_fail=deploy:no_entry; return 1; }
+        m=$(ostree_check "$s/$ot_deploys/$2")
+        [ -z "$m" ] || { ot_fail=deploy:$m; return 1; }
+        ostree_set "$s" "$2" runconf none
+        return 0
+    fi
+    if [ -n "$3" ] && [ "$3" = "$d" ]; then
+        if [ $cok = 1 ] && [ "$c" != "$d" ]; then
+            ostree_set "$s" "$c" fallback prepare
+            return 0
+        fi
+        ot_fail=prepare
+        return 1
+    fi
+    m=$(ostree_check "$s/$ot_deploys/$d")
+    if [ -n "$m" ]; then
+        if [ $cok = 1 ] && [ "$c" != "$d" ]; then
+            ostree_set "$s" "$c" fallback refused
+            return 0
+        fi
+        ot_fail=$m
+        return 1
+    fi
+    if [ "$d" = "$c" ]; then
+        ostree_set "$s" "$d" default none
+        return 0
+    fi
+    if [ -s "$s/$ot_state/tries" ] && grep -qvx "$ot_id [0-9]\{1,\}" "$s/$ot_state/tries"; then
+        ot_unparsable=1
+    fi
+    n=0
+    [ $ot_unparsable = 1 ] || n=$(awk -v d="$d" '$1 == d {n = $2} END {print n + 0}' "$s/$ot_state/tries" 2> /dev/null)
+    case $n in '' | *[!0-9]*) n=0 ;; esac
+    ot_tries=$n
+    if [ "$n" -ge 2 ] && [ $cok = 1 ]; then
+        ostree_set "$s" "$c" fallback tries
+        return 0
+    fi
+    ostree_tries_write "$s" "$d" $((n + 1)) || { ot_fail=tries_write; return 1; }
+    ot_tries=$((n + 1))
+    ostree_set "$s" "$d" default none
+}
+
+ostree_cmdline() {
+    local c o w
+    c=
+    o=$(cat /proc/cmdline)
+    for w in $o; do
+        case $w in ostree=* | blockie.deploy=* | blockie.pick=*) ;; *) c="$c $w" ;; esac
+    done
+    o=$(sed -n 's/^options[[:space:]]\{1,\}//p' "$ot_entry" | head -n 1)
+    for w in $o; do
+        case $w in blockie.deploy=* | blockie.pick=*) continue ;; esac
+        case "$c " in *" $w "*) ;; *) c="$c $w" ;; esac
+    done
+    c="${c# } blockie.deploy=$ot_pick blockie.pick=$ot_by"
+    for w in $c; do
+        case $w in androidboot.*) ot_fail=androidboot; return 1 ;; esac
+    done
+    printf '%s\n' "$c" > "$1"
+}
+
+ostree_mntopt() {
+    case $(awk -v p="$1" '$2 == p {o = $4} END {print o}' /proc/mounts) in
+        '') echo none ;;
+        ro | ro,*) echo ro ;;
+        *) echo rw ;;
+    esac
+}
+
+ostree_prepare() {
+    local m p c
+    ot_rc=-
+    ot_booted=no
+    ot_usr=none
+    ot_sysroot=none
+    for m in /run/ostree /run/ostree-booted /sysroot.tmp; do
+        [ -e $m ] && { ot_fail=run_exists; return 1; }
+    done
+    { mkdir -p /usr/lib/ostree && cp "$ot_dir/usr/lib/ostree/prepare-root.conf" /usr/lib/ostree/prepare-root.conf; } ||
+        { ot_fail=conf_copy; return 1; }
+    timeout -k 10 120 "$ot_dir/usr/lib/ld-linux-aarch64.so.1" --library-path "$ot_dir/usr/lib64" \
+        "$ot_dir/usr/lib/ostree/ostree-prepare-root" "$1" "$(cat "$2")"
+    ot_rc=$?
+    for p in /proc/[0-9]*; do
+        read -r c 2> /dev/null < "$p/comm" && [ "$c" = timeout ] &&
+            tr '\0' ' ' 2> /dev/null < "$p/cmdline" | grep -q ostree-prepare-root && kill "${p#/proc/}" 2> /dev/null
+    done
+    [ -e /run/ostree-booted ] && ot_booted=yes
+    ot_usr=$(ostree_mntopt "$1/usr")
+    ot_sysroot=$(ostree_mntopt "$1/sysroot")
+    if [ "$ot_rc" != 0 ] || [ $ot_booted != yes ] || [ "$ot_usr" != ro ] || [ "$ot_sysroot" = none ]; then
+        ot_fail=prepare
+        return 1
+    fi
+}
+
+ostree_undo() {
+    local m
+    awk -v n="$1" '$1 == n || $2 == "/sysroot.tmp" || index($2, "/sysroot.tmp/") == 1 || index($2, "/run/ostree/") == 1 {print $2}' \
+        /proc/mounts | sort -r | while read -r m; do
+        umount "$m" 2> /dev/null || umount -l "$m" 2> /dev/null
+    done
+    rm -f /run/ostree-booted /usr/lib/ostree/prepare-root.conf
+    [ -d /run/ostree/.private ] && rmdir /run/ostree/.private
+    [ -d /run/ostree ] && rm -f /run/ostree/* && rmdir /run/ostree
+    [ -d /sysroot.tmp ] && rmdir /sysroot.tmp
+    for m in /run/ostree /run/ostree-booted /sysroot.tmp; do
+        [ -e $m ] && return 1
+    done
+    return 0
+}
