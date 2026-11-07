@@ -504,8 +504,8 @@ for kv in video_driver=gl video_context_driver=wayland input_driver=udev input_j
   [[ $(cfgv "${kv%%=*}") == "${kv#*=}" ]] || { ok=1; echo "  ${kv%%=*} is '$(cfgv "${kv%%=*}")'"; }
 done
 pad="$share/autoconfig/udev/AYANEO Controller.cfg"
-for l in 'input_b_btn = "0"' 'input_a_btn = "1"' 'input_x_btn = "2"' 'input_y_btn = "3"' 'input_b_btn_label = "B"' \
-  'input_a_btn_label = "A"' 'input_x_btn_label = "Y"' 'input_y_btn_label = "X"'; do
+for l in 'input_b_btn = "1"' 'input_a_btn = "0"' 'input_x_btn = "2"' 'input_y_btn = "3"' 'input_b_btn_label = "A"' \
+  'input_a_btn_label = "B"' 'input_x_btn_label = "Y"' 'input_y_btn_label = "X"'; do
   grep -qxF "$l" "$pad" || { ok=1; echo "  no '$l' in the autoconfig"; }
 done
 cmp -s <(printf '%s\n' 'nes /usr/share/libretro/shaders/blockie/crt-gdv-mini.glslp' \
