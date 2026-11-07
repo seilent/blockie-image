@@ -6,6 +6,7 @@ After=var.mount
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+TimeoutStartSec=120
 ExecStart=/usr/libexec/blockie/blockie-data
 ExecStartPost=/usr/bin/systemd-tmpfiles --create /usr/lib/blockie/data-tmpfiles.conf
 

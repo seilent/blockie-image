@@ -4,6 +4,7 @@ set -u
 script=${DATA_SCRIPT:-/usr/libexec/blockie/blockie-data}
 unit=${DATA_UNIT:-/usr/lib/systemd/system/blockie-data.service}
 conf=${DATA_TMPFILES:-/usr/lib/blockie/data-tmpfiles.conf}
+drop=${DATA_DROPIN:-/usr/lib/systemd/system/user@.service.d/52-blockie-data.conf}
 top=$(mktemp -d "${TMPDIR:-/tmp}/data.XXXXXX")
 trap 'rm -rf "${top:?}"' EXIT
 fails=0
@@ -17,7 +18,7 @@ res() {
   fi
 }
 
-for kv in Type=oneshot RemainAfterExit=yes ExecStart=/usr/libexec/blockie/blockie-data \
+for kv in Type=oneshot RemainAfterExit=yes TimeoutStartSec=120 ExecStart=/usr/libexec/blockie/blockie-data \
   "ExecStartPost=/usr/bin/systemd-tmpfiles --create /usr/lib/blockie/data-tmpfiles.conf" \
   RequiresMountsFor=/var/lib/blockie WantedBy=multi-user.target; do
   grep -qxF "$kv" "$unit"
@@ -25,6 +26,16 @@ for kv in Type=oneshot RemainAfterExit=yes ExecStart=/usr/libexec/blockie/blocki
 done
 ! grep -q '^Requires=\|^RequiredBy=\|^Before=multi-user' "$unit"
 res $? "unit: no hard dependency, a missing p4 fails only this unit"
+for kv in Wants=blockie-data.service After=blockie-data.service; do
+  grep -qxF "$kv" "$drop"
+  res $? "user@ drop-in has $kv"
+done
+! grep -q '^Requires=\|^Requisite=\|^BindsTo=' "$drop"
+res $? "user@ drop-in: no hard dependency, a missing p4 does not stop the session"
+seat=${DATA_SEAT:-/usr/lib/systemd/system/blockie-seat.service}
+grep -qE '^After=(.* )?blockie-data\.service( |$)' "$seat" && grep -qE '^Wants=(.* )?blockie-data\.service( |$)' "$seat" &&
+  ! grep -qE '^(Requires|Requisite|BindsTo)=.*blockie-data' "$seat"
+res $? "seat: Wants and After blockie-data, so its PAM call never waits on the data step"
 if [[ -z ${DATA_UNIT:-} ]]; then
   [[ -L /etc/systemd/system/multi-user.target.wants/blockie-data.service ]]
   res $? "unit enabled"
@@ -39,6 +50,8 @@ res $? "tmpfiles: cache, media, saves, states owned by blockie"
 res $? "tmpfiles: no line for roms/, bios/ or the mount root"
 [[ ! -e /usr/lib/tmpfiles.d/blockie-data.conf ]] && ! grep -rqs 'blockie/data' /usr/lib/tmpfiles.d
 res $? "tmpfiles: not in tmpfiles.d, so nothing is made under /var before the mount"
+[[ -z $(awk '$2 == "/var/lib/blockie" && $4 != "root"' /usr/lib/tmpfiles.d/*.conf 2> /dev/null) ]]
+res $? "tmpfiles: /var/lib/blockie stays root owned, so uid 1000 cannot make data/ under it"
 
 if [[ -z ${DATA_TMPFILES:-} ]] && command -v systemd-tmpfiles > /dev/null; then
   r=$top/root
@@ -181,6 +194,26 @@ echo OTHER > "$d/label.mmcblk1p4"
 run
 [[ $rc == 1 && ! -s $d/calls ]] && grep -q "not labelled" "$d/out"
 res $? "script: a filesystem label other than BLOCKIE_DATA, refused"
+
+if [[ $(id -u) == 0 ]] && command -v setpriv > /dev/null; then
+  chmod 0755 "$top"
+  as_user() { setpriv --reuid=1000 --regid=1000 --clear-groups "$@" 2> /dev/null; }
+
+  setup bare-first
+  chmod 0755 "$d"
+  rm -rf "$d/target" "$sys/class/block/mmcblk1p4"
+  run
+  [[ $rc == 1 && ! -e $d/target ]] && ! as_user mkdir -p "$d/target/cache"
+  res $? "unmounted, never mounted: no target dir and uid 1000 cannot make one"
+
+  setup bare-after
+  chmod 0755 "$d"
+  rm -rf "$d/target"
+  run
+  [[ $rc == 0 && $(stat -c '%U %G %a' "$d/target") == "root root 755" && -z $(ls -A "$d/target") ]] &&
+    ! as_user mkdir "$d/target/cache" && ! as_user touch "$d/target/x"
+  res $? "unmounted after a mount: the bare target is root 0755, empty, and uid 1000 cannot write it"
+fi
 
 if [[ $fails == 0 ]]; then
   echo "data: all ok"

@@ -279,6 +279,10 @@ grep -qxF "rundir=\${BLOCKIE_RUNDIR:-$run}" "$bin" &&
   ! grep -qs "/run/blockie/" "$bin" "$sf/usr/lib/systemd/system"/blockie-session-* "$sf/usr/libexec/blockie/blockie-hotkeyd"
 res $? "the runtime dir is $run everywhere, nothing in the init's /run/blockie"
 
+grep -qxF 'ExecStopPost=-+/usr/bin/setpriv --reuid=blockie --regid=blockie --init-groups /usr/bin/env XDG_RUNTIME_DIR=/run/user/1000 /usr/bin/systemctl --user stop blockie-compositor.service' \
+  "$sf/usr/lib/systemd/system/blockie-seat.service" && grep -q '^u blockie 1000:1000 ' "$sf/usr/lib/sysusers.d/blockie.conf"
+res $? "seat stop stops the compositor on the user bus of uid 1000, the uid sysusers gives blockie, without a PAM session"
+
 if (( fails )); then
   echo "session: $fails failed"
   exit 1
