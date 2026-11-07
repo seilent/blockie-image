@@ -12,6 +12,7 @@ PAMName=login
 ExecStartPre=+/usr/libexec/blockie/dl1 check
 Environment=XDG_SESSION_TYPE=wayland XDG_SESSION_CLASS=user XDG_SEAT=seat0 XDG_SESSION_DESKTOP=blockie
 ExecStart=/usr/bin/systemctl --user start --wait blockie-compositor.service
+ExecStopPost=-+/usr/bin/systemctl --user --machine=blockie@ stop blockie-compositor.service
 Restart=always
 RestartSec=2
 
