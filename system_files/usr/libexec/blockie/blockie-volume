@@ -1,0 +1,16 @@
+#!/bin/sh
+set -u
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+sink=@DEFAULT_AUDIO_SINK@
+step=${BLOCKIE_VOLUME_STEP:-5%}
+
+case "${1:-}" in
+up) exec wpctl set-volume -l 1.0 "$sink" "$step+" ;;
+down) exec wpctl set-volume "$sink" "$step-" ;;
+mute) exec wpctl set-mute "$sink" toggle ;;
+get) exec wpctl get-volume "$sink" ;;
+*)
+    echo "usage: blockie-volume up|down|mute|get" >&2
+    exit 2
+    ;;
+esac

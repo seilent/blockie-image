@@ -1,0 +1,1 @@
+ACTION!="remove", SUBSYSTEM=="sound", KERNEL=="controlC*", ATTRS{id}=="mt6768mt6358", TAG+="systemd", ENV{SYSTEMD_WANTS}+="blockie-jack.service"

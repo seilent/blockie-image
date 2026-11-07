@@ -36,6 +36,11 @@ dnf -y "${opts[@]}" install \
   jq \
   libwayland-client \
   libwayland-server \
+  pipewire \
+  pipewire-alsa \
+  pipewire-pulseaudio \
+  pipewire-utils \
+  wireplumber \
   NetworkManager-wifi \
   wpa_supplicant \
   iw \

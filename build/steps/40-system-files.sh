@@ -69,6 +69,7 @@ install -d /etc/systemd/system-generators /etc/udev/rules.d
 ln -sf /dev/null /etc/systemd/system-generators/systemd-gpt-auto-generator
 ln -sf /dev/null /etc/systemd/system-generators/systemd-ssh-generator
 ln -sf /dev/null /etc/udev/rules.d/90-alsa-restore.rules
+systemctl --global enable pipewire.socket pipewire-pulse.socket wireplumber.service
 
 sed -i 's/^SELINUX=.*/SELINUX=disabled/' /etc/selinux/config
 grep -qx 'SELINUX=disabled' /etc/selinux/config || { echo "40-system-files: SELINUX not disabled" >&2; exit 1; }

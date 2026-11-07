@@ -1,0 +1,15 @@
+[Unit]
+Description=Mirror the headset jack switch into the Headphone Jack ALSA control
+After=blockie-dl1.service systemd-udev-trigger.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=notify
+ExecStartPre=+/usr/libexec/blockie/dl1 check
+ExecStart=/usr/libexec/blockie/blockie-jack
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
