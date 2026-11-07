@@ -64,7 +64,7 @@ for p in ostree ostree-libs; do
 done
 rpm -q e2fsprogs erofs-utils vulkan-tools egl-utils drm-utils strace file procps-ng jq libwayland-client \
   libwayland-server NetworkManager-wifi wpa_supplicant iw wireless-regdb iperf3 bluez alsa-ucm alsa-ucm-utils \
-  alsa-utils retroarch libretro-mgba libretro-pcsx-rearmed > /dev/null || fail "packages missing"
+  alsa-utils retroarch libretro-mgba libretro-pcsx-rearmed kmscube glmark2 > /dev/null || fail "packages missing"
 [[ -f /usr/lib/firmware/regulatory.db ]] || fail "regulatory.db missing"
 
 jq -e '. == {
@@ -76,7 +76,7 @@ jq -e '. == {
   }}' /etc/containers/policy.json > /dev/null || fail "policy.json is not exactly the planned policy"
 [[ -s /usr/share/blockie/keys/blockie.pub ]] || fail "public key missing"
 grep -qx 'SystemMaxUse=200M' /usr/lib/systemd/journald.conf.d/50-blockie.conf || fail "journal size not capped"
-cmp -s <(printf '[Service]\nExecStart=\nExecStart=-udevadm trigger --type=devices --action=add --subsystem-match=input\n') \
+cmp -s <(printf '[Service]\nExecStart=\nExecStart=-udevadm trigger --type=devices --action=add --subsystem-match=input\nExecStart=-udevadm trigger --type=devices --action=add --subsystem-match=drm --subsystem-match=dma_heap\nExecStart=-udevadm trigger --type=devices --action=add --subsystem-match=misc --sysname-match=mali0\n') \
   /usr/lib/systemd/system/systemd-udev-trigger.service.d/50-blockie.conf || fail "coldplug drop-in"
 cmp -s <(printf '[zram0]\nzram-size = ram\ncompression-algorithm = zstd\nswap-priority = 100\n') \
   /usr/lib/systemd/zram-generator.conf || fail "zram-generator.conf"
@@ -90,6 +90,10 @@ for v in FAILED ACTIVE NOT_EXIT1; do
   grep -q "^BLOCKIE_BOOT_OK_$v=" /usr/lib/blockie/boot-ok.conf || fail "boot-ok.conf lacks BLOCKIE_BOOT_OK_$v"
 done
 [[ -d /usr/share/blockie/blobs.d ]] || fail "no blobs.d"
+rpm -q blockie-gpu > /dev/null || fail "blockie-gpu not installed"
+[[ -f /usr/share/blockie/blobs.d/rk-g29p1.conf && -f /usr/share/blockie/vulkan/rk-g29p1.json ]] || fail "gpu conf or icd missing"
+[[ -x /usr/libexec/blockie/blockie-gpufreq && -f /usr/lib/udev/rules.d/60-blockie-gpu.rules ]] || fail "gpufreq or gpu rules missing"
+[[ ! -e /etc/ld.so.preload ]] || fail "/etc/ld.so.preload present"
 
 echo "image: dnf5 $(rpm -q dnf5)"
 echo "image: ok $kver"

@@ -1,0 +1,7 @@
+{
+    "file_format_version": "1.0.0",
+    "ICD": {
+        "library_path": "/var/lib/blockie/gpu/rk-g29p1/lib/libmali.so.1",
+        "api_version": "1.3.303"
+    }
+}

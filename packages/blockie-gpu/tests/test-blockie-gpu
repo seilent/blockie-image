@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+set -u
+
+src=$(readlink -f "${GPU_FILES:-$(dirname "$0")/../files}")
+gpufreq=$src/usr/libexec/blockie/blockie-gpufreq
+if [[ $(id -u) == 0 ]]; then
+  echo "test-blockie-gpu: refuses to run as root"
+  exit 1
+fi
+top=$(mktemp -d "${TMPDIR:-/tmp}/test-blockie-gpu.XXXXXX")
+trap 'rm -rf "${top:?}"' EXIT
+fails=0
+
+res() {
+  if [[ $1 == 0 ]]; then
+    echo "ok   $2"
+  else
+    echo "FAIL $2"
+    fails=$((fails + 1))
+  fi
+}
+
+field() { sed -n "s/^$1=//p" "$2" | tail -n 1; }
+
+name_re='^[A-Za-z0-9][A-Za-z0-9._+-]*$'
+shopt -s nullglob
+confs=("$src"/usr/share/blockie/blobs.d/*.conf)
+shopt -u nullglob
+[[ ${#confs[@]} == 1 ]]
+res $? "one blob conf"
+c=${confs[0]}
+name=${c##*/}
+name=${name%.conf}
+h=$(field SHA256 "$c")
+size=$(field SIZE "$c")
+soname=$(field SONAME "$c")
+icd=$(field VK_ICD "$c")
+url=$(field URL "$c")
+file=$(field FILE "$c")
+[[ $name =~ $name_re && $h =~ ^[0-9a-f]{64}$ && $size =~ ^[0-9]+$ && $soname =~ $name_re ]]
+res $? "conf name, SHA256, SIZE, SONAME"
+[[ $url == https://* && ${url##*/} == "$file" && $url == *"/$file" ]]
+res $? "conf URL ends in FILE"
+bad=0
+read -r -a links <<< "$(field LINKS "$c")"
+for l in "${links[@]}"; do
+  [[ $l =~ $name_re ]] || bad=1
+done
+[[ $bad == 0 && " ${links[*]} " == *" libEGL.so.1 "* && " ${links[*]} " == *" libGLESv2.so.2 "* && " ${links[*]} " == *" libgbm.so.1 "* ]]
+res $? "conf LINKS are plain names with EGL, GLESv2, gbm"
+[[ ${icd%/*} == /usr/share/blockie/vulkan && -f $src$icd ]]
+res $? "VK_ICD is a shipped file under /usr/share/blockie/vulkan"
+lib=$(python3 -c 'import json, sys; d = json.load(open(sys.argv[1])); print(d["file_format_version"], d["ICD"]["api_version"], d["ICD"]["library_path"])' "$src$icd" 2> /dev/null)
+[[ $lib == "1.0.0 "*" /var/lib/blockie/gpu/$name/lib/$soname" ]]
+res $? "ICD json points at the link farm of $name"
+grep -rqs --exclude="$name.conf" -e "$h" "$src"
+[[ $? != 0 ]]
+res $? "the blob hash appears only in the conf"
+rules=$src/usr/lib/udev/rules.d/60-blockie-gpu.rules
+grep -qx 'SUBSYSTEM=="misc", KERNEL=="mali0", GROUP="render", MODE="0660", TAG+="uaccess"' "$rules" &&
+  ! grep -q -E 'RUN|PROGRAM|IMPORT|NAME=|0666' "$rules"
+res $? "udev rules set group modes only, mali0 is render 0660 with uaccess"
+! grep -q 'BLOCKIE_GPUFREQ' "$gpufreq"
+res $? "the installed gpufreq reads no path from the environment"
+gft=$top/blockie-gpufreq
+cp "$gpufreq" "$gft"
+bad=0
+for kv in 'fix=$T_DIR/fix' 'status=$T_DIR/status' 'ddr=$T_DIR/none' 'big=$T_DIR/none' 'zones=$T_DIR/thermal' 'wakelock=$T_DIR/power'; do
+  k=${kv%%=*}
+  [[ $(grep -c "^$k=" "$gft") == 1 ]] || bad=1
+  sed -i "s|^$k=.*\$|$kv|" "$gft"
+done
+[[ $bad == 0 ]]
+res $? "the test copy redirects each gpufreq path once"
+
+fake() {
+  d=$top/$1
+  mkdir -p "$d/thermal/thermal_zone0" "$d/thermal/thermal_zone1" "$d/power"
+  echo battery > "$d/thermal/thermal_zone0/type"
+  echo 30000 > "$d/thermal/thermal_zone0/temp"
+  echo mtktscpu > "$d/thermal/thermal_zone1/type"
+  echo 31000 > "$d/thermal/thermal_zone1/temp"
+  echo '[GPUFREQ-DEBUG] fixed OPP index is disabled' > "$d/fix"
+  echo '[GPU-OPP]       Index: 29, Freq: 299000, Volt: 61250, Vsram: 85000' > "$d/status"
+  : > "$d/power/wake_lock"
+  : > "$d/power/wake_unlock"
+}
+
+gf() {
+  T_DIR=$d bash "$gft" "$@" > "$d/out" 2>&1
+}
+
+fake a
+gf run abc "$d/log" true
+[[ $? == 2 && $(cat "$d/fix") == '[GPUFREQ-DEBUG] fixed OPP index is disabled' && ! -s $d/power/wake_lock ]]
+res $? "a non numeric OPP is refused before any write"
+
+fake b
+rm -rf "$d/thermal/thermal_zone1"
+gf run 0 "$d/log" true
+[[ $? == 2 && ! -s $d/power/wake_lock ]]
+res $? "no mtktscpu zone is refused before any write"
+
+fake c
+gf run 0 "$d/log" true
+rc=$?
+[[ $rc == 3 && $(cat "$d/fix") == -1 && $(cat "$d/power/wake_unlock") == blockie-gpu ]] && grep -q 'did not read back' "$d/log"
+res $? "a pin that does not read back releases and exits 3"
+
+fake d
+gf unpin
+[[ $? == 0 && $(cat "$d/fix") == -1 ]]
+res $? "unpin writes -1"
+
+fake e
+rm -rf "$d/thermal"
+gf show
+[[ $? == 0 ]] && grep -q 'fixed OPP index is disabled' "$d/out"
+res $? "show works without a thermal zone"
+
+if (( fails )); then
+  echo "test-blockie-gpu: $fails failed"
+  exit 1
+fi
+echo "test-blockie-gpu: all ok"

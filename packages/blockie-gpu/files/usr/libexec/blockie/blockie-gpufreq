@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+me=blockie-gpufreq
+fix=/proc/gpufreqv2/fix_target_opp_index
+status=/proc/gpufreqv2/gpufreq_status
+ddr=/sys/class/devfreq/mtk-dvfsrc-devfreq/cur_freq
+big=/sys/devices/system/cpu/cpufreq/policy6/scaling_cur_freq
+zones=/sys/class/thermal
+wakelock=/sys/power
+limit=50000
+period=0.2
+pid=
+cpu=
+log=/dev/null
+
+find_zone() {
+  local z
+  for z in "$zones"/thermal_zone*; do
+    [[ $(cat "$z/type" 2> /dev/null) == mtktscpu ]] && cpu=$z/temp
+  done
+  [[ -n $cpu ]]
+}
+
+show() {
+  cat "$fix"
+  grep -E 'GPU-OPP|GPU-Power|LimitC|LimitF' "$status"
+  echo "ddr $(cat "$ddr" 2> /dev/null) cpu_temp $([[ -n $cpu ]] && cat "$cpu")"
+}
+
+sample() {
+  local _ o f v
+  read -r _ _ o _ f _ v _ < <(grep GPU-OPP "$status" | tr -d ',')
+  echo "$(cut -d' ' -f1 /proc/uptime) opp=$o freq=$f volt=$v ddr=$(cat "$ddr" 2> /dev/null) cpu_temp=$(cat "$cpu")" \
+    "big=$(cat "$big" 2> /dev/null)"
+}
+
+release() {
+  echo -1 > "$fix"
+  echo blockie-gpu > "$wakelock/wake_unlock" 2> /dev/null || true
+}
+
+stop() {
+  release
+  if [[ -n $pid ]]; then
+    kill "$pid" 2> /dev/null
+    wait "$pid" 2> /dev/null
+  fi
+  trap - EXIT HUP INT TERM
+  echo "stopped rc=$1" >> "$log"
+  exit "$1"
+}
+
+case ${1:-} in
+  show)
+    find_zone
+    show
+    ;;
+  unpin)
+    release
+    show
+    ;;
+  run)
+    opp=${2:?usage: $me run <opp index> <log> <cmd...>}
+    log=${3:?usage: $me run <opp index> <log> <cmd...>}
+    shift 3
+    [[ $opp =~ ^[0-9]+$ ]] || { echo "$me: opp index must be a number" >&2; exit 2; }
+    (( $# )) || { echo "$me: no command" >&2; exit 2; }
+    find_zone || { echo "$me: no mtktscpu thermal zone" >&2; exit 2; }
+    trap release EXIT
+    trap 'stop 129' HUP
+    trap 'stop 130' INT
+    trap 'stop 143' TERM
+    echo blockie-gpu > "$wakelock/wake_lock"
+    echo "$opp" > "$fix"
+    show > "$log"
+    grep -q "fix OPP index: $opp\$" "$fix" || { echo "pin to $opp did not read back" >> "$log"; stop 3; }
+    "$@" &
+    pid=$!
+    while kill -0 "$pid" 2> /dev/null; do
+      sample >> "$log"
+      t=$(cat "$cpu") || { echo "thermal read failed" >> "$log"; stop 4; }
+      [[ $t =~ ^-?[0-9]+$ ]] || { echo "thermal read '$t'" >> "$log"; stop 4; }
+      (( t <= limit )) || { echo "thermal abort at $t" >> "$log"; stop 5; }
+      sleep "$period"
+    done
+    wait "$pid"
+    rc=$?
+    pid=
+    release
+    trap - EXIT HUP INT TERM
+    show >> "$log"
+    echo "rc=$rc" >> "$log"
+    exit "$rc"
+    ;;
+  *)
+    echo "usage: $me show | unpin | run <opp> <log> <cmd...>" >&2
+    exit 2
+    ;;
+esac
