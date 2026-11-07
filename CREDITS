@@ -15,6 +15,8 @@ packages/bootc: Fedora's bootc 1.17.1-1.fc44 source RPM (https://github.com/boot
 rebuilt with ipc-ns-not-found.patch.
 packages/ostree: Fedora's ostree 2026.4-1.fc44 source RPM (https://github.com/ostreedev/ostree, LGPL-2.0-or-later),
 rebuilt with selinux-disabled-skip.patch.
+packages/retroarch: Fedora's retroarch 1.22.0-20.fc44 source RPM (https://github.com/libretro/RetroArch,
+GPL-3.0-or-later), rebuilt for GLES with gles-context.patch, upstream RetroArch commit db91cdbf (#18436).
 packages/libretro-snes9x: Snes9x (https://github.com/libretro/snes9x, fae2fea, the Snes9x licence: non commercial
 use, with LGPL-2.1-or-later and MIT components; the texts under /usr/share/licenses/libretro-snes9x/), built unchanged
 as the libretro core.
