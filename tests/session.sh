@@ -71,6 +71,7 @@ if [[ $1 == --user ]]; then
       ;;
     stop) rm -f "$st.active" "$st.frozen" "$FAKE/win/$(sed -n "s/^$u //p" "$FAKE/apps")" ;;
     freeze) touch "$st.frozen" ;;
+    is-active) [[ -f $st.active ]] && echo active || echo inactive ;;
     thaw) rm -f "$st.frozen" ;;
   esac
 fi
@@ -268,6 +269,66 @@ exec 8>&-
 [[ $r == 75 ]] && grep -q 'session lock busy' "$t/out"
 res $? "a held session lock: switcher exits 75"
 
+rm -f "$t/default"
+export BLOCKIE_SESSION_REVIVE_WAIT=0
+go a
+touch "$t/units/graphical-session.target.active"
+: > "$t/log"
+bs ended blockie-test-a.service
+logged "systemctl start --no-block blockie-session-revive@a.service"
+res $? "ended: the current session's unit stopped, revive@ of that session is started"
+: > "$t/log"
+bs ended blockie-test-b.service
+! grep -q 'revive@' "$t/log"
+res $? "ended: another unit stopped, nothing"
+rm -f "$t/units/graphical-session.target.active"
+: > "$t/log"
+bs ended blockie-test-a.service
+! grep -q 'revive@' "$t/log"
+res $? "ended: the graphical session is not active (logout, seat restart), nothing"
+
+rv() {
+  rm -f "$t/run/session-pending" "$t/run/session-wanted"
+  printf '%s.00 %s.00\n' "$1" "$1" > "$t/uptime"
+  bs revive "$2" > "$t/out" 2>&1
+}
+rm -f "$t/run/revived" "$t/units/blockie-test-a.service.active"
+rv 10 a
+r=$?
+[[ $r == 0 && $(cat "$t/run/session-wanted") == "a revive" && -e $t/run/session-pending ]] && grep -q 'back to a' "$t/out"
+res $? "revive: the default's unit ended, the default is requested again"
+bs switcher > /dev/null 2>&1
+up blockie-test-a.service && [[ $(cur) == "a blockie-test-a.service" ]]
+res $? "revive: the switcher starts the default again"
+rv 11 a
+[[ ! -e $t/run/session-pending ]]
+res $? "revive: the unit is active again (its own restart), nothing"
+rv 12 b
+[[ ! -e $t/run/session-pending ]] && grep -q 'not the current session' "$t/out"
+res $? "revive: a session that is not current, nothing"
+ok=0
+for u in 13 14; do
+  rm -f "$t/units/blockie-test-a.service.active"
+  rv "$u" a || ok=1
+done
+rm -f "$t/units/blockie-test-a.service.active"
+rv 15 a
+r=$?
+[[ $ok == 0 && $r == 1 && ! -e $t/run/session-pending ]] && grep -q 'brought back 3 times in 300 s, not again' "$t/out"
+res $? "revive: a fourth time for the same default inside 300 s is refused"
+rv 400 a
+[[ -e $t/run/session-pending && $(wc -l < "$t/run/revived") == 1 ]]
+res $? "revive: past the window it is allowed again and old entries are dropped"
+go c
+rm -f "$t/units/blockie-test-c.service.active"
+rv 500 c
+[[ $(cat "$t/run/session-wanted") == "a revive" ]] && grep -q 'blockie-test-c.service of c ended, back to a' "$t/out"
+res $? "revive: another session's unit ended, the default is requested"
+FAKE_UID=1000 bs revive a > /dev/null 2>&1
+[[ $? == 2 ]]
+res $? "revive runs as root only"
+unset BLOCKIE_SESSION_REVIVE_WAIT
+
 sf=${bin%/usr/bin/blockie-session}
 run=/run/blockie-session
 grep -qxF "rundir=\${BLOCKIE_RUNDIR:-$run}" "$bin" &&
@@ -282,6 +343,12 @@ res $? "the runtime dir is $run everywhere, nothing in the init's /run/blockie"
 grep -qxF 'ExecStopPost=-+/usr/bin/setpriv --reuid=blockie --regid=blockie --init-groups /usr/bin/env XDG_RUNTIME_DIR=/run/user/1000 /usr/bin/systemctl --user stop blockie-compositor.service' \
   "$sf/usr/lib/systemd/system/blockie-seat.service" && grep -q '^u blockie 1000:1000 ' "$sf/usr/lib/sysusers.d/blockie.conf"
 res $? "seat stop stops the compositor on the user bus of uid 1000, the uid sysusers gives blockie, without a PAM session"
+
+grep -qxF 'ExecStopPost=-/usr/bin/blockie-session ended %n' "$sf/usr/lib/systemd/user/blockie-.service.d/60-blockie-session.conf" &&
+  grep -qxF 'ExecStart=/usr/bin/blockie-session revive %i' "$sf/usr/lib/systemd/system/blockie-session-revive@.service" &&
+  grep -qxF "ReadWritePaths=$run" "$sf/usr/lib/systemd/system/blockie-session-revive@.service" &&
+  grep -qF 'blockie-session-(switch|revive)@' "$sf/usr/share/polkit-1/rules.d/50-blockie-session.rules"
+res $? "every blockie user unit reports its stop, revive@ runs as root, polkit lets blockie start it"
 
 if (( fails )); then
   echo "session: $fails failed"

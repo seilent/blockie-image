@@ -3,7 +3,7 @@ polkit.addRule(function(action, subject) {
     return;
   }
   var unit = action.lookup("unit");
-  var units = /^blockie-session-switch@[a-z0-9][a-z0-9-]*\.service$/;
+  var units = /^blockie-session-(switch|revive)@[a-z0-9][a-z0-9-]*\.service$/;
   if (action.lookup("verb") == "start" && unit && units.test(unit)) {
     return polkit.Result.YES;
   }

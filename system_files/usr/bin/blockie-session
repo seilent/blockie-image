@@ -12,6 +12,9 @@ t_lock=${BLOCKIE_SESSION_LOCK_WAIT:-20}
 t_start=${BLOCKIE_SESSION_START_WAIT:-20}
 t_stop=${BLOCKIE_SESSION_STOP_WAIT:-20}
 t_check=${BLOCKIE_SESSION_CHECK_WAIT:-1}
+t_revive=${BLOCKIE_SESSION_REVIVE_WAIT:-5}
+revive_max=${BLOCKIE_SESSION_REVIVE_MAX:-3}
+revive_window=${BLOCKIE_SESSION_REVIVE_WINDOW:-300}
 uptime=${BLOCKIE_UPTIME:-/proc/uptime}
 dirs=("$root/etc/blockie/sessions.d" "$root/usr/lib/blockie/sessions.d")
 units=("$root/etc/systemd/user" "$root/usr/lib/systemd/user")
@@ -21,7 +24,7 @@ appre='^[A-Za-z0-9][A-Za-z0-9._-]*$'
 log() { echo "$me: $*" >&2; }
 
 usage() {
-  echo "usage: $me list | current | get-default | set-default <name> | switch <name> | request <name> [reason] | switcher | next | back | boot | menu <from> | install <name>" >&2
+  echo "usage: $me list | current | get-default | set-default <name> | switch <name> | request <name> [reason] | switcher | next | back | boot | menu <from> | install <name> | ended <unit> | revive <name>" >&2
   exit 2
 }
 
@@ -394,6 +397,42 @@ boot() {
   switch "$t"
 }
 
+ended() {
+  read_current
+  [[ -n $cur_name && $cur_unit == "$1" ]] || exit 0
+  [[ $(systemctl --user is-active graphical-session.target 2> /dev/null) == active ]] || exit 0
+  exec systemctl start --no-block "blockie-session-revive@$cur_name.service"
+}
+
+revive() {
+  local name=$1 serial unit t now s x n=0 keep=()
+  [[ $(id -u) == 0 ]] || { log "revive runs as root"; exit 2; }
+  ids || { log "no user $user"; exit 1; }
+  read_current
+  [[ $cur_name == "$name" ]] || { log "revive: $name is not the current session"; exit 0; }
+  serial=$cur_serial unit=$cur_unit
+  sleep "$t_revive"
+  read_current
+  [[ $cur_name == "$name" && $cur_serial == "$serial" ]] || exit 0
+  inactive "$unit" || exit 0
+  t=$(get_default) || { log "revive: $unit of $name ended, no default session"; exit 1; }
+  now=$(( $(boottime_us) / 1000000 ))
+  if [[ -f $rundir/revived ]]; then
+    while read -r s x; do
+      [[ $s =~ ^[0-9]+$ ]] && (( now - s < revive_window )) || continue
+      keep+=("$s $x")
+      [[ $x != "$t" ]] || n=$(( n + 1 ))
+    done < "$rundir/revived"
+  fi
+  if (( n >= revive_max )); then
+    log "revive: $unit of $name ended, $t was brought back $n times in $revive_window s, not again"
+    exit 1
+  fi
+  put "$rundir/revived" "${keep[@]}" "$now $t" || exit 1
+  log "revive: $unit of $name ended, back to $t"
+  request "$t" revive
+}
+
 main() {
   case ${1:-} in
     list) (( $# == 1 )) || usage; list ;;
@@ -413,6 +452,8 @@ main() {
     boot) (( $# == 1 )) || usage; boot ;;
     menu) (( $# == 2 )) || usage; menu "$2" ;;
     install) (( $# == 2 )) || usage; install_action "$2" ;;
+    ended) (( $# == 2 )) || usage; ended "$2" ;;
+    revive) (( $# == 2 )) && [[ $2 =~ $namere ]] || usage; revive "$2" ;;
     *) usage ;;
   esac
 }

@@ -1,0 +1,17 @@
+[Unit]
+Description=Bring back a session after the unit of %i ended
+After=blockie-setd.service
+CollectMode=inactive-or-failed
+
+[Service]
+Type=oneshot
+TimeoutStartSec=60
+ExecStart=/usr/bin/blockie-session revive %i
+ProtectSystem=strict
+ReadWritePaths=/run/blockie-session
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectHome=read-only
+RestrictSUIDSGID=yes
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID
