@@ -21,3 +21,8 @@ as the libretro core.
 packages/libretro-genesis-plus-gx: Genesis Plus GX (https://github.com/libretro/Genesis-Plus-GX, f27655b, its own
 non commercial licence with LGPL-2.1-or-later and other component licences; the texts under
 /usr/share/licenses/libretro-genesis-plus-gx/), built unchanged as the libretro core.
+packages/libretro-mupen64plus-next: Mupen64Plus-Next (https://github.com/libretro/mupen64plus-libretro-nx, 15bada8,
+GPL-2.0-only with BSD, MIT, zlib and libpng licensed components; the texts under
+/usr/share/licenses/libretro-mupen64plus-next/), built with GLideN64 on GLES 3 and no-graphicbuffer.patch, which
+excludes GLideN64/src/Graphics/OpenGLContext/GraphicBuffer/PrivateApi/GraphicBuffer.cpp (Android only,
+GPL-3.0-or-later) from the Linux build.
