@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+set -u
+
+src=$(readlink -f "${COMP_FILES:-$(dirname "$0")/../files}")
+build=$(readlink -f "${COMP_BUILD:-.}")
+wrapper=$src/usr/libexec/blockie/blockie-compositor
+rc=$src/usr/share/blockie/labwc/rc.xml
+if [[ $(id -u) == 0 ]]; then
+  echo "test-blockie-compositor: refuses to run as root"
+  exit 1
+fi
+top=$(mktemp -d "${TMPDIR:-/tmp}/test-blockie-compositor.XXXXXX")
+trap 'rm -rf "${top:?}"' EXIT
+fails=0
+
+res() {
+  if [[ $1 == 0 ]]; then
+    echo "ok   $2"
+  else
+    echo "FAIL $2"
+    fails=$((fails + 1))
+  fi
+}
+
+sub() {
+  sed 's/^/  /' "$1"
+  fails=$((fails + $(grep -c '^FAIL' "$1")))
+}
+
+LD_PRELOAD=$build/libblockie-nocursor.so "$build/test/test-nocursor" "$top/nocursor.err" > "$top/nocursor.out" 2>&1
+res $? "nocursor shim"
+sub "$top/nocursor.out"
+"$build/test/test-nocursor" "$top/raw.err" > /dev/null 2>&1
+[[ $? != 0 ]]
+res $? "the nocursor checks fail without the shim"
+LD_PRELOAD=$build/libblockie-glfinish.so "$build/test/test-glfinish" > "$top/glfinish.out" 2>&1
+res $? "glfinish shim"
+sub "$top/glfinish.out"
+"$build/test/test-glfinish" > /dev/null 2>&1
+[[ $? != 0 ]]
+res $? "the glfinish check fails without the shim"
+FAKE_FINISH_FLUSHES=1 LD_PRELOAD=$build/libblockie-glfinish.so timeout 10 "$build/test/test-glfinish" > "$top/nested.out" 2>&1
+res $? "glfinish shim when the driver's glFinish calls glFlush"
+sub "$top/nested.out"
+LD_PRELOAD=$build/libblockie-glfinish.so timeout 10 "$build/test/nofinish/test-glfinish" > "$top/nofinish.out" 2>&1
+res $? "glfinish shim without a glFinish in the driver"
+sub "$top/nofinish.out"
+drop=$src/usr/lib/systemd/user/blockie-.service.d/50-blockie-gpu.conf
+[[ $(cat "$drop") == $'[Service]\nEnvironmentFile=-/run/blockie-gpu/gpu.env\nEnvironment=LD_PRELOAD=/usr/lib64/blockie/libblockie-nocursor.so' ]]
+res $? "every blockie user unit loads gpu.env and preloads only the nocursor shim"
+
+python3 - "$rc" > "$top/rc.out" 2>&1 << 'EOF'
+import sys
+import xml.etree.ElementTree as ET
+
+root = ET.parse(sys.argv[1]).getroot()
+
+
+def check(ok, what):
+    print(("ok   " if ok else "FAIL ") + what)
+
+
+def text(path):
+    e = root.find(path)
+    return None if e is None else (e.text or "").strip()
+
+
+check(root.tag == "labwc_config", "rc.xml root is labwc_config")
+check(text("core/allowTearing") == "no", "tearing is off")
+check(text("core/adaptiveSync") == "no", "adaptive sync is off")
+binds = root.findall("keyboard/keybind")
+check(len(binds) == 1 and [a.get("name") for a in binds[0].findall("action")] == ["None"], "one empty keybind, so no default keybinds")
+mice = root.findall("mouse/context/mousebind")
+check(len(mice) == 1 and [a.get("name") for a in mice[0].findall("action")] == ["None"], "one empty mousebind, so no default mousebinds")
+names = [a.get("name") for a in root.iter("action")]
+check("Execute" not in names and "ToggleFullscreen" not in names, "no Execute and no ToggleFullscreen action")
+rules = root.findall("windowRules/windowRule")
+check(any(r.get("identifier") == "*" and r.get("serverDecoration") == "no" for r in rules), "no server decorations")
+check(any(r.get("identifier") == "*" and r.get("type") == "normal" and [a.get("name") for a in r.findall("action")] == ["Maximize"] for r in rules), "normal windows are maximized on first map")
+EOF
+res $? "rc.xml"
+sub "$top/rc.out"
+
+python3 - "$build/blockie-none" > "$top/cursor.out" 2>&1 << 'EOF'
+import struct
+import sys
+
+d = open(sys.argv[1], "rb").read()
+magic, header, version, ntoc = struct.unpack_from("<4sIII", d, 0)
+kind, nominal, pos = struct.unpack_from("<III", d, 16)
+h = struct.unpack_from("<IIIIIIIII", d, pos)
+pixel = struct.unpack_from("<I", d, pos + 36)[0]
+ok = magic == b"Xcur" and header == 16 and ntoc == 1 and kind == 0xFFFD0002 and h[0] == 36 and h[1] == kind
+ok = ok and h[3] == 1 and h[4:6] == (1, 1) and h[6:8] == (0, 0) and pixel >> 24 == 0 and len(d) == pos + 40
+print(("ok   " if ok else "FAIL ") + "cursor file is one 1x1 transparent image")
+EOF
+res $? "cursor theme file"
+sub "$top/cursor.out"
+
+mkdir -p "$top/bin" "$top/farm"
+cat > "$top/bin/labwc" << 'EOF'
+#!/usr/bin/env bash
+{
+  printf 'args=%s\n' "$*"
+  for v in WLR_RENDERER LD_PRELOAD LD_LIBRARY_PATH VK_DRIVER_FILES WLR_NO_HARDWARE_CURSORS WLR_XWAYLAND XCURSOR_THEME; do
+    printf '%s=%s\n' "$v" "${!v-unset}"
+  done
+} > "$FAKE_OUT"
+EOF
+chmod +x "$top/bin/labwc"
+touch "$top/farm/libEGL.so.1" "$top/farm/libGLESv2.so.2" "$top/farm/libgbm.so.1"
+
+run() {
+  local out=$1
+  shift
+  env -i PATH="$top/bin:/usr/bin:/bin" FAKE_OUT="$out" BLOCKIE_COMPOSITOR_LIB="$build" "$@" bash "$wrapper" -d 2> "$out.err"
+}
+
+val() { sed -n "s/^$1=//p" "$2"; }
+
+run "$top/gl" LD_LIBRARY_PATH="$top/farm:/opt/other" VK_DRIVER_FILES=/x.json
+[[ $(val WLR_RENDERER "$top/gl") == gles2 && $(val LD_LIBRARY_PATH "$top/gl") == "$top/farm:/opt/other" && $(val VK_DRIVER_FILES "$top/gl") == /x.json ]]
+res $? "a full link farm selects gles2 and keeps the GPU env"
+[[ $(val LD_PRELOAD "$top/gl") == "$build/libblockie-nocursor.so $build/libblockie-glfinish.so" ]]
+res $? "gles2 preloads the nocursor and glfinish shims"
+[[ $(val args "$top/gl") == "-C /usr/share/blockie/labwc -d" ]]
+res $? "labwc gets the Blockie config dir and the arguments"
+[[ $(val WLR_NO_HARDWARE_CURSORS "$top/gl") == 1 && $(val WLR_XWAYLAND "$top/gl") == /usr/bin/false && $(val XCURSOR_THEME "$top/gl") == blockie-none ]]
+res $? "software cursor, no Xwayland binary, empty cursor theme"
+grep -qx 'blockie-compositor: renderer gles2' "$top/gl.err" && ! grep -q 'cannot be preloaded' "$top/gl.err"
+res $? "renderer logged and both shims load into a real process"
+rm "$top/farm/libgbm.so.1"
+run "$top/nogbm" LD_LIBRARY_PATH="$top/farm" VK_DRIVER_FILES=/x.json
+[[ $(val WLR_RENDERER "$top/nogbm") == pixman && $(val LD_LIBRARY_PATH "$top/nogbm") == unset && $(val VK_DRIVER_FILES "$top/nogbm") == unset ]]
+res $? "a farm without libgbm falls back to pixman and drops the GPU env"
+[[ $(val LD_PRELOAD "$top/nogbm") == "$build/libblockie-nocursor.so" ]]
+res $? "pixman preloads only the nocursor shim"
+run "$top/none"
+[[ $(val WLR_RENDERER "$top/none") == pixman && $(val WLR_NO_HARDWARE_CURSORS "$top/none") == 1 ]]
+res $? "no gpu.env selects pixman with software cursors"
+
+printf '#!/usr/bin/env bash\necho "systemctl $* WAYLAND_DISPLAY=${WAYLAND_DISPLAY-unset}" >> "$FAKE_OUT"\n' > "$top/bin/systemctl"
+printf '#!/usr/bin/env bash\necho "systemd-notify $*" >> "$FAKE_OUT"\n' > "$top/bin/systemd-notify"
+chmod +x "$top/bin/systemctl" "$top/bin/systemd-notify"
+env -i PATH="$top/bin:/usr/bin:/bin" FAKE_OUT="$top/auto" WAYLAND_DISPLAY=wayland-0 XDG_CURRENT_DESKTOP=labwc:wlroots \
+  sh "$src/usr/share/blockie/labwc/autostart"
+res $? "autostart runs"
+[[ $(cat "$top/auto") == $'systemctl --user import-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP WAYLAND_DISPLAY=wayland-0\nsystemd-notify --ready' ]]
+res $? "autostart imports WAYLAND_DISPLAY into the user manager before it reports ready"
+
+if [[ $fails == 0 ]]; then
+  echo "test-blockie-compositor: all ok"
+  exit 0
+fi
+echo "test-blockie-compositor: $fails failed"
+exit 1

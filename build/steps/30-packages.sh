@@ -4,7 +4,7 @@ set -euo pipefail
 install -d /etc/dnf/libdnf5.conf.d
 printf '[main]\ninstall_weak_deps=False\n' > /etc/dnf/libdnf5.conf.d/10-blockie.conf
 
-own=(blk-wmt/blk-wmt blk-bt/blk-bt blockie-tools/blockie-tools blockie-gpu/blockie-gpu bootc/bootc ostree/ostree ostree/ostree-libs)
+own=(blk-wmt/blk-wmt blk-bt/blk-bt blockie-tools/blockie-tools blockie-gpu/blockie-gpu blockie-compositor/blockie-compositor bootc/bootc ostree/ostree ostree/ostree-libs)
 
 own_rpm() {
   local dir=/pkgs/${1%%/*} name=${1#*/} f found=()
@@ -56,6 +56,7 @@ dnf -y "${opts[@]}" install \
   wlrctl \
   kmscube \
   glmark2 \
+  labwc \
   retroarch \
   libretro-mgba \
   libretro-pcsx-rearmed

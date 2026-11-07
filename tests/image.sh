@@ -50,7 +50,7 @@ for g in wheel systemd-journal input video render audio; do
 done
 [[ $(getent passwd blockie | cut -d: -f6,7) == /var/home/blockie:/bin/bash ]] || fail "blockie home or shell"
 grep -qx 'd /var/home/blockie 0700 blockie blockie -' /usr/lib/tmpfiles.d/blockie.conf || fail "home tmpfiles line"
-for p in /var/cache/libX11 /var/cache/libX11/compose /var/lib/alsa /var/lib/bluetooth /var/lib/bluetooth/mesh; do
+for p in /var/cache/libX11 /var/cache/libX11/compose /var/lib/alsa /var/lib/bluetooth /var/lib/bluetooth/mesh /var/lib/geoclue; do
   [[ -d $p && ! -L $p ]] || fail "$p is not a directory in the image"
   l="d $p $(stat -c '%04a %U %G' "$p") -"
   grep -qxF "$l" /usr/lib/tmpfiles.d/blockie.conf || fail "no tmpfiles line '$l'"
@@ -94,6 +94,12 @@ rpm -q blockie-gpu > /dev/null || fail "blockie-gpu not installed"
 [[ -f /usr/share/blockie/blobs.d/rk-g29p1.conf && -f /usr/share/blockie/vulkan/rk-g29p1.json ]] || fail "gpu conf or icd missing"
 [[ -x /usr/libexec/blockie/blockie-gpufreq && -f /usr/lib/udev/rules.d/60-blockie-gpu.rules ]] || fail "gpufreq or gpu rules missing"
 [[ ! -e /etc/ld.so.preload ]] || fail "/etc/ld.so.preload present"
+rpm -q labwc blockie-compositor > /dev/null || fail "labwc or blockie-compositor not installed"
+[[ -x /usr/libexec/blockie/blockie-compositor && -f /usr/lib64/blockie/libblockie-nocursor.so && -f /usr/lib64/blockie/libblockie-glfinish.so ]] || fail "compositor wrapper or shims missing"
+[[ -f /usr/share/blockie/labwc/rc.xml && -f /usr/share/icons/blockie-none/cursors/blockie-none ]] || fail "labwc config or cursor theme missing"
+[[ -f /usr/lib/systemd/user/blockie-.service.d/50-blockie-gpu.conf ]] || fail "blockie user unit gpu drop-in missing"
+! grep -q '^\[Install\]' /usr/lib/systemd/system/geoclue.service || fail "geoclue.service can be enabled"
+[[ -z $(find /etc/systemd /usr/lib/systemd -path '*.wants/*' \( -name 'geoclue*' -o -name 'xdg-*portal*' \)) ]] || fail "a geoclue or portal unit is enabled"
 
 echo "image: dnf5 $(rpm -q dnf5)"
 echo "image: ok $kver"

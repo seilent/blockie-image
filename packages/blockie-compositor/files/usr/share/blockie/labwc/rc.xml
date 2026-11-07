@@ -1,0 +1,32 @@
+<?xml version="1.0"?>
+<labwc_config>
+  <core>
+    <decoration>server</decoration>
+    <gap>0</gap>
+    <adaptiveSync>no</adaptiveSync>
+    <allowTearing>no</allowTearing>
+    <xwaylandPersistence>no</xwaylandPersistence>
+  </core>
+  <focus>
+    <followMouse>no</followMouse>
+    <raiseOnFocus>no</raiseOnFocus>
+  </focus>
+  <keyboard>
+    <keybind key="XF86Launch9">
+      <action name="None"/>
+    </keybind>
+  </keyboard>
+  <mouse>
+    <context name="Root">
+      <mousebind button="Left" action="Press">
+        <action name="None"/>
+      </mousebind>
+    </context>
+  </mouse>
+  <windowRules>
+    <windowRule identifier="*" serverDecoration="no"/>
+    <windowRule identifier="*" type="normal">
+      <action name="Maximize"/>
+    </windowRule>
+  </windowRules>
+</labwc_config>

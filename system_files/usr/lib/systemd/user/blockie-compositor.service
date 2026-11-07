@@ -1,0 +1,15 @@
+[Unit]
+Description=Compositor for the Blockie sessions
+BindsTo=graphical-session.target
+Before=graphical-session.target
+Wants=graphical-session-pre.target
+After=graphical-session-pre.target
+
+[Service]
+Type=notify
+NotifyAccess=all
+EnvironmentFile=-/run/blockie-gpu/gpu.env
+Environment=LABWC_UPDATE_ACTIVATION_ENV=no
+ExecStart=/usr/libexec/blockie/blockie-compositor
+ExecStopPost=-/usr/bin/systemctl --user unset-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP
+TimeoutStartSec=30

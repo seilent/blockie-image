@@ -1,0 +1,13 @@
+#!/usr/bin/env python3
+import struct
+import sys
+
+if len(sys.argv) != 2:
+    sys.exit("usage: mkcursor <out file>")
+image = 0xFFFD0002
+size = 24
+header = struct.pack("<4sIII", b"Xcur", 16, 0x10000, 1)
+toc = struct.pack("<III", image, size, 16 + 12)
+chunk = struct.pack("<IIIIIIIII", 36, image, size, 1, 1, 1, 0, 0, 0) + struct.pack("<I", 0)
+with open(sys.argv[1], "wb") as f:
+    f.write(header + toc + chunk)

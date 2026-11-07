@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+me=blockie-compositor
+lib=${BLOCKIE_COMPOSITOR_LIB:-/usr/lib64/blockie}
+farm=${LD_LIBRARY_PATH:-}
+farm=${farm%%:*}
+if [[ -n $farm && -e $farm/libEGL.so.1 && -e $farm/libGLESv2.so.2 && -e $farm/libgbm.so.1 ]]; then
+  export WLR_RENDERER=gles2
+  export LD_PRELOAD="$lib/libblockie-nocursor.so $lib/libblockie-glfinish.so"
+else
+  export WLR_RENDERER=pixman
+  export LD_PRELOAD=$lib/libblockie-nocursor.so
+  unset LD_LIBRARY_PATH VK_DRIVER_FILES
+fi
+export WLR_NO_HARDWARE_CURSORS=1
+export WLR_XWAYLAND=/usr/bin/false
+export XCURSOR_THEME=blockie-none
+echo "$me: renderer $WLR_RENDERER" >&2
+exec labwc -C /usr/share/blockie/labwc "$@"
