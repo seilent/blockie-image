@@ -48,6 +48,8 @@ for l in "${links[@]}"; do
 done
 [[ $bad == 0 && " ${links[*]} " == *" libEGL.so.1 "* && " ${links[*]} " == *" libGLESv2.so.2 "* && " ${links[*]} " == *" libgbm.so.1 "* ]]
 res $? "conf LINKS are plain names with EGL, GLESv2, gbm"
+[[ " ${links[*]} " != *" libwayland-egl.so.1 "* ]]
+res $? "conf LINKS leave libwayland-egl to the wayland package"
 [[ ${icd%/*} == /usr/share/blockie/vulkan && -f $src$icd ]]
 res $? "VK_ICD is a shipped file under /usr/share/blockie/vulkan"
 lib=$(python3 -c 'import json, sys; d = json.load(open(sys.argv[1])); print(d["file_format_version"], d["ICD"]["api_version"], d["ICD"]["library_path"])' "$src$icd" 2> /dev/null)
