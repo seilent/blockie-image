@@ -33,6 +33,7 @@ KEYS = {
     "voldown": (("mtk-kpd", "odm:gpio_keys"), KEY_VOLUMEDOWN),
     "power": (("mtk-pmic-keys",), KEY_POWER),
 }
+VIRTUAL = {("AYANEO Controller", "0019", "4001", "0428", "ayaneo-gamepad/input0")}
 ARGS = {"switcher": (0, 0), "next": (0, 0), "back": (0, 0), "switch": (1, 1), "hook": (1, 1), "unit": (1, 1),
         "call": (4, 4), "none": (0, 0)}
 GESTURES = ("tap", "hold", "press")
@@ -104,6 +105,18 @@ def load_table(session):
             continue
         table[(key, gesture)] = row
     return table
+
+
+def identity(name, real):
+    node = os.path.dirname(real)
+    out = [name]
+    for f in ("id/bustype", "id/vendor", "id/product", "phys"):
+        try:
+            with open(os.path.join(node, f)) as fh:
+                out.append(fh.read().strip())
+        except OSError:
+            return None
+    return tuple(out)
 
 
 def current():
@@ -254,8 +267,10 @@ class Hotkeyd:
     def keymap(self, name, codes):
         return {code: key for key, (names, code) in KEYS.items() if name in names and code in codes}
 
-    def physical(self, real):
-        return real.startswith(os.path.join(SYSFS, "devices") + "/") and "/devices/virtual/" not in real
+    def physical(self, real, name):
+        if not real.startswith(os.path.join(SYSFS, "devices") + "/"):
+            return False
+        return "/devices/virtual/" not in real or identity(name, real) in VIRTUAL
 
     def rescan(self):
         for path in sorted(glob.glob("/dev/input/event*")):
@@ -269,7 +284,7 @@ class Hotkeyd:
             except OSError:
                 continue
             m = self.keymap(dev.name, set(dev.capabilities().get(evdev.ecodes.EV_KEY, [])))
-            if not m or not self.physical(real):
+            if not m or not self.physical(real, dev.name):
                 dev.close()
                 self.ignored[path] = real
                 continue

@@ -91,6 +91,47 @@ run 'echo home down; sleep 0.1; printf "x\n" > /dev/null; echo home down; echo h
 [[ $(cat "$t/out") == "action home tap switch test-b" ]]
 res $? "a second down without an up is ignored"
 
+S=$t/sys
+sysnode() {
+  local d=$S/devices/$1
+  mkdir -p "$d/id" "$d/event${1##*input}"
+  printf '%s\n' "$2" > "$d/id/bustype"
+  printf '%s\n' "$3" > "$d/id/vendor"
+  printf '%s\n' "$4" > "$d/id/product"
+  printf '%s\n' "$5" > "$d/phys"
+}
+sysnode virtual/input/input5 0019 4001 0428 ayaneo-gamepad/input0
+sysnode virtual/input/input6 0019 0001 0428 ayaneo-gamepad/input0
+sysnode virtual/input/input7 0019 4001 0428 ""
+sysnode virtual/input/input8 0019 4001 0428 ayaneo-gamepad/input0
+sysnode platform/odm/odm:gpio_keys/input/input0 0019 0001 0001 gpio-keys/input0
+mkdir -p "$S/devices/virtual/input/input9/event9"
+BLOCKIE_HOTKEYD_SYSFS=$S python3 - "$bin" "$S" > "$t/phys.out" 2>&1 << 'EOF'
+import importlib.machinery
+import importlib.util
+import sys
+
+loader = importlib.machinery.SourceFileLoader("hotkeyd", sys.argv[1])
+spec = importlib.util.spec_from_loader("hotkeyd", loader)
+m = importlib.util.module_from_spec(spec)
+loader.exec_module(m)
+s = sys.argv[2]
+cases = [
+    ("virtual/input/input5/event5", "AYANEO Controller", True),
+    ("virtual/input/input6/event6", "AYANEO Controller", False),
+    ("virtual/input/input7/event7", "AYANEO Controller", False),
+    ("virtual/input/input8/event8", "uinput mirror", False),
+    ("virtual/input/input9/event9", "AYANEO Controller", False),
+    ("platform/odm/odm:gpio_keys/input/input0/event0", "odm:gpio_keys", True),
+]
+bad = [c[0] for c in cases if m.Hotkeyd.physical(None, f"{s}/devices/{c[0]}", c[1]) != c[2]]
+if m.Hotkeyd.physical(None, "/elsewhere/input5/event5", "AYANEO Controller"):
+    bad.append("outside")
+print(bad)
+sys.exit(1 if bad else 0)
+EOF
+res $? "virtual nodes stay out except the AYANEO Controller by name, ids and phys"
+
 if (( fails )); then
   echo "hotkeyd: $fails failed"
   exit 1
