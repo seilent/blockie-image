@@ -544,7 +544,34 @@ serve https://m2/f/repodata/repomd.xml fnew
 serve https://m1/u/repodata/repomd.xml unew
 state_run
 is "$rc" 0 && is "$(< "$d/st/state")" "$(printf 'fedora %s https://m2/f/\nupdates %s https://m1/u/' "$(hex fnew)" "$(hex unew)")" \
-  && is "$(< "$d/st/blockie.repo")" "$(printf '[fedora]\nbaseurl=https://m2/f/\nmetalink=\nmirrorlist=\n[updates]\nbaseurl=https://m1/u/\nmetalink=\nmirrorlist=')"; res $? "repo state: the first mirror serving the current repomd is pinned"
+  && is "$(< "$d/st/blockie.repo")" "$(printf '[fedora]\nbaseurl=https://m2/f/\nmetalink=\nmirrorlist=\n[updates]\nbaseurl=https://m1/u/\nmetalink=\nmirrorlist=')"; res $? "repo state: only mirrors serving the current repomd are pinned"
+
+dlf=https://dl.fedoraproject.org/pub/fedora/linux/releases/44/Everything/aarch64/os
+dlu=https://dl.fedoraproject.org/pub/fedora/linux/updates/44/Everything/aarch64
+
+state_setup q_dl
+meta "$d/meta.fedora" "$(hex fnew)" "$(hex fold)" https://m1/f https://m2/f https://m3/f https://m4/f
+meta "$d/meta.updates" "$(hex unew)" "$(hex uold)" https://m1/u "$dlu"
+serve "$dlf/repodata/repomd.xml" fnew
+serve https://m1/f/repodata/repomd.xml fnew
+serve https://m2/f/repodata/repomd.xml fold
+serve https://m3/f/repodata/repomd.xml fnew
+serve https://m4/f/repodata/repomd.xml fnew
+serve "$dlu/repodata/repomd.xml" unew
+serve https://m1/u/repodata/repomd.xml unew
+state_run
+is "$rc" 0 && is "$(< "$d/st/state")" "$(printf 'fedora %s %s/ https://m1/f/ https://m3/f/\nupdates %s %s/ https://m1/u/' "$(hex fnew)" "$dlf" "$(hex unew)" "$dlu")" \
+  && is "$(< "$d/st/blockie.repo")" "$(printf '[fedora]\nbaseurl=%s/ https://m1/f/ https://m3/f/\nmetalink=\nmirrorlist=\n[updates]\nbaseurl=%s/ https://m1/u/\nmetalink=\nmirrorlist=' "$dlf" "$dlu")"; res $? "repo state: dl.fedoraproject.org first, then up to two more current mirrors, each once"
+
+state_setup q_dlold
+meta "$d/meta.fedora" "$(hex fnew)" "$(hex fold)" https://m1/f
+meta "$d/meta.updates" "$(hex unew)" "$(hex uold)" https://m1/u
+serve "$dlf/repodata/repomd.xml" fold
+serve https://m1/f/repodata/repomd.xml fnew
+serve "$dlu/repodata/repomd.xml" unew
+serve https://m1/u/repodata/repomd.xml uold
+state_run
+is "$rc" 0 && is "$(< "$d/st/state")" "$(printf 'fedora %s https://m1/f/\nupdates %s %s/' "$(hex fnew)" "$(hex unew)" "$dlu")"; res $? "repo state: dl.fedoraproject.org serving another repomd is skipped"
 
 state_setup q_nomirror
 meta "$d/meta.fedora" "$(hex fnew)" "$(hex fold)" https://m1/f
@@ -624,7 +651,7 @@ is "$rc" 0 && is "$out" "$base-x -" && grep -qxF "build --no-cache $lim -t $base
 
 builder_setup b_key
 k1=$(bkey)
-printf 'fedora %s https://m9/f/\nupdates %s https://m9/u/\n' "$(hex f)" "$(hex u)" > "$d/st/state"
+printf 'fedora %s https://m9/f/ https://m8/f/\nupdates %s https://m9/u/\n' "$(hex f)" "$(hex u)" > "$d/st/state"
 k2=$(bkey)
 printf 'fedora %s https://m9/f/\nupdates %s https://m9/u/\n' "$(hex f)" "$(hex u2)" > "$d/st/state"
 k3=$(bkey)
