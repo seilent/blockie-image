@@ -475,6 +475,28 @@ rc=$?
 [[ $rc == 143 && -e $FAKE/term && $during == 0 && ! -e $fifo ]] && grep -qx -- '--user stop blockie-game.scope' "$FAKE/systemctl.log"
 res $? "TERM on the wrapper stops RetroArch and the scope, removes the FIFO, then exits 143"
 
+rm -f "$FAKE"/*.log "$FAKE/term" "$FAKE/pid"
+FAKE_SLEEP=1 PATH=$FAKE/bin:$PATH XDG_RUNTIME_DIR=$t/run DL1_CARDS=$t/nocard "$game" gba "$rom" > "$t/out" 2>&1 &
+w=$!
+for _ in $(seq 50); do
+  [[ -s $FAKE/pid ]] && break
+  sleep 0.1
+done
+gp=$(cat "$FAKE/pid" 2> /dev/null)
+kill -STOP "$gp"
+sleep 1
+[[ $(sed -n 's/^State:[[:space:]]*\(.\).*/\1/p' "/proc/$gp/status" 2> /dev/null) == T ]] && kill -0 "$w" 2> /dev/null
+during=$?
+kill -CONT "$gp"
+sleep 0.5
+kill -0 "$w" 2> /dev/null
+cont=$?
+kill -TERM "$gp"
+wait "$w"
+rc=$?
+[[ $during == 0 && $cont == 0 && $rc == 143 && -e $FAKE/term ]]
+res $? "a RetroArch stopped by SIGSTOP (as blank-on sends) keeps the wrapper waiting; after SIGCONT it runs on and its exit is the wrapper's"
+
 rm -f "$FAKE"/*.log "$FAKE/term" "$FAKE/pid" "$FAKE/append.cfg" "$FAKE/core.opt"
 FAKE_SLEEP=1 PATH=$FAKE/bin:$PATH XDG_RUNTIME_DIR=$t/run DL1_CARDS=$t/nocard "$game" gb "$rom" > "$t/out" 2>&1 &
 w=$!
