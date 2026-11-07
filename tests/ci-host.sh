@@ -273,7 +273,7 @@ EOF
 }
 
 pins() {
-  printf '%s  a-1.tar.gz\n' "$(printf '%064d' 1)" > "$r/packages/a/SOURCE.sha256"
+  printf '%s  %s-1.tar.gz\n' "$(printf '%064d' 1)" "${1:-a}" > "$r/packages/${1:-a}/SOURCE.sha256"
   git -C "$r" add -A
 }
 
@@ -353,7 +353,12 @@ plan_run
 plan_setup p_nosource
 pins
 plan_run
-[[ $rc == 1 ]] && has '::error::ghcr.io/seilent/blockie/pkg/a:' && has 'no source referrer' && has 'delete that package version'; res $? "plan: a signed pinned package without a source referrer fails at list time"
+[[ $rc == 1 ]] && has '::error::ghcr.io/seilent/blockie/pkg/a:' && has 'no source referrer' && has 'delete that package version on ghcr and rerun'; res $? "plan: a signed pinned package without a source referrer fails at list time"
+
+plan_setup p_nosourcelocal
+pins c
+plan_run
+[[ $rc == 1 ]] && has '::error::ghcr.io/seilent/blockie/pkg/c:' && has 'just pkg-push c on the build PC' && ! has 'and rerun'; res $? "plan: a signed LOCAL pinned package without a source referrer names just pkg-push as the repair"
 
 plan_setup p_wrongsource
 pins

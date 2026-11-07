@@ -34,7 +34,9 @@ for name in $(git ls-files -- 'packages/*/build.sh' | cut -d/ -f2); do
       if [[ -n $(git ls-files -- "packages/$name/SOURCE.sha256") ]]; then
         digest=sha256:$(skopeo inspect --no-creds --raw "docker://$repo:$hash" | sha256sum | cut -d' ' -f1)
         if ! art=$(build/source-referrer.sh "$repo@$digest" "packages/$name/SOURCE.sha256"); then
-          echo "::error::$repo:$hash is signed but has no source referrer with the files of packages/$name/SOURCE.sha256; delete that package version on ghcr and rerun"
+          fix="delete that package version on ghcr and rerun"
+          [[ -z $(git ls-files -- "packages/$name/LOCAL") ]] || fix="delete that package version on ghcr, then run just pkg-push $name on the build PC"
+          echo "::error::$repo:$hash is signed but has no source referrer with the files of packages/$name/SOURCE.sha256; $fix"
           exit 1
         fi
         echo "$repo:$hash exists, signed, source $art"
