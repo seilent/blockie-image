@@ -478,18 +478,27 @@ for kv in video_driver=gl video_context_driver=wayland input_driver=udev input_j
   savefile_directory=$data/saves savestate_directory=$data/states system_directory=$data/bios \
   libretro_directory=/usr/lib64/libretro libretro_info_path=/usr/share/libretro/info audio_driver=pipewire \
   config_save_on_exit=false joypad_autoconfig_dir=$share/autoconfig input_autodetect_enable=true midi_driver=null \
-  core_info_cache_enable=false gamemode_enable=false; do
+  core_info_cache_enable=false gamemode_enable=false menu_swap_ok_cancel_buttons=true; do
   [[ $(cfgv "${kv%%=*}") == "${kv#*=}" ]] || { ok=1; echo "  ${kv%%=*} is '$(cfgv "${kv%%=*}")'"; }
 done
+pad="$share/autoconfig/udev/AYANEO Controller.cfg"
+for l in 'input_b_btn = "0"' 'input_a_btn = "1"' 'input_x_btn = "2"' 'input_y_btn = "3"' 'input_b_btn_label = "B"' \
+  'input_a_btn_label = "A"' 'input_x_btn_label = "Y"' 'input_y_btn_label = "X"'; do
+  grep -qxF "$l" "$pad" || { ok=1; echo "  no '$l' in the autoconfig"; }
+done
+cmp -s <(printf '%s\n' 'nes /usr/share/libretro/shaders/blockie/crt-gdv-mini.glslp' \
+  'snes /usr/share/libretro/shaders/blockie/crt-gdv-mini.glslp' 'genesis /usr/share/libretro/shaders/blockie/crt-gdv-mini.glslp' \
+  'gb /usr/share/libretro/shaders/blockie/lcd3x.glslp' 'gbc /usr/share/libretro/shaders/blockie/lcd3x.glslp' \
+  'gba /usr/share/libretro/shaders/blockie/lcd3x.glslp' 'ps1 /usr/share/libretro/shaders/blockie/lcd3x.glslp') \
+  "$t/shader-defaults" || { ok=1; echo "  shipped shader-defaults"; }
 ! grep -q 'audio_volume' "$share/blockie.cfg" || ok=1
 for l in 'menu_show_online_updater = "false"' 'menu_show_core_updater = "false"' 'core_updater_buildbot_cores_url = ""' \
   'core_updater_buildbot_assets_url = ""' 'netplay_public_announce = "false"' 'network_cmd_enable = "false"'; do
   grep -qxF "$l" "$share/blockie.cfg" || { ok=1; echo "  no '$l'"; }
 done
-[[ -f "$share/autoconfig/udev/AYANEO Controller.cfg" ]] || ok=1
 ! grep -Eq '^input_(enable_hotkey|menu_toggle|exit_emulator)_btn' "$share/blockie.cfg" || { ok=1; echo "  a pad hotkey in blockie.cfg"; }
-! grep -q 'input_menu_toggle_btn' "$share/autoconfig/udev/AYANEO Controller.cfg" || { ok=1; echo "  a pad menu toggle in the autoconfig"; }
-res $ok "base config: dirs, cores, pipewire, midi, info cache, gamemode, no save on exit, autoconfig, volume, stdin commands, no pad hotkeys"
+! grep -q 'input_menu_toggle_btn' "$pad" || { ok=1; echo "  a pad menu toggle in the autoconfig"; }
+res $ok "base config: dirs, cores, pipewire, midi, info cache, gamemode, no save on exit, menu ok on south, positional face buttons with physical labels, shader defaults, volume, stdin commands, no pad hotkeys"
 
 if [[ $fails == 0 ]]; then
   echo "game: all ok"
