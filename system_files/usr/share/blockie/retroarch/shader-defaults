@@ -1,0 +1,6 @@
+nes /usr/share/libretro/shaders/blockie/crt-gdv-mini.glslp
+snes /usr/share/libretro/shaders/blockie/crt-gdv-mini.glslp
+genesis /usr/share/libretro/shaders/blockie/crt-gdv-mini.glslp
+gb /usr/share/libretro/shaders/blockie/lcd3x.glslp
+gbc /usr/share/libretro/shaders/blockie/lcd3x.glslp
+gba /usr/share/libretro/shaders/blockie/lcd3x.glslp

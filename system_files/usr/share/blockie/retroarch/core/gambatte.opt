@@ -1,0 +1,4 @@
+gambatte_gb_colorization = "auto"
+gambatte_gb_internal_palette = "GBC - Pastel Mix"
+gambatte_gbc_color_correction = "always"
+gambatte_mix_frames = "lcd_ghosting"

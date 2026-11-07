@@ -1,0 +1,6 @@
+shaders = 1
+
+shader0 = ../glsl-shaders/handheld/shaders/zfast_lcd.glsl
+filter_linear0 = true
+
+GBAGAMMA = 0.0

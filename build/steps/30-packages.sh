@@ -8,7 +8,7 @@ own=(blk-wmt/blk-wmt blk-bt/blk-bt blockie-tools/blockie-tools blockie-gpu/block
 for c in snes9x genesis-plus-gx mupen64plus-next ppsspp flycast; do
   own+=("libretro-$c/libretro-$c")
 done
-own+=(retroarch/retroarch)
+own+=(retroarch/retroarch libretro-shaders-blockie/libretro-shaders-blockie)
 
 own_rpm() {
   local dir=/pkgs/${1%%/*} name=${1#*/} f found=()

@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 set -u
 
+[[ -e /run/.containerenv ]] || { echo "game: runs only in a container, it rewrites files under /usr" >&2; exit 2; }
 game=/usr/bin/blockie-game
 share=/usr/share/blockie/retroarch
 data=/var/lib/blockie/data
 t=$(mktemp -d "${TMPDIR:-/tmp}/game.XXXXXX")
 fails=0
-trap 'rm -rf "${t:?}"' EXIT
+cp -p "$share/shader-defaults" "$t/shader-defaults"
+trap 'cp -p "$t/shader-defaults" "$share/shader-defaults"; rm -rf "${t:?}"' EXIT
+: > "$share/shader-defaults"
 
 res() {
   if [[ $1 == 0 ]]; then
@@ -18,11 +21,15 @@ res() {
 }
 
 export FAKE=$t/fake
-mkdir -p "$FAKE/bin" "$t/run" "$data/roms/gba" "$data/roms/psp" "$data/roms/dir" /usr/share/libretro/shaders/crt
+mkdir -p "$FAKE/bin" "$t/run" "$t/r\"un" "$data/roms/gba" "$data/roms/psp" "$data/roms/dir" /usr/share/libretro/shaders/crt \
+  /var/lib/blockie/shaders
 printf 'invented rom\n' > "$data/roms/gba/test.gba"
 printf 'invented iso\n' > "$data/roms/psp/test.iso"
-printf 'invented shader\n' > /usr/share/libretro/shaders/crt/test.glslp
-printf 'invented shader\n' > /usr/share/libretro/shaders/crt/test.slangp
+for f in crt/test.glslp crt/test.slangp crt/game.glslp crt/test.glsl; do
+  printf 'invented shader\n' > "/usr/share/libretro/shaders/$f"
+done
+printf 'invented shader\n' > /var/lib/blockie/shaders/test.slangp
+printf 'invented shader\n' > /var/lib/blockie/shaders/test.glslp
 printf 'invented shader\n' > "$t/outside.glslp"
 ln -sfn "$t/outside.glslp" /usr/share/libretro/shaders/crt/out.glslp
 ln -sfn /etc/passwd "$data/roms/gba/out.gba"
@@ -59,10 +66,13 @@ while (( $# )); do
   fi
   shift
 done
+o=$(sed -n 's/^core_options_path = "\(.*\)"$/\1/p' "$FAKE/append.cfg")
+[[ -z $o ]] || cp "$o" "$FAKE/core.opt"
 if [[ -n ${FAKE_SLEEP:-} ]]; then
-  trap 'echo term > "$FAKE/term"; exit 143' TERM
-  echo "$$" > "$FAKE/pid"
+  trap 'echo term > "$FAKE/term"; kill "$s"; exit 143' TERM
   sleep 30 &
+  s=$!
+  echo "$$" > "$FAKE/pid"
   wait
 fi
 exit "${FAKE_RC:-0}"
@@ -70,7 +80,7 @@ EOF
 chmod 755 "$FAKE/bin/systemd-run" "$FAKE/bin/systemctl" "$FAKE/bin/retroarch"
 
 play() {
-  rm -f "$FAKE"/*.log "$FAKE/retroarch.argv" "$FAKE/retroarch.env" "$FAKE/append.cfg" "$FAKE/term" "$FAKE/pid"
+  rm -f "$FAKE"/*.log "$FAKE/retroarch.argv" "$FAKE/retroarch.env" "$FAKE/append.cfg" "$FAKE/term" "$FAKE/pid" "$FAKE/core.opt"
   PATH=$FAKE/bin:$PATH XDG_RUNTIME_DIR=${RUN-$t/run} DL1_CARDS=${CARDS:-$t/nocard} "$game" "$@" > "$t/out" 2>&1
   rc=$?
 }
@@ -85,9 +95,9 @@ scope="--user --scope --quiet --unit=blockie-game --collect --slice=blockie-emul
 scope+=" -p After=blockie-frontend.service -p MemoryHigh=80% -p MemoryMax=90% -p TasksMax=512 -p OOMPolicy=kill --"
 base="--config $share/blockie.cfg"
 
-play gba "$rom"
-[[ $rc == 0 && $(cat "$FAKE/systemd-run.log") == "$scope retroarch $base -L /usr/lib64/libretro/mgba_libretro.so $rom" ]]
-res $? "gba: one scope in blockie-emulation.slice bound to the frontend, with the limits, RetroArch on mgba"
+play ps1 "$rom"
+[[ $rc == 0 && $(cat "$FAKE/systemd-run.log") == "$scope retroarch $base -L /usr/lib64/libretro/pcsx_rearmed_libretro.so $rom" ]]
+res $? "ps1: one scope in blockie-emulation.slice bound to the frontend, with the limits, RetroArch on pcsx_rearmed"
 
 declare -A want=([gb]=gambatte [gbc]=gambatte [nes]=nestopia [snes]=snes9x [genesis]=genesis_plus_gx [gba]=mgba
   [ps1]=pcsx_rearmed [n64]=mupen64plus_next [psp]=ppsspp [dc]=flycast)
@@ -103,8 +113,8 @@ play snes "$rom" --core pcsx_rearmed
 [[ $rc == 0 ]] && argv "$base -L /usr/lib64/libretro/pcsx_rearmed_libretro.so $rom"
 res $? "--core overrides the system default"
 
-play gba "$data/roms/gba/in.gba"
-[[ $rc == 0 ]] && argv "$base -L /usr/lib64/libretro/mgba_libretro.so $rom"
+play ps1 "$data/roms/gba/in.gba"
+[[ $rc == 0 ]] && argv "$base -L /usr/lib64/libretro/pcsx_rearmed_libretro.so $rom"
 res $? "a symlink inside the data dir is passed resolved"
 
 play psp "$data/roms/psp/test.iso"
@@ -153,12 +163,12 @@ res $ok "rompaths: relative, missing, outside, a symlink out, a .. escape, a dir
 
 cfg() {
   printf '%s\n' "$@" > "$t/game.cfg"
-  play gba "$rom" --config "$t/game.cfg"
+  play ps1 "$rom" --config "$t/game.cfg"
 }
-cfg 'aspect_ratio_index = "22"' '' 'video_scale_integer = "true"' 'video_shader_enable = "false"' \
+cfg 'aspect_ratio_index = "22"' '' 'video_scale_integer = "true"' 'video_shader_enable = "true"' \
   'video_shader = "/usr/share/libretro/shaders/crt/../crt/test.glslp"' 'video_smooth="false"' 'rewind_enable = "true"' \
   'savestate_auto_save = "false"' 'savestate_auto_load = "true"' $'fastforward_ratio = "4.0"\r'
-exp=$(printf '%s\n' 'aspect_ratio_index = "22"' 'video_scale_integer = "true"' 'video_shader_enable = "false"' \
+exp=$(printf '%s\n' 'aspect_ratio_index = "22"' 'video_scale_integer = "true"' 'video_shader_enable = "true"' \
   'video_smooth = "false"' 'rewind_enable = "true"' \
   'savestate_auto_save = "false"' 'savestate_auto_load = "true"' 'fastforward_ratio = "4.0"')
 app=$(sed -n 's/.* --appendconfig \([^ ]*\) .*/\1/p' "$FAKE/retroarch.argv")
@@ -174,7 +184,7 @@ done
 res $ok "config: aspect_ratio_index 0 to 22 and 24 pass"
 
 cfg '' '   '
-[[ $rc == 0 ]] && argv "$base -L /usr/lib64/libretro/mgba_libretro.so $rom"
+[[ $rc == 0 ]] && argv "$base -L /usr/lib64/libretro/pcsx_rearmed_libretro.so $rom"
 res $? "config: blank lines only, no --appendconfig"
 
 printf 'rewind_enable = "true"\n' > "$t/game.cfg"
@@ -202,6 +212,129 @@ refused gba "$rom" --config "$t" || ok=1
 head -c 70000 /dev/zero | tr '\0' '\n' > "$t/big.cfg"
 refused gba "$rom" --config "$t/big.cfg" || ok=1
 res $ok "config: other keys, comments, bad values, shaders outside the dir, a key twice, missing or huge files exit 64"
+
+D=/usr/share/libretro/shaders/crt/test.glslp
+G=/usr/share/libretro/shaders/crt/game.glslp
+S=/var/lib/blockie/shaders/test.slangp
+defs() {
+  : > "$share/shader-defaults"
+  (( ! $# )) || printf '%s\n' "$@" > "$share/shader-defaults"
+}
+sets() { [[ $(cat "$FAKE/retroarch.argv") == *" --set-shader $1 -L "* ]]; }
+noset() { [[ $(cat "$FAKE/retroarch.argv") != *--set-shader* ]]; }
+appended() { [[ $(cat "$FAKE/append.cfg") == "$(printf '%s\n' "$@")" ]]; }
+noappend() { [[ $(cat "$FAKE/retroarch.argv") != *--appendconfig* ]]; }
+logged() { [[ $(wc -l < "$t/out") == "$1" ]] && grep -q -- "$2" "$t/out"; }
+cell() {
+  local sys=$1 sh=$2 en=$3 conf=$4 shader=$5 l=() e=()
+  if [[ $conf == 1 ]]; then
+    l=('rewind_enable = "true"')
+    [[ -z $sh ]] || l+=("video_shader = \"$sh\"")
+    [[ -z $en ]] || l+=("video_shader_enable = \"$en\"")
+    printf '%s\n' "${l[@]}" > "$t/game.cfg"
+    play "$sys" "$rom" --config "$t/game.cfg"
+    e=('rewind_enable = "true"')
+    [[ -z $en ]] || e+=("video_shader_enable = \"$en\"")
+  else
+    play "$sys" "$rom"
+  fi
+  [[ -z $shader || $en == true ]] || e+=('video_shader_enable = "true"')
+  [[ $rc == 0 && ! -s $t/out ]] && appended "${e[@]}" || return 1
+  (( ${#e[@]} )) || noappend || return 1
+  if [[ -n $shader ]]; then sets "$shader"; else noset; fi
+}
+
+defs "nes $D"
+ok=0
+cell nes '' '' 0 "$D" || { ok=1; echo "  nes: no config"; }
+for en in '' true false; do
+  w=$D
+  [[ $en != false ]] || w=
+  cell nes '' "$en" 1 "$w" || { ok=1; echo "  nes: no video_shader, video_shader_enable '$en'"; }
+  w=$G
+  [[ $en != false ]] || w=
+  cell nes "$G" "$en" 1 "$w" || { ok=1; echo "  nes: video_shader, video_shader_enable '$en'"; }
+done
+play nes "$rom" --core snes9x
+[[ $rc == 0 ]] && sets "$D" || { ok=1; echo "  nes --core snes9x: no default"; }
+res $ok "shader, nes with a default: the game's video_shader, else the default, video_shader_enable true once, none on false"
+
+ok=0
+cell snes '' '' 0 '' || { ok=1; echo "  snes: no config"; }
+for en in '' true false; do
+  cell snes '' "$en" 1 '' || { ok=1; echo "  snes: no video_shader, video_shader_enable '$en'"; }
+  w=$G
+  [[ $en != false ]] || w=
+  cell snes "$G" "$en" 1 "$w" || { ok=1; echo "  snes: video_shader, video_shader_enable '$en'"; }
+done
+res $ok "shader, snes without a default: only the game's video_shader, no run append file without lines"
+
+defs "nes /usr/share/libretro/shaders/crt/none.glslp"
+play nes "$rom"
+[[ $rc == 0 ]] && noset && noappend && logged 1 'shader-defaults line 1: /usr/share/libretro/shaders/crt/none.glslp is not'
+res $? "shader: a missing default is skipped with one log line, the game starts"
+
+ok=0
+for p in /usr/share/libretro/shaders/crt/test.slangp /usr/share/libretro/shaders/crt/out.glslp /usr/share/libretro/shaders/crt \
+  /usr/share/libretro/shaders/crt/test.glsl /var/lib/blockie/shaders/test.glslp /var/lib/blockie/shaders/../shaders \
+  /etc/passwd "$t/outside.glslp"; do
+  defs "nes $p"
+  play nes "$rom"
+  [[ $rc == 0 ]] && noset && noappend && logged 1 'shader-defaults line 1: .* skipped' || { ok=1; echo "  default $p: rc $rc"; }
+done
+res $ok "shader: a default that is not a .glslp under the shaders dir or a .slangp under the slang dir is skipped"
+
+defs 'nes' "nes $D extra" "nds $D" 'nes crt/test.glslp' "Nes $D" '' "snes $D"
+play snes "$rom"
+[[ $rc == 0 ]] && sets "$D" && [[ $(grep -c 'is not <system> <absolute path>, skipped' "$t/out") == 5 && $(wc -l < "$t/out") == 5 ]]
+r1=$?
+play nes "$rom"
+[[ $r1 == 0 && $rc == 0 ]] && noset && noappend && logged 5 'shader-defaults line 4 is not'
+res $? "shader: malformed lines (fields, unknown system, relative path) are skipped with a log line each"
+
+defs "nes $D" "nes $G"
+play nes "$rom"
+[[ $rc == 0 ]] && sets "$D" && logged 1 'shader-defaults line 2 sets nes again, skipped'
+res $? "shader: the first line for a system wins"
+
+defs "nes $S"
+ok=0
+play nes "$rom"
+[[ $rc == 0 ]] && sets "$S" && appended 'video_shader_enable = "true"' 'video_driver = "glcore"' || { ok=1; echo "  slangp default"; }
+printf '%s\n' 'video_shader_enable = "false"' > "$t/game.cfg"
+play nes "$rom" --config "$t/game.cfg"
+[[ $rc == 0 ]] && noset && appended 'video_shader_enable = "false"' || { ok=1; echo "  slangp default, game false"; }
+printf '%s\n' "video_shader = \"$G\"" > "$t/game.cfg"
+play nes "$rom" --config "$t/game.cfg"
+[[ $rc == 0 ]] && sets "$G" && appended 'video_shader_enable = "true"' || { ok=1; echo "  slangp default, game shader"; }
+res $ok "shader: a .slangp default under /var/lib/blockie/shaders runs on glcore, only when it is the shader"
+
+defs
+ok=0
+for sc in gb:gambatte gbc:gambatte gba:mgba snes:gambatte; do
+  s=${sc%%:*}
+  c=${sc#*:}
+  if [[ $s == snes ]]; then play snes "$rom" --core gambatte; else play "$s" "$rom"; fi
+  app=$(sed -n 's/.* --appendconfig \([^ ]*\) .*/\1/p' "$FAKE/retroarch.argv")
+  o=$(sed -n 's/^core_options_path = "\(.*\)"$/\1/p' "$FAKE/append.cfg")
+  [[ $rc == 0 && $o == "$t/run/blockie-game."*.opt && $app == "$t/run/blockie-game."*.cfg && ! -e $o && ! -e $app ]] &&
+    appended 'global_core_options = "true"' "core_options_path = \"$o\"" && cmp -s "$FAKE/core.opt" "$share/core/$c.opt" ||
+    { ok=1; echo "  $s on $c: rc $rc"; }
+done
+for sc in gb:pcsx_rearmed gba:snes9x; do
+  play "${sc%%:*}" "$rom" --core "${sc#*:}"
+  [[ $rc == 0 ]] && argv "$base -L /usr/lib64/libretro/${sc#*:}_libretro.so $rom" || { ok=1; echo "  ${sc%%:*} on ${sc#*:}: options"; }
+done
+[[ -z $(find "$t/run" -name 'blockie-game.*.opt') ]] || ok=1
+res $ok "core options: a shipped <core>.opt is copied for the run as global core options and removed, none for other cores"
+
+defs "gb $D"
+play gb "$rom"
+o=$(sed -n 's/^core_options_path = "\(.*\)"$/\1/p' "$FAKE/append.cfg")
+[[ $rc == 0 && -n $o ]] && sets "$D" &&
+  appended 'video_shader_enable = "true"' 'global_core_options = "true"' "core_options_path = \"$o\""
+res $? "shader and core options: the shader line, then the two option lines"
+defs
 
 mv /usr/lib64/libretro/mgba_libretro.so "$t/mgba.so"
 play gba "$rom"
@@ -238,9 +371,12 @@ CARDS=$t/card play gba "$rom"
 [[ $rc == 71 ]] && ! ran
 res $? "a failed DL1 check exits 71 before RetroArch starts"
 
+ok=0
 RUN='' play gba "$rom"
-[[ $rc == 70 ]] && ! ran
-res $? "no XDG_RUNTIME_DIR exits 70"
+[[ $rc == 70 ]] && ! ran || ok=1
+RUN="$t/r\"un" play gba "$rom"
+[[ $rc == 70 ]] && ! ran || ok=1
+res $ok "no XDG_RUNTIME_DIR, or one with a quote, exits 70"
 
 mkdir -p /run/blockie-gpu
 printf '%s\n' LD_LIBRARY_PATH=/invented/farm VK_DRIVER_FILES=/invented/icd.json FAKE_GPU_EXTRA=x > /run/blockie-gpu/gpu.env
@@ -261,6 +397,23 @@ wait "$w"
 rc=$?
 [[ $rc == 143 && -e $FAKE/term ]] && grep -qx -- '--user stop blockie-game.scope' "$FAKE/systemctl.log"
 res $? "TERM on the wrapper stops RetroArch and the scope, then exits 143"
+
+rm -f "$FAKE"/*.log "$FAKE/term" "$FAKE/pid" "$FAKE/append.cfg" "$FAKE/core.opt"
+FAKE_SLEEP=1 PATH=$FAKE/bin:$PATH XDG_RUNTIME_DIR=$t/run DL1_CARDS=$t/nocard "$game" gb "$rom" > "$t/out" 2>&1 &
+w=$!
+for _ in $(seq 50); do
+  [[ -s $FAKE/pid ]] && break
+  sleep 0.1
+done
+o=$(sed -n 's/^core_options_path = "\(.*\)"$/\1/p' "$FAKE/append.cfg")
+app=$(sed -n 's/.* --appendconfig \([^ ]*\) .*/\1/p' "$FAKE/retroarch.argv")
+[[ -n $o && -f $o && -f $app ]]
+during=$?
+kill -TERM "$w"
+wait "$w"
+rc=$?
+[[ $rc == 143 && $during == 0 && ! -e $o && ! -e $app ]] && cmp -s "$FAKE/core.opt" "$share/core/gambatte.opt"
+res $? "TERM: the core options copy and the run append file are removed"
 
 cfgv() { sed -n "s/^$1 = \"\(.*\)\"$/\1/p" "$share/blockie.cfg"; }
 ok=0

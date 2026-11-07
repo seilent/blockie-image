@@ -1,0 +1,14 @@
+FROM localhost/blockie-pkg-builder
+
+COPY SOURCE.sha256 libretro-shaders-blockie.spec /tmp/libretro-shaders-blockie/
+RUN dnf -y --setopt=install_weak_deps=False install glslang \
+ && dnf clean all \
+ && install -d /srcpkg \
+ && rpmspec -P /tmp/libretro-shaders-blockie/libretro-shaders-blockie.spec \
+      | sed -n 's|^Source[0-9]*:[[:space:]]*\(https://.*\)$|\1|p' > /tmp/libretro-shaders-blockie/urls \
+ && while read -r u; do \
+      curl -fsSL --retry 3 -o "/srcpkg/${u##*/}" "$u" || exit 1; \
+    done < /tmp/libretro-shaders-blockie/urls \
+ && (cd /srcpkg && sha256sum -c /tmp/libretro-shaders-blockie/SOURCE.sha256) \
+ && [ "$(ls /srcpkg | LC_ALL=C sort)" = "$(awk '{ print $2 }' /tmp/libretro-shaders-blockie/SOURCE.sha256 | LC_ALL=C sort)" ] \
+ && rm -rf /tmp/libretro-shaders-blockie

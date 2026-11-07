@@ -36,3 +36,13 @@ ext/sfmt19937 refers to.
 packages/libretro-flycast: Flycast (https://github.com/flyinghead/flycast, v2.7 5aa091f, GPL-2.0-or-later with the
 component licences under /usr/share/licenses/libretro-flycast/), built as the libretro core with the version string
 set to v2.7. md5-LICENSE is the LICENSE of https://github.com/ulwanski/md5 (bca18c2), where core/deps/md5 comes from.
+packages/libretro-shaders-blockie: GLSL shaders from https://github.com/libretro/glsl-shaders (1aaabbe), unchanged at
+their upstream paths: crt/shaders/crt-gdv-mini.glsl (CRT - Guest mini, guest(r) 2017-2018, edited by metallic77,
+GPL-2.0-or-later), handheld/shaders/lcd3x.glsl (Gigaherz, public domain), handheld/shaders/zfast_lcd.glsl (Greg Hogan
+(SoltanGris42) 2017, GPL-2.0-or-later), handheld/shaders/lcd1x.glsl (Gigaherz's lcd3x edited by jdgleaver,
+GPL-2.0-or-later), handheld/shaders/sameboy-lcd.glsl (LIJI32, Lior Halphon 2015-2016, MIT) and
+handheld/shaders/retro-v2.glsl (Hyllian 2013, GPL-2.0-or-later). sp101-color.glsl is ported from
+handheld/shaders/color/sp101-color.slang of https://github.com/libretro/slang-shaders (afb1416b) by Pokefan531,
+hunterk and crashGG (public domain).
+system_files/usr/share/blockie/retroarch/core: the gambatte.opt and mgba.opt option values come from the settings of
+https://github.com/BruhMeh/Ayaneo-Handheld-Scripts (168d1c9), values only.

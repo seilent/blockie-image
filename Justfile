@@ -5,6 +5,7 @@ podman := env_var_or_default("PODMAN", "podman")
 pkg name:
     #!/usr/bin/env bash
     set -euo pipefail
+    [[ ! -f packages/$1/LICENSE ]] || cmp -s "packages/$1/LICENSE" LICENSE || { echo "packages/$1/LICENSE differs from LICENSE" >&2; exit 1; }
     hash=$(build/pkg-hash.sh "$1")
     mapfile -t inputs < <(build/pkg-hash.sh --inputs "$1")
     dirty=0

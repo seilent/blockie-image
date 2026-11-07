@@ -6,6 +6,7 @@ data=/var/lib/blockie/data
 cores=/usr/lib64/libretro
 share=/usr/share/blockie/retroarch
 shaders=/usr/share/libretro/shaders
+slang=/var/lib/blockie/shaders
 gpuenv=/run/blockie-gpu/gpu.env
 dl1=/usr/libexec/blockie/dl1
 
@@ -56,6 +57,7 @@ real=$(realpath -e -- "$rom" 2> /dev/null) || refuse "rompath $(q "$rom") does n
 
 lines=()
 shader=
+enable=
 if (( have_config )); then
   [[ -f $config && -r $config ]] || refuse "config $(q "$config") is not a readable file"
   (( $(stat -c %s -- "$config") <= 65536 )) || refuse "config $(q "$config") is over 64 KiB"
@@ -70,6 +72,7 @@ if (( have_config )); then
     seen[$key]=1
     if [[ $bools == *" $key "* ]]; then
       [[ $value == true || $value == false ]] || refuse "config $key = $(q "$value") is not true or false"
+      [[ $key != video_shader_enable ]] || enable=$value
     elif [[ $key == aspect_ratio_index ]]; then
       [[ $value =~ ^([0-9]|1[0-9]|2[0-2]|24)$ ]] || refuse "config $key = $(q "$value") is not an index 0 to 22 or 24"
     elif [[ $key == fastforward_ratio ]]; then
@@ -93,7 +96,7 @@ if [[ ! -f $so ]]; then
 fi
 
 run=${XDG_RUNTIME_DIR:-}
-[[ $run == /* && $run != *[\|[:cntrl:]]* && -d $run ]] || die "XDG_RUNTIME_DIR is not a directory"
+[[ $run == /* && $run != *[\|\"[:cntrl:]]* && -d $run ]] || die "XDG_RUNTIME_DIR is not a directory"
 exec 9> "$run/blockie-game.lock" || die "cannot open $run/blockie-game.lock"
 if ! flock -n 9; then
   echo "$me: another game holds $run/blockie-game.lock" >&2
@@ -127,10 +130,51 @@ if [[ -r $gpuenv ]]; then
   done < "$gpuenv"
 fi
 
+if [[ -z $shader && $enable != false && -f $share/shader-defaults ]]; then
+  n=0
+  found=0
+  while IFS= read -r line || [[ -n $line ]]; do
+    n=$((n + 1))
+    read -r s p extra <<< "$line"
+    [[ -n $s ]] || continue
+    if [[ -z $p || -n $extra || ! $s =~ ^[a-z0-9]+$ || -z ${default[$s]:-} || $p != /* ]]; then
+      echo "$me: shader-defaults line $n is not <system> <absolute path>, skipped" >&2
+      continue
+    fi
+    [[ $s == "$system" ]] || continue
+    if (( found )); then
+      echo "$me: shader-defaults line $n sets $system again, skipped" >&2
+      continue
+    fi
+    found=1
+    d=$(realpath -e -- "$p" 2> /dev/null)
+    if [[ -f $d && ($d == "$shaders"/*.glslp || $d == "$slang"/*.slangp) ]]; then
+      shader=$d
+    else
+      echo "$me: shader-defaults line $n: $(q "$p") is not a .glslp under $shaders or a .slangp under $slang, skipped" >&2
+    fi
+  done < "$share/shader-defaults"
+fi
+if [[ -n $shader && $enable != false ]]; then
+  [[ $enable == true ]] || lines+=('video_shader_enable = "true"')
+  [[ $shader != *.slangp ]] || lines+=('video_driver = "glcore"')
+else
+  shader=
+fi
+
 append=()
 [[ ! -f $share/core/$core.cfg ]] || append+=("$share/core/$core.cfg")
 tmp=
-trap '[[ -z $tmp ]] || rm -f -- "$tmp"' EXIT
+opt=
+trap '[[ -z $tmp ]] || rm -f -- "$tmp"; [[ -z $opt ]] || rm -f -- "$opt"' EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
+trap 'exit 129' HUP
+if [[ -f $share/core/$core.opt ]]; then
+  opt=$(mktemp "$run/blockie-game.XXXXXX.opt") || die "cannot write the core options in $run"
+  cp -- "$share/core/$core.opt" "$opt" || die "cannot write $opt"
+  lines+=('global_core_options = "true"' "core_options_path = \"$opt\"")
+fi
 if (( ${#lines[@]} )); then
   tmp=$(mktemp "$run/blockie-game.XXXXXX.cfg") || die "cannot write the game config in $run"
   printf '%s\n' "${lines[@]}" > "$tmp" || die "cannot write $tmp"

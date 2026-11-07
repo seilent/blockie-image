@@ -77,6 +77,27 @@ done
 features=$(retroarch --features)
 grep -qxF '  OpenGLES        - Video driver: yes' <<< "$features" || fail "retroarch has no GLES video driver"
 [[ $(rpm -qa --qf '%{NAME}\n' 'retroarch*') == retroarch ]] || fail "a Fedora retroarch subpackage is installed: $(rpm -qa 'retroarch*' | tr '\n' ' ')"
+rpm -q libretro-shaders-blockie > /dev/null || fail "libretro-shaders-blockie not installed"
+for p in crt-gdv-mini lcd3x gb-zfast-lcd gba-zfast-lcd lcd1x sameboy-lcd retro-v2 sp101-color gba-zfast-lcd-sp101; do
+  f=/usr/share/libretro/shaders/blockie/$p.glslp
+  [[ -f $f && $(rpm -qf --qf '%{NAME}' "$f") == libretro-shaders-blockie ]] || fail "preset $p.glslp missing"
+done
+ra=/usr/share/blockie/retroarch
+[[ -f $ra/shader-defaults ]] || fail "shader-defaults missing"
+declare -A seen=()
+while read -r s p extra || [[ -n $s ]]; do
+  [[ -n $s ]] || continue
+  [[ $s =~ ^(gb|gbc|nes|snes|genesis|gba|ps1|n64|psp|dc)$ && -z ${seen[$s]:-} && -n $p && -z $extra ]] ||
+    fail "shader-defaults line '$s $p $extra' is not one <system> <preset> line per wrapper system"
+  seen[$s]=1
+  r=$(realpath -e -- "$p" 2> /dev/null) || r=
+  [[ $p == /usr/share/libretro/shaders/*.glslp && -f $r && $r == /usr/share/libretro/shaders/*.glslp ]] ||
+    [[ $p == /var/lib/blockie/shaders/*.slangp && $(realpath -m -- "$p") == "$p" ]] ||
+    fail "shader-defaults $s: $p is not an existing .glslp under /usr/share/libretro/shaders or a .slangp under /var/lib/blockie/shaders"
+done < "$ra/shader-defaults"
+cmp -s <(printf '%s\n' 'gambatte_gb_colorization = "auto"' 'gambatte_gb_internal_palette = "GBC - Pastel Mix"' \
+  'gambatte_gbc_color_correction = "always"' 'gambatte_mix_frames = "lcd_ghosting"') "$ra/core/gambatte.opt" || fail "core/gambatte.opt"
+cmp -s <(printf '%s\n' 'mgba_interframe_blending = "mix_smart"') "$ra/core/mgba.opt" || fail "core/mgba.opt"
 [[ -f /usr/lib/firmware/regulatory.db ]] || fail "regulatory.db missing"
 
 jq -e '. == {

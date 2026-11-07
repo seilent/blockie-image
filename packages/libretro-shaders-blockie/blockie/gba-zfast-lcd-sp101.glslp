@@ -1,0 +1,11 @@
+shaders = 2
+
+shader0 = sp101-color.glsl
+filter_linear0 = false
+scale_type0 = source
+scale0 = 1.0
+
+shader1 = ../glsl-shaders/handheld/shaders/zfast_lcd.glsl
+filter_linear1 = false
+
+GBAGAMMA = 0.0
