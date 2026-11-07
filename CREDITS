@@ -32,7 +32,10 @@ packages/libretro-ppsspp: PPSSPP (https://github.com/hrydgard/ppsspp, v1.20.4 fa
 component licences under /usr/share/licenses/libretro-ppsspp/), built unchanged as the libretro core, linked static
 with FFmpeg (https://github.com/FFmpeg/FFmpeg, n7.1.5 3a0867c, LGPL-2.1-or-later) built with only the PSP decoders.
 SFMT-LICENSE.txt is SFMT's LICENSE.txt (https://github.com/MersenneTwister-Lab/SFMT, d69c917), which the vendored
-ext/sfmt19937 refers to.
+ext/sfmt19937 refers to. The assets/flash0/font files were made from Ume and Source Han Sans fonts:
+flash0-font-NOTICE.txt records their origin, UmeFont-license.html is license.html of the Ume font 670 release
+(umefont_670.tar.xz, as kept by Fedora's horai-ume-fonts) and SourceHanSans-LICENSE.txt is LICENSE.txt of
+https://github.com/adobe-fonts/source-han-sans (2.001R).
 packages/libretro-flycast: Flycast (https://github.com/flyinghead/flycast, v2.7 5aa091f, GPL-2.0-or-later with the
 component licences under /usr/share/licenses/libretro-flycast/), built as the libretro core with the version string
 set to v2.7. md5-LICENSE is the LICENSE of https://github.com/ulwanski/md5 (bca18c2), where core/deps/md5 comes from.

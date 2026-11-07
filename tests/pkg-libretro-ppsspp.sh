@@ -21,11 +21,12 @@ for f in "/usr/lib64/libretro/${core}_libretro.so" "$lic/LICENSE.TXT" "$lic/COPY
   "$lic/ext/glslang/LICENSE.txt" "$lic/ext/SPIRV-Cross/LICENSE" "$lic/ext/zstd/LICENSE" "$lic/ext/libchdr/LICENSE.txt" \
   "$lic/ext/freetype/LICENSE.TXT" "$lic/ext/cityhash/COPYING" "$lic/ext/gason/LICENSE" "$lic/ext/udis86/LICENSE" \
   "$lic/ext/snappy/COPYING" "$lic/ext/aemu_postoffice/gpl-3.0.txt" "$lic/ext/sfmt19937/LICENSE.txt" \
+  "$lic/flash0-font/NOTICE" "$lic/flash0-font/UmeFont-license.html" "$lic/flash0-font/SourceHanSans-LICENSE.txt" \
   "$assets/compat.ini" "$assets/ppge_atlas.zim" "$assets/flash0/font/ltn0.pgf" "$assets/lang"; do
   grep -qx "$f" <<< "$files" || fail "missing $f"
 done
 ! grep -q "^$assets/debugger" <<< "$files" || fail "debugger assets packaged"
-[[ $(rpm -qp --qf '%{LICENSE}' "$rpm") == "GPL-2.0-or-later AND GPL-3.0-or-later AND GPL-3.0-only AND GPL-3.0-or-later WITH Bison-exception-2.2 AND LGPL-2.1-or-later AND Apache-2.0 AND BSD-2-Clause AND BSD-3-Clause AND MIT AND Zlib AND CC0-1.0 AND LicenseRef-Fedora-Public-Domain AND LicenseRef-disarm AND (FTL OR GPL-2.0-or-later)" ]] \
+[[ $(rpm -qp --qf '%{LICENSE}' "$rpm") == "GPL-2.0-or-later AND GPL-3.0-or-later AND GPL-3.0-only AND GPL-3.0-or-later WITH Bison-exception-2.2 AND LGPL-2.1-or-later AND Apache-2.0 AND BSD-2-Clause AND BSD-3-Clause AND MIT AND Zlib AND CC0-1.0 AND LicenseRef-Fedora-Public-Domain AND LicenseRef-disarm AND (FTL OR GPL-2.0-or-later) AND mplus AND OFL-1.1" ]] \
   || fail "licence tag"
 t=$(mktemp -d)
 trap 'rm -rf "${t:?}"' EXIT
@@ -46,6 +47,13 @@ for n in "ext/libzip|Dieter Baron and Thomas Klausner|Redistribution and use" "e
   [[ -s $f ]] && grep -qF "$a" "$f" && grep -qF "$b" "$f" || fail "notice $d"
 done
 grep -q 'Redistribution and use' "$t$lic/ext/sfmt19937/LICENSE.txt" || fail "SFMT licence text"
+f=$t$lic/flash0-font
+grep -q 'fa50bb1976065c4f8b1b47af227d367fe9771555' "$f/NOTICE" && grep -q '#13510' "$f/NOTICE" && grep -q 'dc34bea8' "$f/NOTICE" \
+  || fail "flash0 font notice"
+[[ $(sha256sum < "$f/UmeFont-license.html") == "88d5d5a1bf928ff316e3f80d2e665b1a3ab0f46af80ae7d1ec0046b16ea64cdb  -" ]] \
+  && grep -qF 'Unlimited permission is granted to use, copy, and distribute it,' "$f/UmeFont-license.html" || fail "Ume font licence text"
+[[ $(sha256sum < "$f/SourceHanSans-LICENSE.txt") == "0983abed9371adc8958c321bf8d8036324b4a2e8cc324682b0fe0c699e63a009  -" ]] \
+  && grep -qF 'SIL OPEN FONT LICENSE Version 1.1' "$f/SourceHanSans-LICENSE.txt" || fail "Source Han Sans licence text"
 [[ $(readelf -dW "$t/usr/lib64/libretro/${core}_libretro.so") != *libav* ]] || fail "FFmpeg linked dynamically"
 sections=$(readelf -SW "$so")
 [[ $sections != *.debug_info* ]] || fail "debug info not stripped"

@@ -15,7 +15,8 @@ day=$(date -u -d "@$SOURCE_EPOCH" +%Y%m%d)
 grep -Eqx "Release: +[0-9]+\.${day}git%\{shortcommit\}%\{\?dist\}" "$spec" || { echo "build.sh: spec Release date is not $day" >&2; exit 1; }
 top=/var/tmp/libretro-ppsspp-build
 mkdir -p "$top/SOURCES"
-cp "/srcpkg/$SOURCE_TAR" "/srcpkg/$FFMPEG_TAR" "$src/SFMT-LICENSE.txt" "$top/SOURCES/"
+cp "/srcpkg/$SOURCE_TAR" "/srcpkg/$FFMPEG_TAR" "$src/SFMT-LICENSE.txt" "$src/flash0-font-NOTICE.txt" "$src/UmeFont-license.html" \
+  "$src/SourceHanSans-LICENSE.txt" "$top/SOURCES/"
 rpmbuild -bb \
   --define "_topdir $top" \
   --define "_buildhost blockie" \

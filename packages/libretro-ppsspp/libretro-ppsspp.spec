@@ -7,13 +7,16 @@
 
 Name:           libretro-ppsspp
 Version:        0
-Release:        1.20260516git%{shortcommit}%{?dist}
+Release:        2.20260516git%{shortcommit}%{?dist}
 Summary:        PPSSPP PlayStation Portable core for libretro
-License:        GPL-2.0-or-later AND GPL-3.0-or-later AND GPL-3.0-only AND GPL-3.0-or-later WITH Bison-exception-2.2 AND LGPL-2.1-or-later AND Apache-2.0 AND BSD-2-Clause AND BSD-3-Clause AND MIT AND Zlib AND CC0-1.0 AND LicenseRef-Fedora-Public-Domain AND LicenseRef-disarm AND (FTL OR GPL-2.0-or-later)
+License:        GPL-2.0-or-later AND GPL-3.0-or-later AND GPL-3.0-only AND GPL-3.0-or-later WITH Bison-exception-2.2 AND LGPL-2.1-or-later AND Apache-2.0 AND BSD-2-Clause AND BSD-3-Clause AND MIT AND Zlib AND CC0-1.0 AND LicenseRef-Fedora-Public-Domain AND LicenseRef-disarm AND (FTL OR GPL-2.0-or-later) AND mplus AND OFL-1.1
 URL:            https://github.com/hrydgard/ppsspp
 Source0:        ppsspp-%{commit}.tar.gz
 Source1:        FFmpeg-%{ffcommit}.tar.gz
 Source2:        SFMT-LICENSE.txt
+Source3:        flash0-font-NOTICE.txt
+Source4:        UmeFont-license.html
+Source5:        SourceHanSans-LICENSE.txt
 BuildRequires:  gcc
 BuildRequires:  gcc-c++
 BuildRequires:  make
@@ -85,6 +88,9 @@ notice() {
 notice ext/libzip ext/libzip/zip.h 4,35p 'Dieter Baron and Thomas Klausner'
 notice ext/sfmt19937 ext/sfmt19937/SFMT.c 1,18p 'Mutsuo Saito'
 install -Dm0644 %{SOURCE2} "$lic/ext/sfmt19937/LICENSE.txt"
+install -Dm0644 %{SOURCE3} "$lic/flash0-font/NOTICE"
+install -Dm0644 %{SOURCE4} "$lic/flash0-font/UmeFont-license.html"
+install -Dm0644 %{SOURCE5} "$lic/flash0-font/SourceHanSans-LICENSE.txt"
 notice ext/pugixml ext/pugixml/pugixml.hpp 1562,1585p 'Arseny Kapoulkine'
 notice ext/lua ext/lua/lua.h 499,520p 'Lua.org, PUC-Rio'
 notice ext/vma ext/vma/vk_mem_alloc.h 1,21p 'Advanced Micro Devices'
