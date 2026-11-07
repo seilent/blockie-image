@@ -4,6 +4,8 @@ set -u
 here=$(cd "$(dirname "$0")" && pwd)
 bin=${HOTKEYD_BIN:-/usr/libexec/blockie/blockie-hotkeyd}
 [[ -x $bin ]] || bin=$here/../system_files/usr/libexec/blockie/blockie-hotkeyd
+tables=/usr/lib/blockie/hotkeys.d
+[[ -d $tables ]] || tables=$here/../system_files/usr/lib/blockie/hotkeys.d
 t=$(mktemp -d "${TMPDIR:-/tmp}/hotkeyd.XXXXXX")
 fails=0
 trap 'rm -rf "${t:?}"' EXIT
@@ -39,7 +41,7 @@ run() {
   rm -f "$t/fifo"
   mkfifo "$t/fifo"
   BLOCKIE_HOTKEYD_INPUT=$t/fifo BLOCKIE_HOTKEYD_DRY=1 BLOCKIE_HOTKEYD_LONG_MS=300 \
-    BLOCKIE_HOTKEYD_TABLES="$t/usr:$t/etc" BLOCKIE_HOTKEYD_CURRENT=$t/current \
+    BLOCKIE_HOTKEYD_TABLES="${TABLES:-$t/usr:$t/etc}" BLOCKIE_HOTKEYD_CURRENT=$t/current \
     timeout 20 python3 "$bin" > "$t/out" 2> "$t/err" &
   local pid=$!
   bash -c "$script" > "$t/fifo"
@@ -90,6 +92,13 @@ printf 'test-a 1 1\n' > "$t/current"
 run 'echo home down; sleep 0.1; printf "x\n" > /dev/null; echo home down; echo home up'
 [[ $(cat "$t/out") == "action home tap switch test-b" ]]
 res $? "a second down without an up is ignored"
+
+printf 'emulation 1 1\n' > "$t/current"
+TABLES=$tables run 'echo extra3 down; sleep 0.1; echo extra3 up; echo extra3 down; sleep 0.5; echo extra3 up
+  echo home down; sleep 0.5; echo home up; echo extra1 down; sleep 0.5; echo extra1 up'
+[[ $(cat "$t/out") == $'action extra3 tap hook game-menu\naction extra3 hold hook game-quit\naction home hold switcher' ]] &&
+  ! grep -q ignored "$t/err"
+res $? "emulation: the shipped rows give logo tap game-menu and hold game-quit, home hold stays the switcher, extra1 has no row"
 
 S=$t/sys
 sysnode() {

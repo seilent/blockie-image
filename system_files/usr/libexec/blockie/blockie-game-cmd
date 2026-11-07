@@ -1,0 +1,40 @@
+#!/usr/bin/python3 -IS
+import errno
+import os
+import stat
+import sys
+
+ME = "blockie-game-cmd"
+COMMANDS = ("MENU_TOGGLE", "QUIT")
+
+
+def log(msg):
+    print(f"{ME}: {msg}", file=sys.stderr, flush=True)
+
+
+def main(argv):
+    if len(argv) != 2 or argv[1] not in COMMANDS:
+        print(f"usage: {ME} {'|'.join(COMMANDS)}", file=sys.stderr)
+        return 64
+    run = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    path = os.path.join(run, "blockie-game.cmd")
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as err:
+        if err.errno not in (errno.ENOENT, errno.ENXIO):
+            log(f"{path}: {err.strerror}")
+        return 0
+    try:
+        if stat.S_ISFIFO(os.fstat(fd).st_mode):
+            os.write(fd, f"{argv[1]}\n".encode())
+        else:
+            log(f"{path} is not a FIFO")
+    except OSError as err:
+        log(f"{path}: {err.strerror}")
+    finally:
+        os.close(fd)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

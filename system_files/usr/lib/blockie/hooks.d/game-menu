@@ -1,0 +1,2 @@
+#!/bin/sh
+exec /usr/libexec/blockie/blockie-game-cmd MENU_TOGGLE

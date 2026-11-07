@@ -166,7 +166,8 @@ append=()
 [[ ! -f $share/core/$core.cfg ]] || append+=("$share/core/$core.cfg")
 tmp=
 opt=
-trap '[[ -z $tmp ]] || rm -f -- "$tmp"; [[ -z $opt ]] || rm -f -- "$opt"' EXIT
+cmd=
+trap '[[ -z $tmp ]] || rm -f -- "$tmp"; [[ -z $opt ]] || rm -f -- "$opt"; [[ -z $cmd ]] || rm -f -- "$cmd"' EXIT
 trap 'exit 143' TERM
 trap 'exit 130' INT
 trap 'exit 129' HUP
@@ -180,6 +181,10 @@ if (( ${#lines[@]} )); then
   printf '%s\n' "${lines[@]}" > "$tmp" || die "cannot write $tmp"
   append+=("$tmp")
 fi
+cmd=$run/blockie-game.cmd
+rm -f -- "$cmd" "$run/blockie-game.quit"
+mkfifo -m 600 -- "$cmd" || die "cannot make $cmd"
+exec 3<> "$cmd" || die "cannot open $cmd"
 
 argv=(retroarch --config "$share/blockie.cfg")
 if (( ${#append[@]} )); then
@@ -203,7 +208,8 @@ trap 'stop 129' HUP
 
 systemd-run --user --scope --quiet --unit=blockie-game --collect --slice=blockie-emulation.slice \
   -p BindsTo=blockie-frontend.service -p After=blockie-frontend.service -p MemoryHigh=80% -p MemoryMax=90% \
-  -p TasksMax=512 -p OOMPolicy=kill -- "${argv[@]}" &
+  -p TasksMax=512 -p OOMPolicy=kill -p TimeoutStopSec=5s -- "${argv[@]}" <&3 3<&- &
+exec 3<&-
 wait "$!"
 rc=$?
 case $rc in

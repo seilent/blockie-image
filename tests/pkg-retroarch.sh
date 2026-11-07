@@ -36,7 +36,8 @@ features=$("$bin" --features)
 for l in "OpenGLES        - Video driver: yes" "EGL             - Video context driver: yes" \
   "Wayland         - Wayland input/video drivers: yes" "UDEV            - UDEV/EVDEV input driver: yes" \
   "Vulkan          - Video driver: yes" "PipeWire        - Audio driver: yes" "ALSA            - Audio driver: yes" \
-  "glslang         - Fragment/vertex shader driver: yes"; do
+  "glslang         - Fragment/vertex shader driver: yes" "Command         - Command interface support: yes" \
+  "Netplay         - Peer-to-peer netplay: yes"; do
   grep -qxF "  $l" <<< "$features" || fail "--features lacks '$l'"
 done
 ! grep -q '^  Qt  ' <<< "$features" || fail "built with the Qt companion"

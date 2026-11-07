@@ -3,6 +3,7 @@ set -u
 
 [[ -e /run/.containerenv ]] || { echo "game: runs only in a container, it rewrites files under /usr" >&2; exit 2; }
 game=/usr/bin/blockie-game
+gcmd=/usr/libexec/blockie/blockie-game-cmd
 share=/usr/share/blockie/retroarch
 data=/var/lib/blockie/data
 t=$(mktemp -d "${TMPDIR:-/tmp}/game.XXXXXX")
@@ -68,6 +69,12 @@ while (( $# )); do
 done
 o=$(sed -n 's/^core_options_path = "\(.*\)"$/\1/p' "$FAKE/append.cfg")
 [[ -z $o ]] || cp "$o" "$FAKE/core.opt"
+if [[ -n ${FAKE_CMD:-} ]]; then
+  { stat -L -c '%F %a' /dev/stdin; readlink "/proc/$$/fd/0"; [[ ! -e /proc/$$/fd/3 ]] || echo fd3; } > "$FAKE/stdin"
+  stat -L -c %i /dev/stdin > "$FAKE/ino"
+  echo "$$" > "$FAKE/pid"
+  read -r -t 10 line && printf '%s\n' "$line" > "$FAKE/line"
+fi
 if [[ -n ${FAKE_SLEEP:-} ]]; then
   trap 'echo term > "$FAKE/term"; kill "$s"; exit 143' TERM
   sleep 30 &
@@ -81,6 +88,7 @@ chmod 755 "$FAKE/bin/systemd-run" "$FAKE/bin/systemctl" "$FAKE/bin/retroarch"
 
 play() {
   rm -f "$FAKE"/*.log "$FAKE/retroarch.argv" "$FAKE/retroarch.env" "$FAKE/append.cfg" "$FAKE/term" "$FAKE/pid" "$FAKE/core.opt"
+  rm -f "$FAKE/stdin" "$FAKE/ino" "$FAKE/line"
   PATH=$FAKE/bin:$PATH XDG_RUNTIME_DIR=${RUN-$t/run} DL1_CARDS=${CARDS:-$t/nocard} "$game" "$@" > "$t/out" 2>&1
   rc=$?
 }
@@ -92,12 +100,51 @@ refused() {
 }
 
 scope="--user --scope --quiet --unit=blockie-game --collect --slice=blockie-emulation.slice -p BindsTo=blockie-frontend.service"
-scope+=" -p After=blockie-frontend.service -p MemoryHigh=80% -p MemoryMax=90% -p TasksMax=512 -p OOMPolicy=kill --"
+scope+=" -p After=blockie-frontend.service -p MemoryHigh=80% -p MemoryMax=90% -p TasksMax=512 -p OOMPolicy=kill"
+scope+=" -p TimeoutStopSec=5s --"
 base="--config $share/blockie.cfg"
+fifo=$t/run/blockie-game.cmd
 
 play ps1 "$rom"
-[[ $rc == 0 && $(cat "$FAKE/systemd-run.log") == "$scope retroarch $base -L /usr/lib64/libretro/pcsx_rearmed_libretro.so $rom" ]]
+[[ $rc == 0 && $(cat "$FAKE/systemd-run.log") == "$scope retroarch $base -L /usr/lib64/libretro/pcsx_rearmed_libretro.so $rom" ]] &&
+  [[ ! -e $fifo ]]
 res $? "ps1: one scope in blockie-emulation.slice bound to the frontend, with the limits, RetroArch on pcsx_rearmed"
+
+cmdplay() {
+  rm -f "$FAKE"/*.log "$FAKE/pid" "$FAKE/stdin" "$FAKE/ino" "$FAKE/line"
+  FAKE_CMD=1 PATH=$FAKE/bin:$PATH XDG_RUNTIME_DIR=$t/run DL1_CARDS=$t/nocard "$game" gba "$rom" > "$t/out" 2>&1 &
+  local w=$!
+  for _ in $(seq 50); do
+    [[ -s $FAKE/pid ]] && break
+    sleep 0.1
+  done
+  for _ in $(seq 20); do
+    [[ -e /proc/$w/fd/3 ]] || break
+    sleep 0.1
+  done
+  [[ ! -e /proc/$w/fd/3 ]]
+  wfd=$?
+  XDG_RUNTIME_DIR=$t/run timeout 5 "$gcmd" MENU_TOGGLE > "$t/cmd.out" 2>&1
+  crc=$?
+  wait "$w"
+  rc=$?
+}
+echo 1 > "$t/run/blockie-game.quit"
+cmdplay
+[[ $rc == 0 && $crc == 0 && $wfd == 0 && ! -s $t/cmd.out && $(cat "$FAKE/stdin") == "fifo 600"$'\n'"$fifo" ]] &&
+  [[ $(cat "$FAKE/line" 2> /dev/null) == MENU_TOGGLE && ! -e $fifo && ! -e $t/run/blockie-game.quit ]]
+res $? "commands: RetroArch's stdin is the 600 FIFO, fd 3 closed in it and the wrapper, a line arrives, FIFO and quit stamp removed"
+
+mkfifo -m 644 "$fifo"
+exec 4<> "$fifo"
+planted=$(stat -c %i "$fifo")
+cmdplay
+line=
+read -r -t 1 line <&4
+exec 4>&-
+[[ $rc == 0 && $(head -n 1 "$FAKE/stdin") == "fifo 600" && $(cat "$FAKE/ino") != "$planted" && -z $line ]] &&
+  [[ $(cat "$FAKE/line" 2> /dev/null) == MENU_TOGGLE && ! -e $fifo ]]
+res $? "commands: a stale 644 FIFO at the path is replaced by a new 600 one"
 
 declare -A want=([gb]=gambatte [gbc]=gambatte [nes]=nestopia [snes]=snes9x [genesis]=genesis_plus_gx [gba]=mgba
   [ps1]=pcsx_rearmed [n64]=mupen64plus_next [psp]=ppsspp [dc]=flycast)
@@ -342,12 +389,18 @@ play gba "$rom"
 res $? "a core that is not installed exits 69 before anything starts"
 mv "$t/mgba.so" /usr/lib64/libretro/mgba_libretro.so
 
+mkfifo -m 600 "$fifo"
+exec 4<> "$fifo"
+planted=$(stat -c %i "$fifo")
+echo 1 > "$t/run/blockie-game.quit"
 flock -o "$t/run/blockie-game.lock" sleep 5 &
 holder=$!
 sleep 0.5
 play gba "$rom"
-[[ $rc == 75 ]] && ! ran
-res $? "a held lock exits 75 and starts nothing"
+[[ $rc == 75 ]] && ! ran && [[ -p $fifo && $(stat -c %i "$fifo") == "$planted" && -e $t/run/blockie-game.quit ]]
+res $? "a held lock exits 75, starts nothing and leaves the running game's FIFO and quit stamp"
+exec 4>&-
+rm -f "$fifo" "$t/run/blockie-game.quit"
 kill "$holder" 2> /dev/null
 wait "$holder" 2> /dev/null
 
@@ -392,11 +445,13 @@ for _ in $(seq 50); do
   [[ -s $FAKE/pid ]] && break
   sleep 0.1
 done
+[[ -p $fifo ]]
+during=$?
 kill -TERM "$w"
 wait "$w"
 rc=$?
-[[ $rc == 143 && -e $FAKE/term ]] && grep -qx -- '--user stop blockie-game.scope' "$FAKE/systemctl.log"
-res $? "TERM on the wrapper stops RetroArch and the scope, then exits 143"
+[[ $rc == 143 && -e $FAKE/term && $during == 0 && ! -e $fifo ]] && grep -qx -- '--user stop blockie-game.scope' "$FAKE/systemctl.log"
+res $? "TERM on the wrapper stops RetroArch and the scope, removes the FIFO, then exits 143"
 
 rm -f "$FAKE"/*.log "$FAKE/term" "$FAKE/pid" "$FAKE/append.cfg" "$FAKE/core.opt"
 FAKE_SLEEP=1 PATH=$FAKE/bin:$PATH XDG_RUNTIME_DIR=$t/run DL1_CARDS=$t/nocard "$game" gb "$rom" > "$t/out" 2>&1 &
@@ -417,8 +472,8 @@ res $? "TERM: the core options copy and the run append file are removed"
 
 cfgv() { sed -n "s/^$1 = \"\(.*\)\"$/\1/p" "$share/blockie.cfg"; }
 ok=0
-for kv in video_driver=gl video_context_driver=wayland input_driver=udev input_joypad_driver=udev input_enable_hotkey_btn=10 \
-  input_menu_toggle_btn=10 input_exit_emulator_btn=9 quit_press_twice=false auto_overrides_enable=false \
+for kv in video_driver=gl video_context_driver=wayland input_driver=udev input_joypad_driver=udev stdin_cmd_enable=true \
+  quit_press_twice=false quit_on_close_content=2 load_dummy_on_core_shutdown=false auto_overrides_enable=false \
   auto_remaps_enable=false remap_save_on_exit=false auto_shaders_enable=false game_specific_options=false \
   savefile_directory=$data/saves savestate_directory=$data/states system_directory=$data/bios \
   libretro_directory=/usr/lib64/libretro libretro_info_path=/usr/share/libretro/info audio_driver=pipewire \
@@ -432,7 +487,9 @@ for l in 'menu_show_online_updater = "false"' 'menu_show_core_updater = "false"'
   grep -qxF "$l" "$share/blockie.cfg" || { ok=1; echo "  no '$l'"; }
 done
 [[ -f "$share/autoconfig/udev/AYANEO Controller.cfg" ]] || ok=1
-res $ok "base config: dirs, cores, pipewire, midi, info cache and gamemode off, no save on exit, pad autoconfig, default volume"
+! grep -Eq '^input_(enable_hotkey|menu_toggle|exit_emulator)_btn' "$share/blockie.cfg" || { ok=1; echo "  a pad hotkey in blockie.cfg"; }
+! grep -q 'input_menu_toggle_btn' "$share/autoconfig/udev/AYANEO Controller.cfg" || { ok=1; echo "  a pad menu toggle in the autoconfig"; }
+res $ok "base config: dirs, cores, pipewire, midi, info cache, gamemode, no save on exit, autoconfig, volume, stdin commands, no pad hotkeys"
 
 if [[ $fails == 0 ]]; then
   echo "game: all ok"

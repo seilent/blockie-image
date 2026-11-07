@@ -1,0 +1,22 @@
+#!/bin/sh
+set -u
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+cmd=$XDG_RUNTIME_DIR/blockie-game.cmd
+stamp=$XDG_RUNTIME_DIR/blockie-game.quit
+if [ -p "$cmd" ]; then
+    read -r up _ < /proc/uptime
+    now=${up%.*}
+    at=
+    [ ! -f "$stamp" ] || read -r at < "$stamp"
+    case $at in
+    '' | *[!0-9]*) ;;
+    *)
+        if [ $((now - at)) -lt 10 ]; then
+            rm -f -- "$stamp"
+            exec systemctl --user stop --no-block blockie-game.scope
+        fi
+        ;;
+    esac
+    echo "$now" > "$stamp"
+fi
+exec /usr/libexec/blockie/blockie-game-cmd QUIT
