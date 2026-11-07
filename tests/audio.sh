@@ -59,6 +59,8 @@ grep -qxF After=blockie-dl1.service "$drop" || fail "user@.service is not ordere
 grep -qxF "ExecStartPre=+$dl1 check" "$drop" || fail "user@.service does not run dl1 check"
 grep -qxF "ACTION==\"add\", SUBSYSTEM==\"sound\", KERNEL==\"controlC*\", ATTRS{id}==\"mt6768mt6358\", RUN+=\"$dl1 set\"" \
   /usr/lib/udev/rules.d/60-blockie-dl1.rules || fail "the dl1 udev rule"
+grep -qxF 'ACTION!="remove", SUBSYSTEM=="sound", KERNEL=="controlC*", ATTRS{id}=="mt6768mt6358", TAG+="systemd", ENV{SYSTEMD_WANTS}+="blockie-dl1.service"' \
+  /usr/lib/udev/rules.d/60-blockie-dl1.rules || fail "a late card does not start blockie-dl1.service again"
 
 while IFS= read -r f; do
   case $f in

@@ -1,1 +1,2 @@
 ACTION=="add", SUBSYSTEM=="sound", KERNEL=="controlC*", ATTRS{id}=="mt6768mt6358", RUN+="/usr/libexec/blockie/dl1 set"
+ACTION!="remove", SUBSYSTEM=="sound", KERNEL=="controlC*", ATTRS{id}=="mt6768mt6358", TAG+="systemd", ENV{SYSTEMD_WANTS}+="blockie-dl1.service"
