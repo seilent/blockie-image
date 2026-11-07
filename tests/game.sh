@@ -22,10 +22,11 @@ res() {
 }
 
 export FAKE=$t/fake
-mkdir -p "$FAKE/bin" "$t/run" "$t/r\"un" "$data/roms/gba" "$data/roms/psp" "$data/roms/dir" /usr/share/libretro/shaders/crt \
-  /var/lib/blockie/shaders
+mkdir -p "$FAKE/bin" "$t/run" "$t/r\"un" "$data/roms/gba" "$data/roms/psp" "$data/roms/n64" "$data/roms/dir" \
+  /usr/share/libretro/shaders/crt /var/lib/blockie/shaders
 printf 'invented rom\n' > "$data/roms/gba/test.gba"
 printf 'invented iso\n' > "$data/roms/psp/test.iso"
+printf 'invented rom\n' > "$data/roms/n64/test.z64"
 for f in crt/test.glslp crt/test.slangp crt/game.glslp crt/test.glsl; do
   printf 'invented shader\n' > "/usr/share/libretro/shaders/$f"
 done
@@ -171,6 +172,27 @@ res $? "psp: the ppsspp core config points system_directory at the PPSSPP assets
 
 [[ -f /usr/share/libretro/ppsspp/PPSSPP/compat.ini ]]
 res $? "the ppsspp system directory holds PPSSPP/compat.ini"
+
+n64cfg=$share/core/mupen64plus_next.cfg
+play n64 "$data/roms/n64/test.z64"
+[[ $rc == 0 ]] &&
+  argv "$base --appendconfig $n64cfg -L /usr/lib64/libretro/mupen64plus_next_libretro.so $data/roms/n64/test.z64" &&
+  [[ $(cat "$FAKE/append.cfg") == "$(printf '%s\n' 'input_player1_l_x_plus_btn = "h0right"' \
+    'input_player1_l_x_minus_btn = "h0left"' 'input_player1_l_y_plus_btn = "h0down"' 'input_player1_l_y_minus_btn = "h0up"' \
+    'input_analog_deadzone = "0.1"' 'system_directory = "/var/lib/blockie/data/mupen64plus_next"')" ]]
+res $? "n64: the mupen core config binds the hat to the left stick, a deadzone over the rest value, its own system_directory"
+
+ok=0
+auto="$share/autoconfig/udev/AYANEO Controller.cfg"
+for d in up:l_y_minus down:l_y_plus left:l_x_minus right:l_x_plus; do
+  hat=$(sed -n "s/^input_${d%%:*}_btn = \"\(h0[a-z]*\)\"$/\1/p" "$auto")
+  [[ -n $hat ]] && grep -qxF "input_player1_${d#*:}_btn = \"$hat\"" "$n64cfg" || { ok=1; echo "  ${d%%:*}: '$hat'"; }
+done
+res $ok "n64: each stick direction is bound to the hat direction the autoconfig binds to that D-pad direction"
+
+sd=$(sed -n 's/^system_directory = "\(.*\)"$/\1/p' "$n64cfg")
+[[ $sd == "$data"/* ]] && grep -qxF "d $sd 0755 blockie blockie -" /usr/lib/blockie/data-tmpfiles.conf
+res $? "n64: the data tmpfiles make the mupen system_directory, owned by blockie"
 
 ok=0
 for c in 0 1 139; do

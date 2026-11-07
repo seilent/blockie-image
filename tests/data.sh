@@ -43,9 +43,9 @@ if [[ -z ${DATA_UNIT:-} ]]; then
   res $? "boot-ok does not wait on blockie-data"
 fi
 
-want=$(printf 'd /var/lib/blockie/data/%s 0755 blockie blockie -\n' cache media saves states)
+want=$(printf 'd /var/lib/blockie/data/%s 0755 blockie blockie -\n' cache media mupen64plus_next saves states)
 [[ $(cat "$conf") == "$want" ]]
-res $? "tmpfiles: cache, media, saves, states owned by blockie"
+res $? "tmpfiles: cache, media, mupen64plus_next, saves, states owned by blockie"
 ! grep -qE 'data/(roms|bios)|data/? |data -' "$conf"
 res $? "tmpfiles: no line for roms/, bios/ or the mount root"
 [[ ! -e /usr/lib/tmpfiles.d/blockie-data.conf ]] && ! grep -rqs 'blockie/data' /usr/lib/tmpfiles.d
@@ -64,11 +64,11 @@ if [[ -z ${DATA_TMPFILES:-} ]] && command -v systemd-tmpfiles > /dev/null; then
   before=$(cd "$r/var/lib/blockie/data" && find roms bios -printf '%p %u %g %m\n' | sort)
   systemd-tmpfiles --root="$r" --create "$conf" > "$top/tmpfiles.out" 2>&1
   ok=$?
-  for n in cache media saves states; do
+  for n in cache media mupen64plus_next saves states; do
     [[ $(stat -c '%U %G %a' "$r/var/lib/blockie/data/$n") == "blockie blockie 755" ]] || ok=1
   done
   [[ $(cd "$r/var/lib/blockie/data" && find roms bios -printf '%p %u %g %m\n' | sort) == "$before" ]] || ok=1
-  res $ok "tmpfiles applied: four blockie dirs, roms/ and bios/ unchanged"
+  res $ok "tmpfiles applied: five blockie dirs, roms/ and bios/ unchanged"
 fi
 
 setup() {
