@@ -56,6 +56,7 @@ jobs:
       short: ${{ steps.version.outputs.short }}
       channel: ${{ steps.version.outputs.channel }}
       kernel_ref: ${{ steps.kernel.outputs.ref }}
+      pkg_refs: ${{ steps.packages.outputs.refs }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -84,8 +85,10 @@ jobs:
           echo "$PKG_KERNEL:$hash $digest"
 
       - name: Packages
+        id: packages
         run: |
           mkdir -p "$RUNNER_TEMP/pkgs"
+          refs=()
           for name in $(git ls-files -- 'packages/*/build.sh' | cut -d/ -f2); do
             [[ $name != kernel ]] || continue
             hash=$(build/pkg-hash.sh "$name")
@@ -101,8 +104,10 @@ jobs:
             digest=sha256:$(sha256sum < "$RUNNER_TEMP/raw" | cut -d' ' -f1)
             cosign verify --key "$PUBKEY" "$repo@$digest" > /dev/null
             build/pkg-check.sh "$repo@$digest" "$RUNNER_TEMP/check" "$RUNNER_TEMP/pkgs/$name"
+            refs+=("$repo@$digest")
             echo "$repo:$hash $digest"
           done
+          echo "refs=${refs[*]}" >> "$GITHUB_OUTPUT"
 
       - name: Version
         id: version
@@ -408,6 +413,7 @@ jobs:
       SHORT: ${{ needs.image.outputs.short }}
       MODE: ${{ needs.image.outputs.channel == 'true' && 'full' || 'base' }}
       KERNEL_REF: ${{ needs.image.outputs.kernel_ref }}
+      PKG_REFS: ${{ needs.image.outputs.pkg_refs }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -444,7 +450,8 @@ jobs:
         env:
           BLOCKIE_SOURCE_CACHE: ${{ env.MODE == 'full' && format('{0}/cache', runner.temp) || '' }}
         run: |
-          build/source-artifact.sh "$RUNNER_TEMP/srpms/srpms.tsv" "$RUNNER_TEMP/source" "$MODE" "$KERNEL_REF"
+          read -ra refs <<< "$PKG_REFS"
+          build/source-artifact.sh "$RUNNER_TEMP/srpms/srpms.tsv" "$RUNNER_TEMP/source" "$MODE" "$KERNEL_REF" "${refs[@]}"
           df -H /
 
       - name: Attach
@@ -466,7 +473,7 @@ jobs:
         env:
           ART: ${{ steps.attach.outputs.digest }}
         run: |
-          names=$(printf '%s\n' "blockie-image-$SHORT.tar.gz" blockie-kernel-source.tar.gz)
+          names=$(printf '%s\n' "blockie-image-$SHORT.tar.gz"; awk '{ print $2 }' packages/*/SOURCE.sha256)
           upstream=$(sed -n 's/^SRPM_URL=//p' packages/*/SOURCE.env | sed 's|.*/||')
           [[ -z $upstream ]] || names+=$'\n'$upstream
           if [[ $MODE == full ]]; then

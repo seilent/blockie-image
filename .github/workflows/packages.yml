@@ -28,6 +28,11 @@ concurrency:
   group: packages-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  SOURCE_TYPE: application/vnd.blockie.source.v1
+  ORAS_VERSION: 1.3.4
+  ORAS_SHA256: 15702c6e3a4a56a8bd8ac5c17efdbcab56d9bada661ccbcf017f5b10c1d89399
+
 jobs:
   list:
     runs-on: ubuntu-24.04-arm
@@ -42,7 +47,14 @@ jobs:
           persist-credentials: false
 
       - name: Install tools
-        run: build/ci-need.sh skopeo:skopeo
+        run: |
+          build/ci-need.sh skopeo:skopeo
+          tarball=oras_${ORAS_VERSION}_linux_arm64.tar.gz
+          curl -fsSL -o "$RUNNER_TEMP/$tarball" "https://github.com/oras-project/oras/releases/download/v$ORAS_VERSION/$tarball"
+          echo "$ORAS_SHA256  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP/bin" oras
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
 
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
         with:
@@ -115,6 +127,22 @@ jobs:
       - name: Build
         run: just pkg "$PKG"
 
+      - name: Sources
+        id: sources
+        run: |
+          build/pkg-source.sh "$PKG" "$RUNNER_TEMP/src"
+          [[ -z $(ls -A "$RUNNER_TEMP/src" 2> /dev/null) ]] || echo "upload=true" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: steps.sources.outputs.upload == 'true'
+        with:
+          name: pkgsrc-${{ matrix.package }}
+          path: ${{ runner.temp }}/src
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+          overwrite: true
+
       - name: Save builder
         if: github.ref == 'refs/heads/main' && steps.builder.outputs.key != '' && steps.restore.outputs.cache-hit != 'true' && !inputs.cold
         env:
@@ -171,6 +199,12 @@ jobs:
           path: ${{ runner.temp }}/pkg
           merge-multiple: true
 
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          pattern: pkgsrc-${{ matrix.package }}
+          path: ${{ runner.temp }}/src
+          merge-multiple: true
+
       - name: Install tools
         run: build/ci-need.sh skopeo:skopeo
 
@@ -202,6 +236,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Check archive
+        id: check
         if: steps.built.outputs.archive != ''
         env:
           ARCHIVE: ${{ steps.built.outputs.archive }}
@@ -225,6 +260,27 @@ jobs:
           grep -q '\.rpm$' <<< "$listing" || { echo "::error::no RPM in the archive"; exit 1; }
           rm -rf "$oci"
           echo "${names[*]}: $(grep -c '\.rpm$' <<< "$listing") RPMs"
+          pins=packages/$PKG/SOURCE.sha256
+          if [[ -f $pins ]]; then
+            [[ $(find "$RUNNER_TEMP/src" -mindepth 1 -maxdepth 1 -printf '%f\n' 2> /dev/null | LC_ALL=C sort) == "$(awk '{ print $2 }' "$pins" | LC_ALL=C sort)" ]] ||
+              { echo "::error::the source artifact is not the file set of $pins"; exit 1; }
+            (cd "$RUNNER_TEMP/src" && sha256sum --quiet -c "$GITHUB_WORKSPACE/$pins") || { echo "::error::the source artifact differs from $pins"; exit 1; }
+            echo "source=true" >> "$GITHUB_OUTPUT"
+            echo "$PKG: $(wc -l < "$pins") source files"
+          elif [[ -e $RUNNER_TEMP/src ]]; then
+            echo "::error::a source artifact for $PKG, which pins no source"
+            exit 1
+          fi
+
+      - name: Install oras
+        if: steps.check.outputs.source == 'true'
+        run: |
+          tarball=oras_${ORAS_VERSION}_linux_arm64.tar.gz
+          curl -fsSL -o "$RUNNER_TEMP/$tarball" "https://github.com/oras-project/oras/releases/download/v$ORAS_VERSION/$tarball"
+          echo "$ORAS_SHA256  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP/bin" oras
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
 
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
         if: steps.built.outputs.archive != ''
@@ -237,6 +293,7 @@ jobs:
           HASH: ${{ steps.built.outputs.hash }}
           ARCHIVE: ${{ steps.built.outputs.archive }}
           REPLACE: ${{ steps.built.outputs.replace }}
+          SOURCE: ${{ steps.check.outputs.source }}
           GH_ACTOR: ${{ github.actor }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
@@ -279,6 +336,19 @@ jobs:
           skopeo copy --digestfile "$RUNNER_TEMP/digest" "oci-archive:$ARCHIVE" "docker://$REPO:$HASH"
           digest=$(cat "$RUNNER_TEMP/digest")
           cosign login ghcr.io -u "$GH_ACTOR" --password-stdin <<< "$GH_TOKEN"
+          if [[ $SOURCE == true ]]; then
+            oras login ghcr.io -u "$GH_ACTOR" --password-stdin <<< "$GH_TOKEN"
+            mapfile -t src < <(awk '{ print $2 }' "packages/$PKG/SOURCE.sha256")
+            art=$(cd "$RUNNER_TEMP/src" && oras attach --artifact-type "$SOURCE_TYPE" --format go-template --template '{{.digest}}' \
+              "$REPO@$digest" "${src[@]}")
+            [[ $art =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::no source referrer digest from oras attach: $art"; exit 1; }
+            oras discover --artifact-type "$SOURCE_TYPE" --format json "$REPO@$digest" |
+              jq -e --arg d "$art" '[.referrers[].digest] | index($d) != null' > /dev/null ||
+              { echo "::error::$REPO@$art is not a source referrer of $REPO@$digest"; exit 1; }
+            cosign sign --yes --new-bundle-format=false --key env://COSIGN_PRIVATE_KEY "$REPO@$art"
+            cosign verify --key "$PUBKEY" "$REPO@$art" > /dev/null
+            echo "$REPO@$art source"
+          fi
           cosign sign --yes --new-bundle-format=false --key env://COSIGN_PRIVATE_KEY "$REPO@$digest"
           cosign verify --key "$PUBKEY" "$REPO@$digest" > /dev/null
           echo "$REPO:$HASH $digest"

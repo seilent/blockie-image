@@ -215,7 +215,7 @@ plan_setup() {
   ln -sf "$BASH" "$bin/bash"
   r=$d/repo
   mkdir -p "$r/build" "$r/system_files/usr/share/blockie/keys"
-  cp "$plan" "$here/build/pkg-hash.sh" "$r/build/"
+  cp "$plan" "$here/build/pkg-hash.sh" "$here/build/source-referrer.sh" "$r/build/"
   echo key > "$r/system_files/usr/share/blockie/keys/blockie.pub"
   local p
   for p in a b c; do
@@ -253,9 +253,32 @@ esac
 exit 0
 EOF
   fake sleep "echo sleep >> '$d/calls'"
-  chmod 755 "$bin/skopeo" "$bin/cosign"
+  cat > "$bin/oras" << EOF
+#!$BASH
+echo "oras \$*" >> '$d/calls'
+r=\${*: -1}
+[[ \$1 == manifest ]] && r=\$3
+n=\${r##*/pkg/}
+n=\${n%%@*}
+case "\$1 \$2" in
+  "discover --artifact-type")
+    if [[ -f '$d'/ref.\$n ]]; then echo '{"referrers":[{"digest":"sha256:$(printf '%064d' 0)"}]}'; else echo '{"referrers":[]}'; fi ;;
+  "manifest fetch") cat '$d'/ref.\$n ;;
+  *) echo "fake oras: \$*" >&2; exit 2 ;;
+esac
+EOF
+  chmod 755 "$bin/skopeo" "$bin/cosign" "$bin/oras"
   git -C "$r" init -q
   git -C "$r" add -A
+}
+
+pins() {
+  printf '%s  a-1.tar.gz\n' "$(printf '%064d' 1)" > "$r/packages/a/SOURCE.sha256"
+  git -C "$r" add -A
+}
+
+layer() {
+  printf '{"layers":[{"digest":"sha256:%s","annotations":{"org.opencontainers.image.title":"%s"}}]}\n' "$1" "$2" > "$d/ref.a"
 }
 
 plan_run() {
@@ -320,6 +343,36 @@ printf 'a missing\nb signed\nc signed\n' > "$d/cfg"
 out=$(cd "$d" && PATH=$bin GH_ACTOR=actor GH_TOKEN=token "$BASH" "$r/build/pkg-plan.sh" rel.json 2>&1)
 rc=$?
 is "$rc" 0 && is "$(< "$d/rel.json")" '[{"package":"a","state":"missing"}]'; res $? "plan: a relative output path is taken from the caller's directory"
+
+plan_setup p_source
+pins
+layer "$(printf '%064d' 1)" a-1.tar.gz
+plan_run
+[[ $rc == 0 ]] && built '[]' && has "pkg/a:" && has "exists, signed, source sha256:$(printf '%064d' 0)"; res $? "plan: a signed pinned package with its source referrer builds nothing"
+
+plan_setup p_nosource
+pins
+plan_run
+[[ $rc == 1 ]] && has '::error::ghcr.io/seilent/blockie/pkg/a:' && has 'no source referrer' && has 'delete that package version'; res $? "plan: a signed pinned package without a source referrer fails at list time"
+
+plan_setup p_wrongsource
+pins
+layer "$(printf '%064d' 2)" a-1.tar.gz
+plan_run
+[[ $rc == 1 ]] && has 'no source referrer'; res $? "plan: a source referrer whose layer digest is not the pin fails"
+
+plan_setup p_extrasource
+pins
+printf '{"layers":[{"digest":"sha256:%s","annotations":{"org.opencontainers.image.title":"a-1.tar.gz"}},{"digest":"sha256:%s","annotations":{"org.opencontainers.image.title":"x.tar.gz"}}]}\n' \
+  "$(printf '%064d' 1)" "$(printf '%064d' 3)" > "$d/ref.a"
+plan_run
+[[ $rc == 1 ]] && has 'no source referrer'; res $? "plan: a source referrer with a file the pins do not list fails"
+
+plan_setup p_missingpinned
+pins
+printf 'a missing\nb signed\nc signed\n' > "$d/cfg"
+plan_run
+[[ $rc == 0 ]] && built '[{"package":"a","state":"missing"}]' && ! grep -q '^oras' "$d/calls"; res $? "plan: a missing pinned package is built, its referrer is not looked up"
 
 cache_setup() {
   setup "$1"

@@ -8,21 +8,23 @@ repo=https://github.com/seilent/blockie-image
 
 fail() { echo "source-artifact: $*" >&2; exit 1; }
 
-(( $# == 4 )) || { echo "usage: source-artifact.sh <srpms.tsv> <outdir> <full|base> <kernel package repo@digest>" >&2; exit 2; }
+(( $# >= 4 )) || { echo "usage: source-artifact.sh <srpms.tsv> <outdir> <full|base> <package repo@digest>..." >&2; exit 2; }
 tsv=$1
 out=$2
 mode=$3
-kref=$4
+shift 3
 source_type=application/vnd.blockie.source.v1
-kname=blockie-kernel-source.tar.gz
 [[ $mode == full || $mode == base ]] || fail "mode is $mode, not full or base"
 [[ -s $tsv ]] || fail "$tsv is empty"
 
-[[ $kref =~ ^[a-z0-9./-]+@sha256:[0-9a-f]{64}$ ]] || fail "bad kernel package ref $kref"
+declare -A refs
+for ref in "$@"; do
+  [[ $ref =~ ^[a-z0-9./-]+/pkg/([a-z0-9][a-z0-9-]*)@sha256:[0-9a-f]{64}$ ]] || fail "bad package ref $ref"
+  [[ -z ${refs[${BASH_REMATCH[1]}]:-} ]] || fail "two refs for ${BASH_REMATCH[1]}"
+  refs[${BASH_REMATCH[1]}]=$ref
+done
 
 root=$(cd "$(dirname "$0")/.." && pwd)
-ksha=$(awk -v n="$kname" '$2 == n { print $1 }' "$root/packages/kernel/SOURCE.sha256")
-[[ $ksha =~ ^[0-9a-f]{64}$ ]] || fail "no $kname line in packages/kernel/SOURCE.sha256"
 
 mkdir -p "$out"
 out=$(cd "$out" && pwd)
@@ -53,21 +55,26 @@ for env in "$root"/packages/*/SOURCE.env; do
   echo "$f" >> "$tmp/upstream"
 done
 
-krepo=${kref%@*}
-art=""
-while read -r d; do
-  [[ $d =~ ^sha256:[0-9a-f]{64}$ ]] || continue
-  layer=$(oras manifest fetch "$krepo@$d" | jq -r --arg n "$kname" '[.layers[] | select(.annotations["org.opencontainers.image.title"] == $n)] | if length == 1 then .[0].digest else empty end')
-  [[ $layer == sha256:* ]] || continue
-  oras blob fetch --output "$out/$kname" "$krepo@$layer"
-  if [[ $(sha256sum < "$out/$kname" | cut -d' ' -f1) == "$ksha" ]]; then
-    art=$d
-    break
-  fi
-  rm -f "${out:?}/$kname"
-done < <(oras discover --artifact-type "$source_type" --format json "$kref" | jq -r '.referrers[]?.digest')
-[[ -n $art ]] || fail "no $source_type referrer on $kref holds $kname with sha256 $ksha"
-printf '%s %s\n' "$kname" "$krepo@$art" >> "$tmp/origins"
+for pins in "$root"/packages/*/SOURCE.sha256; do
+  [[ -f $pins ]] || continue
+  name=${pins%/SOURCE.sha256}
+  name=${name##*/}
+  ref=${refs[$name]:-}
+  [[ -n $ref ]] || fail "$name pins a source and has no package ref"
+  repo=${ref%@*}
+  want=$(awk '{ print $2 " sha256:" $1 }' "$pins" | LC_ALL=C sort)
+  [[ -n $want ]] || fail "$pins is empty"
+  while read -r f _; do
+    [[ $f =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ && ! -e $out/$f ]] || fail "bad or repeated source file $f in $pins"
+  done <<< "$want"
+  art=$("$root/build/source-referrer.sh" "$ref" "$pins") ||
+    fail "no $source_type referrer on $ref holds the files of packages/$name/SOURCE.sha256"
+  while read -r f layer; do
+    oras blob fetch --output "$out/$f" "$repo@$layer"
+    [[ sha256:$(sha256sum < "$out/$f" | cut -d' ' -f1) == "$layer" ]] || fail "$f from $repo@$layer is not $layer"
+    printf '%s %s\n' "$f" "$repo@$art" >> "$tmp/origins"
+  done <<< "$want"
+done
 
 : > "$tmp/srpms"
 if [[ $mode == full ]]; then
