@@ -38,9 +38,11 @@ grep -Eq '^ +GNU_RELRO ' <<< "$phdr" || fail "blockie-frontend lacks GNU_RELRO"
 grep -Eq ' __[A-Za-z0-9_]+_chk(@| |$)' <<< "$syms" || fail "blockie-frontend has no fortified __*_chk call"
 grep -q 'Additional permission under GNU GPL version 3 section 7' "$t$lic/LICENSE" || fail "LICENSE lacks the additional permission"
 reqs=$(rpm -qpR "${rpms[0]}")
-grep -q '^libwayland-client\.so' <<< "$reqs" || fail "no libwayland-client requirement"
-grep -q '^libxkbcommon\.so' <<< "$reqs" || fail "no libxkbcommon requirement"
-grep -q '^libcurl\.so\.4' <<< "$reqs" || fail "no libcurl requirement"
+want_reqs=$(printf '%s\n' 'ld-linux-aarch64.so.1()(64bit)' 'libc.so.6()(64bit)' 'libcurl.so.4()(64bit)' 'libgcc_s.so.1()(64bit)' \
+  'libm.so.6()(64bit)' 'libstdc++.so.6()(64bit)' 'libwayland-client.so.0()(64bit)' 'libxkbcommon.so.0()(64bit)' 'rtld(GNU_HASH)' |
+  LC_ALL=C sort)
+got_reqs=$(awk '!/^rpmlib\(/ && !/^[^(]*\([^)]+\)\(64bit\)$/' <<< "$reqs" | LC_ALL=C sort)
+[[ $got_reqs == "$want_reqs" ]] || fail "requires: $(tr '\n' ' ' <<< "$got_reqs")"
 grep -q 'SIL Open Font License, Version 1.1' "$t$lic/Selawik-LICENSE.txt" || fail "Selawik-LICENSE.txt is not the OFL"
 grep -q 'here is a blessing' "$t$lic/sqlite-NOTICE" || fail "sqlite-NOTICE lacks the blessing"
 echo "pkg-blockie-frontend: ok"
