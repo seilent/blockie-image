@@ -26,3 +26,8 @@ GPL-2.0-only with BSD, MIT, zlib and libpng licensed components; the texts under
 /usr/share/licenses/libretro-mupen64plus-next/), built with GLideN64 on GLES 3 and no-graphicbuffer.patch, which
 excludes GLideN64/src/Graphics/OpenGLContext/GraphicBuffer/PrivateApi/GraphicBuffer.cpp (Android only,
 GPL-3.0-or-later) from the Linux build.
+packages/libretro-ppsspp: PPSSPP (https://github.com/hrydgard/ppsspp, v1.20.4 fa50bb1, GPL-2.0-or-later with the
+component licences under /usr/share/licenses/libretro-ppsspp/), built unchanged as the libretro core, linked static
+with FFmpeg (https://github.com/FFmpeg/FFmpeg, n7.1.5 3a0867c, LGPL-2.1-or-later) built with only the PSP decoders.
+SFMT-LICENSE.txt is SFMT's LICENSE.txt (https://github.com/MersenneTwister-Lab/SFMT, d69c917), which the vendored
+ext/sfmt19937 refers to.

@@ -1,0 +1,27 @@
+FROM localhost/blockie-pkg-builder
+
+COPY SOURCE.env SOURCE.sha256 /tmp/src/
+RUN . /tmp/src/SOURCE.env \
+ && umask 022 \
+ && install -d /srcpkg \
+ && fetch() { \
+      d=/var/tmp/src/${4%.tar.gz} \
+      && git init -q "$d" \
+      && git -C "$d" fetch -q --depth 1 "$1" "$2" \
+      && git -C "$d" -c advice.detachedHead=false checkout -q FETCH_HEAD \
+      && test "$(git -C "$d" rev-parse HEAD)" = "$2" \
+      && { test -z "$5" \
+           || git -C "$d" submodule update -q --init --recursive --depth 1 -- $5 \
+           || git -C "$d" submodule update -q --init --recursive -- $5; } \
+      && tar -C /var/tmp/src --sort=name --mtime="@$3" --owner=0 --group=0 --numeric-owner --format=gnu \
+           --exclude=.git -cf - "${d##*/}" | gzip -n > "/srcpkg/$4"; \
+    } \
+ && fetch "$SOURCE_URL" "$SOURCE_COMMIT" "$SOURCE_EPOCH" "$SOURCE_TAR" "$SOURCE_SUBMODULES" \
+ && fetch "$FFMPEG_URL" "$FFMPEG_COMMIT" "$FFMPEG_EPOCH" "$FFMPEG_TAR" "" \
+ && (cd /srcpkg && sha256sum "$SOURCE_TAR" "$FFMPEG_TAR" && sha256sum -c /tmp/src/SOURCE.sha256) \
+ && rm -rf /var/tmp/src /tmp/src
+
+COPY libretro-ppsspp.spec /tmp/spec/
+RUN dnf -y --setopt=install_weak_deps=False builddep /tmp/spec/libretro-ppsspp.spec \
+ && dnf clean all \
+ && rm -rf /tmp/spec
