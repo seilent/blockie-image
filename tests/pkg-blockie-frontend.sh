@@ -40,6 +40,7 @@ grep -q 'Additional permission under GNU GPL version 3 section 7' "$t$lic/LICENS
 reqs=$(rpm -qpR "${rpms[0]}")
 grep -q '^libwayland-client\.so' <<< "$reqs" || fail "no libwayland-client requirement"
 grep -q '^libxkbcommon\.so' <<< "$reqs" || fail "no libxkbcommon requirement"
+grep -q '^libcurl\.so\.4' <<< "$reqs" || fail "no libcurl requirement"
 grep -q 'SIL Open Font License, Version 1.1' "$t$lic/Selawik-LICENSE.txt" || fail "Selawik-LICENSE.txt is not the OFL"
 grep -q 'here is a blessing' "$t$lic/sqlite-NOTICE" || fail "sqlite-NOTICE lacks the blessing"
 echo "pkg-blockie-frontend: ok"
