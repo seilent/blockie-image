@@ -269,7 +269,8 @@ for kv in video_driver=gl video_context_driver=wayland input_driver=udev input_j
   auto_remaps_enable=false remap_save_on_exit=false auto_shaders_enable=false game_specific_options=false \
   savefile_directory=$data/saves savestate_directory=$data/states system_directory=$data/bios \
   libretro_directory=/usr/lib64/libretro libretro_info_path=/usr/share/libretro/info audio_driver=pipewire \
-  config_save_on_exit=false joypad_autoconfig_dir=$share/autoconfig input_autodetect_enable=true; do
+  config_save_on_exit=false joypad_autoconfig_dir=$share/autoconfig input_autodetect_enable=true midi_driver=null \
+  core_info_cache_enable=false gamemode_enable=false; do
   [[ $(cfgv "${kv%%=*}") == "${kv#*=}" ]] || { ok=1; echo "  ${kv%%=*} is '$(cfgv "${kv%%=*}")'"; }
 done
 ! grep -q 'audio_volume' "$share/blockie.cfg" || ok=1
@@ -278,7 +279,7 @@ for l in 'menu_show_online_updater = "false"' 'menu_show_core_updater = "false"'
   grep -qxF "$l" "$share/blockie.cfg" || { ok=1; echo "  no '$l'"; }
 done
 [[ -f "$share/autoconfig/udev/AYANEO Controller.cfg" ]] || ok=1
-res $ok "base config: data dirs, cores, pipewire, no save on exit, the pad autoconfig, default volume"
+res $ok "base config: dirs, cores, pipewire, midi, info cache and gamemode off, no save on exit, pad autoconfig, default volume"
 
 if [[ $fails == 0 ]]; then
   echo "game: all ok"
