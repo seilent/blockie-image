@@ -497,7 +497,7 @@ ok=0
 for kv in video_driver=gl video_context_driver=wayland input_driver=udev input_joypad_driver=udev stdin_cmd_enable=true \
   quit_press_twice=false quit_on_close_content=2 load_dummy_on_core_shutdown=false auto_overrides_enable=false \
   auto_remaps_enable=false remap_save_on_exit=false auto_shaders_enable=false game_specific_options=false \
-  savefile_directory=$data/saves savestate_directory=$data/states system_directory=$data/bios \
+  savefile_directory=$data/saves autosave_interval=60 savestate_directory=$data/states system_directory=$data/bios \
   libretro_directory=/usr/lib64/libretro libretro_info_path=/usr/share/libretro/info audio_driver=pipewire \
   config_save_on_exit=false joypad_autoconfig_dir=$share/autoconfig input_autodetect_enable=true midi_driver=null \
   core_info_cache_enable=false gamemode_enable=false menu_swap_ok_cancel_buttons=true; do
@@ -520,7 +520,7 @@ for l in 'menu_show_online_updater = "false"' 'menu_show_core_updater = "false"'
 done
 ! grep -Eq '^input_(enable_hotkey|menu_toggle|exit_emulator)_btn' "$share/blockie.cfg" || { ok=1; echo "  a pad hotkey in blockie.cfg"; }
 ! grep -q 'input_menu_toggle_btn' "$pad" || { ok=1; echo "  a pad menu toggle in the autoconfig"; }
-res $ok "base config: dirs, cores, pipewire, midi, info cache, gamemode, no save on exit, menu ok on south, positional face buttons with physical labels, shader defaults, volume, stdin commands, no pad hotkeys"
+res $ok "base config: dirs, sram autosave every 60 s, cores, pipewire, midi, info cache, gamemode, no save on exit, menu ok on south, positional face buttons with physical labels, shader defaults, volume, stdin commands, no pad hotkeys"
 
 if [[ $fails == 0 ]]; then
   echo "game: all ok"

@@ -1,0 +1,21 @@
+#!/bin/sh
+set -u
+me=blockie-poweroff
+scope=blockie-game.scope
+timeout 2 wlopm --on '*' || echo "$me: wlopm --on failed" >&2
+case $(systemctl --user show -P FreezerState "$scope") in
+frozen | freezing) systemctl --user thaw "$scope" || echo "$me: thaw of $scope failed" >&2 ;;
+esac
+if systemctl --user is-active --quiet "$scope"; then
+    /usr/libexec/blockie/blockie-game-cmd QUIT
+    n=0
+    while systemctl --user is-active --quiet "$scope"; do
+        if [ $n -ge 25 ]; then
+            echo "$me: $scope still active after 5 s, powering off anyway" >&2
+            break
+        fi
+        sleep 0.2
+        n=$((n + 1))
+    done
+fi
+exec busctl call org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager PowerOff b false

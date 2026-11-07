@@ -61,6 +61,7 @@ dnf -y "${opts[@]}" install \
   kmscube \
   glmark2 \
   labwc \
+  wlopm \
   libretro-mgba \
   libretro-pcsx-rearmed \
   libretro-gambatte \

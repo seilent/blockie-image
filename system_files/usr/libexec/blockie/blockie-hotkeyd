@@ -18,12 +18,15 @@ INPUT = os.environ.get("BLOCKIE_HOTKEYD_INPUT")
 DRY = os.environ.get("BLOCKIE_HOTKEYD_DRY") == "1"
 SYSFS = os.environ.get("BLOCKIE_HOTKEYD_SYSFS", "/sys")
 LONG_MS = int(os.environ.get("BLOCKIE_HOTKEYD_LONG_MS", "1000"))
+HOOK_MS = int(os.environ.get("BLOCKIE_HOTKEYD_HOOK_MS", "5000"))
+BACKSTOP_MS = int(os.environ.get("BLOCKIE_HOTKEYD_BACKSTOP_MS", "20000"))
+HOLD_MAX_MS = 60000
 REPEAT_DELAY_MS = 400
 REPEAT_MS = 100
 RESCAN_S = 2
-HOOK_S = 5
 SWITCHER = ("net.seilent.Blockie.Switcher", "/net/seilent/Blockie/Switcher", "net.seilent.Blockie.Switcher1", "Toggle")
 KEY_POWER, KEY_VOLUMEDOWN, KEY_VOLUMEUP, BTN_MODE = 116, 114, 115, 316
+BTN_JOYSTICK, BTN_THUMBR, BTN_TOUCH, ABS_MT_POSITION_X = 0x120, 0x13E, 0x14A, 0x35
 KEYS = {
     "home": (("odm:gpio_keys",), 0x2F1),
     "extra1": (("AYANEO Controller",), BTN_MODE),
@@ -35,13 +38,16 @@ KEYS = {
 }
 VIRTUAL = {("AYANEO Controller", "0019", "4001", "0428", "ayaneo-gamepad/input0")}
 ARGS = {"switcher": (0, 0), "next": (0, 0), "back": (0, 0), "switch": (1, 1), "hook": (1, 1), "unit": (1, 1),
-        "call": (4, 4), "none": (0, 0)}
+        "call": (4, 4), "blank": (0, 1), "none": (0, 0)}
 GESTURES = ("tap", "hold", "press")
-DEFAULTS = {("home", "hold"): ("switcher",), ("volup", "press"): ("hook", "volume-up"),
-            ("voldown", "press"): ("hook", "volume-down"), ("power", "tap"): ("hook", "power-tap"),
-            ("power", "hold"): ("hook", "power-hold")}
+DISPLAY = {"awake": "blank-off", "blanked": "blank-on", "lit-frozen": "screen-on"}
+DEFAULTS = {("home", "hold"): ((LONG_MS, "hold", ("switcher",)),), ("volup", "press"): ("hook", "volume-up"),
+            ("voldown", "press"): ("hook", "volume-down"), ("power", "tap"): ("blank",),
+            ("power", "hold"): ((LONG_MS, "hold", ("blank", "on")),
+                                (3000, "hold=3000", ("unit", "blockie-poweroff.service")))}
 NAME = re.compile(r"[a-z0-9][a-z0-9-]*")
 UNIT = re.compile(r"[a-z0-9][a-z0-9@._-]*\.service")
+HOLD = re.compile(r"hold(?:=([1-9][0-9]{0,4}))?")
 
 
 def log(msg):
@@ -56,6 +62,8 @@ def valid(action, args):
         return NAME.fullmatch(args[0]) is not None
     if action == "unit":
         return UNIT.fullmatch(args[0]) is not None
+    if action == "blank":
+        return args in ([], ["on"])
     if action == "call":
         return (Gio.dbus_is_name(args[0]) and GLib.Variant.is_object_path(args[1])
                 and Gio.dbus_is_interface_name(args[2]) and Gio.dbus_is_member_name(args[3]))
@@ -75,6 +83,7 @@ def table_files(session):
 
 def load_table(session):
     table = {}
+    holds = {}
     for path in table_files(session):
         try:
             with open(path) as f:
@@ -84,15 +93,27 @@ def load_table(session):
         except OSError as err:
             log(f"cannot read {path}: {err}")
             continue
+        mine = set()
         for n, line in enumerate(lines, 1):
             words = line.split()
             if not words or words[0].startswith("#"):
                 continue
-            if (len(words) < 3 or words[0] not in KEYS or words[1] not in GESTURES or not valid(words[2], words[3:])
-                    or (words[1] == "press" and words[2] not in ("hook", "none"))):
+            m = HOLD.fullmatch(words[1]) if len(words) > 1 else None
+            ms = int(m.group(1) or LONG_MS) if m else 0
+            gesture = "hold" if m else words[1] if len(words) > 1 else ""
+            if (len(words) < 3 or words[0] not in KEYS or gesture not in GESTURES or not valid(words[2], words[3:])
+                    or (gesture == "press" and words[2] not in ("hook", "none")) or ms > HOLD_MAX_MS):
                 log(f"{path}:{n}: ignored: {line.strip()}")
                 continue
-            table[(words[0], words[1])] = tuple(words[2:])
+            if gesture != "hold":
+                table[(words[0], gesture)] = tuple(words[2:])
+                continue
+            if words[0] not in mine:
+                mine.add(words[0])
+                holds[words[0]] = {}
+            holds[words[0]][ms] = (words[1], tuple(words[2:]))
+    for key, stages in holds.items():
+        table[(key, "hold")] = tuple((ms, w, row) for ms, (w, row) in sorted(stages.items()))
     for key, gesture in sorted(table):
         if gesture != "press" and (key, "press") in table:
             del table[(key, gesture)]
@@ -134,6 +155,7 @@ class Key:
         self.consumed = False
         self.table = {}
         self.timer = 0
+        self.stage = 0
 
 
 class Hotkeyd:
@@ -144,6 +166,17 @@ class Hotkeyd:
         self.ignored = {}
         self.missing_hooks = set()
         self.bus = None
+        self.wanted = "awake"
+        self.applied = "unknown"
+        self.busy = False
+        self.kill_timer = 0
+        self.retry = 1
+        self.pending = None
+        self.started = None
+        self.backstop = 0
+        self.grabbed = False
+        self.extra = {}
+        self.nograb = {}
 
     def session_bus(self):
         if self.bus is None:
@@ -158,17 +191,208 @@ class Hotkeyd:
         except GLib.Error as err:
             log(f"cannot run {argv[0]}: {err.message}")
 
-    def hook(self, name):
+    def find_hook(self, name):
         for d in HOOKS:
             path = os.path.join(d, name)
             if os.path.isfile(path) and os.access(path, os.X_OK):
-                p = self.run([path])
-                if p is not None:
-                    GLib.timeout_add_seconds(HOOK_S, lambda: p.force_exit() or False)
-                return
+                return path
         if name not in self.missing_hooks:
             self.missing_hooks.add(name)
             log(f"no hook {name} in {':'.join(HOOKS)}")
+        return None
+
+    def hook(self, name):
+        path = self.find_hook(name)
+        p = self.run([path]) if path else None
+        if p is not None:
+            GLib.timeout_add(HOOK_MS, lambda: p.force_exit() or False)
+
+    def want(self, state):
+        self.wanted = state
+        self.retry = 1
+        self.set_grab(state == "blanked")
+        self.apply()
+
+    def apply(self):
+        if self.busy:
+            return
+        if self.applied != self.wanted:
+            state = self.wanted
+            if DRY:
+                self.applied = state
+            else:
+                path = self.find_hook(DISPLAY[state])
+                p = self.run([path]) if path else None
+                if p is not None:
+                    self.busy = True
+                    self.kill_timer = GLib.timeout_add(HOOK_MS, self.kill, p)
+                    p.wait_async(None, self.hook_done, state)
+                    return
+                self.applied = state if path is None else "unknown"
+        self.start_pending()
+
+    def start_pending(self):
+        if self.pending and self.wanted == "lit-frozen":
+            unit, self.pending = self.pending, None
+            self.start(unit)
+            self.started = unit
+            if self.backstop:
+                GLib.source_remove(self.backstop)
+            self.backstop = GLib.timeout_add(BACKSTOP_MS, self.lapsed, unit)
+
+    def lapsed(self, unit):
+        self.backstop = 0
+        if self.wanted == "lit-frozen" and self.started == unit:
+            log(f"{unit} started {BACKSTOP_MS} ms ago and the power is still on: back to awake")
+            self.want("awake")
+        return False
+
+    def check_started(self):
+        if DRY:
+            return
+        try:
+            p = Gio.Subprocess.new(["systemctl", "--user", "show", "-P", "ActiveState", self.started],
+                                   Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE)
+        except GLib.Error as err:
+            log(f"cannot run systemctl: {err.message}")
+            return
+        p.communicate_utf8_async(None, None, self.checked, self.started)
+
+    def checked(self, p, res, unit):
+        try:
+            out = p.communicate_utf8_finish(res)[1] or ""
+        except GLib.Error as err:
+            log(f"systemctl show {unit}: {err.message}")
+            out = ""
+        state = out.strip()
+        if self.wanted == "lit-frozen" and self.started == unit and state not in ("activating", "active", "deactivating",
+                                                                                   "reloading"):
+            log(f"{unit} is {state or 'unknown'}: back to awake")
+            self.want("awake")
+
+    def kill(self, p):
+        self.kill_timer = 0
+        p.force_exit()
+        return False
+
+    def hook_done(self, p, res, state):
+        try:
+            p.wait_finish(res)
+        except GLib.Error as err:
+            log(f"{DISPLAY[state]}: {err.message}")
+        if self.kill_timer:
+            GLib.source_remove(self.kill_timer)
+            self.kill_timer = 0
+        self.busy = False
+        if p.get_if_exited() and p.get_exit_status() == 0:
+            self.applied = state
+        else:
+            self.applied = "unknown"
+            log(f"{DISPLAY[state]}: " + (f"exit {p.get_exit_status()}" if p.get_if_exited() else "killed")
+                + (", once more" if self.retry else ""))
+            if not self.retry:
+                self.start_pending()
+                return
+            self.retry -= 1
+        self.apply()
+
+    def start(self, unit):
+        self.run(["systemctl", "--user", "start", "--no-block", unit])
+
+    def blank(self, args):
+        if self.wanted == "awake":
+            self.want("blanked")
+        elif self.wanted == "blanked":
+            self.want("blanked" if args else "awake")
+        elif not args and self.started:
+            self.check_started()
+
+    def unit(self, name):
+        if self.wanted == "awake":
+            self.start(name)
+        else:
+            self.pending = name
+            self.started = None
+            self.want("lit-frozen")
+
+    def grab(self, dev):
+        try:
+            dev.grab()
+        except OSError as err:
+            log(f"{dev.path}: grab: {err.strerror}")
+
+    def close(self, dev):
+        try:
+            dev.close()
+        except OSError:
+            pass
+
+    def grab_more(self):
+        for path in sorted(glob.glob("/dev/input/event*")):
+            if path in self.devices:
+                continue
+            real = os.path.realpath(os.path.join(SYSFS, "class/input", os.path.basename(path)))
+            old = self.extra.get(path)
+            if (old and old[1] == real) or self.nograb.get(path) == real:
+                continue
+            if old:
+                self.close(self.extra.pop(path)[0])
+            try:
+                dev = evdev.InputDevice(path)
+                caps = dev.capabilities(absinfo=False)
+            except OSError:
+                continue
+            keys = set(caps.get(evdev.ecodes.EV_KEY, []))
+            if not (any(BTN_JOYSTICK <= c <= BTN_THUMBR for c in keys)
+                    or (BTN_TOUCH in keys and ABS_MT_POSITION_X in caps.get(evdev.ecodes.EV_ABS, []))):
+                dev.close()
+                self.nograb[path] = real
+                continue
+            self.grab(dev)
+            self.extra[path] = (dev, real)
+            log(f"{path} {dev.name}: grabbed while blanked")
+
+    def set_grab(self, on):
+        if on == self.grabbed:
+            return
+        self.grabbed = on
+        if DRY:
+            print("grab" if on else "ungrab", flush=True)
+        if on:
+            for dev, _, _ in self.devices.values():
+                self.grab(dev)
+            if not INPUT:
+                self.grab_more()
+            log(f"blanked: {len(self.devices)} key nodes and {len(self.extra)} more grabbed")
+            return
+        for dev, _, _ in self.devices.values():
+            try:
+                dev.ungrab()
+            except OSError:
+                pass
+        for dev, _ in self.extra.values():
+            self.close(dev)
+        self.extra.clear()
+        self.nograb.clear()
+        log("ungrabbed")
+        self.resync()
+
+    def resync(self):
+        if DRY:
+            print("resync", flush=True)
+        held = {}
+        for dev, m, _ in self.devices.values():
+            try:
+                active = set(dev.active_keys())
+            except OSError:
+                continue
+            for code, key in m.items():
+                held[key] = held.get(key, False) or code in active
+        for key, down in held.items():
+            k = self.keys[key]
+            if k.down and not down:
+                k.down = False
+                self.stop_timer(k)
 
     def call(self, name, path, iface, member):
         if DRY:
@@ -202,6 +426,8 @@ class Hotkeyd:
             self.run(["blockie-session", "next"])
 
     def fire(self, key, gesture, row):
+        if self.wanted == "blanked" and key != "power":
+            return
         action, args = row[0], row[1:]
         if DRY:
             print(f"action {key} {gesture} {' '.join(row)}", flush=True)
@@ -217,7 +443,9 @@ class Hotkeyd:
             if not DRY:
                 self.hook(args[0])
         elif action == "unit":
-            self.run(["systemctl", "--user", "start", "--no-block", args[0]])
+            self.unit(args[0])
+        elif action == "blank":
+            self.blank(args)
         elif action == "call":
             self.call(*args)
 
@@ -229,9 +457,14 @@ class Hotkeyd:
     def held(self, key):
         k = self.keys[key]
         k.timer = 0
-        if k.down and not k.consumed:
+        stages = k.table[(key, "hold")]
+        if k.down and k.stage < len(stages):
+            ms, word, row = stages[k.stage]
             k.consumed = True
-            self.fire(key, "hold", k.table[(key, "hold")])
+            k.stage += 1
+            if k.stage < len(stages):
+                k.timer = GLib.timeout_add(stages[k.stage][0] - ms, self.held, key)
+            self.fire(key, word, row)
         return False
 
     def repeat(self, key, first):
@@ -247,17 +480,20 @@ class Hotkeyd:
 
     def handle(self, key, value):
         k = self.keys[key]
-        if value == 1 and not k.down:
+        if value == 1:
             k.down = True
-            k.consumed = False
-            k.table = load_table(current())
+            k.consumed = self.wanted == "blanked" and key != "power"
+            k.stage = 0
             self.stop_timer(k)
+            if k.consumed:
+                return
+            k.table = load_table(current())
             if (key, "press") in k.table:
                 k.consumed = True
                 self.fire(key, "press", k.table[(key, "press")])
                 k.timer = GLib.timeout_add(REPEAT_DELAY_MS, self.repeat, key, True)
             elif (key, "hold") in k.table:
-                k.timer = GLib.timeout_add(LONG_MS, self.held, key)
+                k.timer = GLib.timeout_add(k.table[(key, "hold")][0][0], self.held, key)
         elif value == 0 and k.down:
             k.down = False
             self.stop_timer(k)
@@ -291,7 +527,11 @@ class Hotkeyd:
             watch = GLib.io_add_watch(dev.fd, GLib.PRIORITY_DEFAULT, GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR,
                                       self.readable, path)
             self.devices[path] = (dev, m, watch)
+            if self.grabbed:
+                self.grab(dev)
             log(f"{path} {dev.name}: {', '.join(sorted(m.values()))}")
+        if self.grabbed:
+            self.grab_more()
         return True
 
     def drop(self, path):
@@ -348,6 +588,7 @@ def main():
     else:
         d.rescan()
         GLib.timeout_add_seconds(RESCAN_S, d.rescan)
+    d.apply()
     GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, 15, loop.quit)
     loop.run()
     return 0

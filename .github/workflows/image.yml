@@ -195,7 +195,7 @@ jobs:
         env:
           TAG: ${{ steps.version.outputs.push_tag }}
         run: |
-          for t in image units blobs audio wifi bt boot-ok data session hotkeyd game game-cmd; do
+          for t in image units blobs audio wifi bt boot-ok data session hotkeyd power game game-cmd; do
             podman run --rm -v "$PWD/tests:/tests:ro" -v "$PWD/boot:/repo-boot:ro" "$IMAGE:$TAG" "/tests/$t.sh"
           done
           podman run --rm -v "$PWD/tests:/tests:ro" "$IMAGE:$TAG" \

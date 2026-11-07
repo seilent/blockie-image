@@ -136,7 +136,21 @@ rpm -q blockie-frontend > /dev/null || fail "blockie-frontend not installed"
 xdg=$(mktemp -d)
 XDG_RUNTIME_DIR=$xdg systemd-analyze verify --user --man=no /usr/lib/systemd/user/blockie-frontend.service ||
   fail "blockie-frontend.service does not verify"
+XDG_RUNTIME_DIR=$xdg systemd-analyze verify --user --man=no /usr/lib/systemd/user/blockie-poweroff.service ||
+  fail "blockie-poweroff.service does not verify"
 rm -rf "${xdg:?}"
+rpm -q wlopm > /dev/null || fail "wlopm not installed"
+for h in blank-on blank-off screen-on; do
+  [[ -f /usr/lib/blockie/hooks.d/$h && $(stat -c %a "/usr/lib/blockie/hooks.d/$h") == 755 ]] || fail "hook $h is not a 755 file"
+done
+[[ -x /usr/libexec/blockie/blockie-poweroff ]] || fail "blockie-poweroff missing"
+po=/usr/lib/systemd/user/blockie-poweroff.service
+grep -qx 'Type=oneshot' "$po" && grep -qx 'TimeoutStartSec=15s' "$po" && ! grep -q '^\[Install\]' "$po" ||
+  fail "blockie-poweroff.service is not a 15 s oneshot without [Install]"
+grep -qx 'ExecStopPost=-/usr/lib/blockie/hooks.d/blank-off' /usr/lib/systemd/user/blockie-hotkeyd.service ||
+  fail "a hotkeyd stop does not wake the screen"
+cmp -s <(printf '[Login]\nHandlePowerKey=ignore\nHandlePowerKeyLongPress=ignore\n') /usr/lib/systemd/logind.conf.d/50-blockie.conf ||
+  fail "logind drop-in is not the two ignore lines"
 ! grep -q '^\[Install\]' /usr/lib/systemd/system/geoclue.service || fail "geoclue.service can be enabled"
 [[ -z $(find /etc/systemd /usr/lib/systemd -path '*.wants/*' \( -name 'geoclue*' -o -name 'xdg-*portal*' \)) ]] || fail "a geoclue or portal unit is enabled"
 

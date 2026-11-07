@@ -1,0 +1,7 @@
+[Unit]
+Description=Quit the game and power off
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/blockie/blockie-poweroff
+TimeoutStartSec=15s

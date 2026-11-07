@@ -91,7 +91,7 @@ res $? "a session without a table gets the defaults"
 printf 'test-a 1 1\n' > "$t/current"
 run 'echo home down; sleep 0.1; printf "x\n" > /dev/null; echo home down; echo home up'
 [[ $(cat "$t/out") == "action home tap switch test-b" ]]
-res $? "a second down without an up is ignored"
+res $? "a second down without an up starts a new press, so its release is a tap"
 
 printf 'emulation 1 1\n' > "$t/current"
 TABLES=$tables run 'echo extra3 down; sleep 0.1; echo extra3 up; echo extra3 down; sleep 0.5; echo extra3 up
@@ -99,6 +99,123 @@ TABLES=$tables run 'echo extra3 down; sleep 0.1; echo extra3 up; echo extra3 dow
 [[ $(cat "$t/out") == $'action extra3 tap hook game-menu\naction extra3 hold hook game-quit\naction home hold switcher' ]] &&
   ! grep -q ignored "$t/err"
 res $? "emulation: the shipped rows give logo tap game-menu and hold game-quit, home hold stays the switcher, extra1 has no row"
+
+printf 'nobody-here 1 1\n' > "$t/current"
+run 'echo power down; echo power up; echo home down; sleep 0.5; echo home up; echo volup down; echo volup up
+  echo extra3 down; echo extra3 up; echo power down; echo power up'
+[[ $(cat "$t/out") == $'action power tap blank\ngrab\naction power tap blank\nungrab\nresync' ]]
+res $? "power tap blanks and grabs, other keys fire nothing while blanked, the next power tap wakes, ungrabs and resyncs"
+
+run 'echo power down; sleep 0.5; echo power down; echo power up'
+[[ $(cat "$t/out") == $'action power hold blank on\ngrab\naction power tap blank\nungrab\nresync' ]]
+res $? "a lost power release: the second down starts a new press and its tap wakes"
+
+run 'echo power down; sleep 2; echo power up; echo power down; sleep 3.3; echo power up'
+[[ $(cat "$t/out") == $'action power hold blank on\ngrab\naction power hold blank on\naction power hold=3000 unit blockie-poweroff.service\nungrab\nresync' ]]
+res $? "default power hold: blank at the plain hold time, a release at 2 s stays blanked, 3000 ms starts blockie-poweroff.service"
+
+printf 'power tap none\npower hold none\n' > "$t/usr/test-p.conf"
+printf 'test-p 1 1\n' > "$t/current"
+run 'echo power down; echo power up; echo power down; sleep 3.3; echo power up'
+[[ $(cat "$t/out") == $'action power tap none\naction power hold none' ]]
+res $? "session power rows replace the default tap and both default hold stages"
+
+printf '%s\n' 'power hold blank on' 'power hold=1200 unit blockie-test.service' 'power hold=abc none' 'power hold=0 none' \
+  'power hold=70000 none' 'power tap blank off' > "$t/usr/test-h.conf"
+printf 'test-h 1 1\n' > "$t/current"
+run 'echo power down; sleep 0.7; echo power up; echo power down; sleep 1.5; echo power up'
+[[ $(cat "$t/out") == $'action power hold blank on\ngrab\naction power hold blank on\naction power hold=1200 unit blockie-test.service\nungrab\nresync' ]] &&
+  grep -q 'test-h.conf:3: ignored: power hold=abc none' "$t/err" && grep -q 'test-h.conf:4: ignored: power hold=0 none' "$t/err" &&
+  grep -q 'test-h.conf:5: ignored: power hold=70000 none' "$t/err" && grep -q 'test-h.conf:6: ignored: power tap blank off' "$t/err"
+res $? "hold=<ms> rows add a stage each next to the plain hold; bad hold times and blank arguments are ignored with their line"
+
+hk=$t/hooks
+mkdir -p "$hk" "$t/fbin"
+for h in blank-on blank-off screen-on; do
+  cat > "$hk/$h" << EOF
+#!/bin/sh
+echo "start $h" >> "$t/hooks.log"
+s=0.5
+[ ! -f "$hk/$h.sleep" ] || read -r s < "$hk/$h.sleep"
+sleep "\$s"
+rc=0
+[ ! -f "$hk/$h.rc" ] || read -r rc < "$hk/$h.rc"
+echo "exit $h" >> "$t/hooks.log"
+exit "\$rc"
+EOF
+  chmod 755 "$hk/$h"
+done
+cat > "$t/fbin/systemctl" << EOF
+#!/bin/sh
+case "\$*" in
+  '--user show -P ActiveState '*) cat "$t/unit.state" 2> /dev/null || echo inactive ;;
+  *) echo "systemctl \$*" >> "$t/hooks.log" ;;
+esac
+EOF
+chmod 755 "$t/fbin/systemctl"
+
+live() {
+  local script=$1
+  rm -f "$t/fifo" "$t/hooks.log"
+  mkfifo "$t/fifo"
+  PATH=$t/fbin:$PATH BLOCKIE_HOTKEYD_INPUT=$t/fifo BLOCKIE_HOTKEYD_HOOKS=$hk BLOCKIE_HOTKEYD_LONG_MS=300 \
+    BLOCKIE_HOTKEYD_HOOK_MS=${HOOK_MS:-5000} BLOCKIE_HOTKEYD_BACKSTOP_MS=${BACKSTOP_MS:-20000} BLOCKIE_HOTKEYD_TABLES=$t/usr:$t/etc BLOCKIE_HOTKEYD_CURRENT=$t/current \
+    timeout 30 python3 "$bin" > "$t/out" 2> "$t/err" &
+  local pid=$!
+  bash -c "$script" > "$t/fifo"
+  wait "$pid"
+  touch "$t/hooks.log"
+}
+logis() { [[ $(< "$t/hooks.log") == "$1" ]]; }
+tap='echo power down; echo power up'
+woke=$'start blank-off\nexit blank-off'
+
+printf 'nobody-here 1 1\n' > "$t/current"
+live 'sleep 1'
+logis "$woke"
+res $? "hooks run: start runs blank-off once, the applied state starts unknown"
+
+live "sleep 1; $tap; sleep 0.1; $tap; sleep 1.5"
+logis "$woke"$'\nstart blank-on\nexit blank-on\nstart blank-off\nexit blank-off'
+res $? "hooks run: two taps inside one blank-on run blank-off after it, never overlapping"
+
+live "sleep 1; $tap; sleep 0.1; $tap; sleep 0.1; $tap; sleep 1.2"
+logis "$woke"$'\nstart blank-on\nexit blank-on'
+res $? "hooks run: three taps inside one blank-on coalesce, one blank-on, ending blanked"
+
+printf '%s\n' 'power hold blank on' 'power hold=600 unit blockie-poweroff.service' > "$t/usr/test-l.conf"
+printf 'test-l 1 1\n' > "$t/current"
+echo 1 > "$hk/blank-on.sleep"
+live "sleep 1; echo power down; sleep 0.8; echo power up; sleep 0.7; $tap; sleep 1.5"
+logis "$woke"$'\nstart blank-on\nexit blank-on\nstart screen-on\nexit screen-on\nsystemctl --user start --no-block blockie-poweroff.service'
+res $? "hooks run: a long hold while blank-on runs: screen-on after blank-on, the unit after screen-on, a tap during screen-on runs no blank-on"
+rm -f "$hk/blank-on.sleep"
+
+started=$'start blank-on\nexit blank-on\nstart screen-on\nexit screen-on\nsystemctl --user start --no-block blockie-poweroff.service'
+echo activating > "$t/unit.state"
+live "sleep 1; echo power down; sleep 1.5; echo power up; sleep 0.3; $tap; sleep 0.5; echo failed > '$t/unit.state'; $tap
+  sleep 1.2"
+logis "$woke"$'\n'"$started"$'\n'"$woke" && grep -q 'blockie-poweroff.service is failed: back to awake' "$t/err"
+res $? "hooks run: after the power off unit starts, a tap does nothing while it is activating and wakes once it failed"
+
+echo activating > "$t/unit.state"
+BACKSTOP_MS=1500 live "sleep 1; echo power down; sleep 1.5; echo power up; sleep 2.5"
+logis "$woke"$'\n'"$started"$'\n'"$woke" && grep -q 'started 1500 ms ago and the power is still on: back to awake' "$t/err"
+res $? "hooks run: the backstop wakes the screen when the power is still on after the unit start"
+rm -f "$t/unit.state"
+
+printf 'nobody-here 1 1\n' > "$t/current"
+echo 3 > "$hk/blank-on.sleep"
+HOOK_MS=1000 live "sleep 1; $tap; sleep 2.6; $tap; sleep 1.2"
+logis "$woke"$'\nstart blank-on\nstart blank-on\n'"$woke" && grep -q 'blank-on: killed, once more' "$t/err"
+res $? "hooks run: a blank-on killed at the limit runs once more, then the applied state is unknown and a tap runs blank-off"
+rm -f "$hk/blank-on.sleep"
+
+echo 1 > "$hk/blank-on.rc"
+live "sleep 1; $tap; sleep 2.5"
+logis "$woke"$'\nstart blank-on\nexit blank-on\nstart blank-on\nexit blank-on' && grep -q 'blank-on: exit 1$' "$t/err"
+res $? "hooks run: a blank-on that always fails runs twice for one press, no loop"
+rm -f "$hk/blank-on.rc"
 
 S=$t/sys
 sysnode() {

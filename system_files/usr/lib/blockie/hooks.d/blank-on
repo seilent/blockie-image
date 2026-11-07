@@ -1,0 +1,7 @@
+#!/bin/sh
+rc=0
+case $(systemctl --user show -P ActiveState blockie-game.scope):$(systemctl --user show -P FreezerState blockie-game.scope) in
+active:running | active:thawing) systemctl --user freeze blockie-game.scope || rc=1 ;;
+esac
+timeout 2 wlopm --off '*' || rc=1
+exit $rc

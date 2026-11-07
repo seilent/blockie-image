@@ -1,0 +1,7 @@
+#!/bin/sh
+rc=0
+timeout 2 wlopm --on '*' || rc=1
+case $(systemctl --user show -P FreezerState blockie-game.scope) in
+frozen | freezing) systemctl --user thaw blockie-game.scope || rc=1 ;;
+esac
+exit $rc
