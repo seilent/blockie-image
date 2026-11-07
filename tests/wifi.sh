@@ -30,4 +30,8 @@ done
 for d in /etc/NetworkManager/system-connections /usr/lib/NetworkManager/system-connections; do
   [[ ! -d $d ]] || [[ -z $(find "$d" -mindepth 1 -print -quit) ]] || fail "$d is not empty"
 done
+only='unmanaged-devices=interface-name:ap0;interface-name:wlan1;interface-name:p2p0'
+grep -qxF "$only" /usr/lib/NetworkManager/conf.d/50-blockie-wifi.conf || fail "50-blockie-wifi.conf does not leave ap0, wlan1 and p2p0 unmanaged"
+nm=$(NetworkManager --print-config 2> /dev/null) || fail "NetworkManager --print-config failed"
+grep -qxF "$only" <<< "$nm" || fail "NetworkManager's merged config does not leave ap0, wlan1 and p2p0 unmanaged"
 echo "wifi: ok"
