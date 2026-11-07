@@ -98,6 +98,12 @@ rpm -q labwc blockie-compositor > /dev/null || fail "labwc or blockie-compositor
 [[ -x /usr/libexec/blockie/blockie-compositor && -f /usr/lib64/blockie/libblockie-nocursor.so && -f /usr/lib64/blockie/libblockie-glfinish.so ]] || fail "compositor wrapper or shims missing"
 [[ -f /usr/share/blockie/labwc/rc.xml && -f /usr/share/icons/blockie-none/cursors/blockie-none ]] || fail "labwc config or cursor theme missing"
 [[ -f /usr/lib/systemd/user/blockie-.service.d/50-blockie-gpu.conf ]] || fail "blockie user unit gpu drop-in missing"
+rpm -q blockie-frontend > /dev/null || fail "blockie-frontend not installed"
+[[ -x /usr/libexec/blockie/blockie-frontend && -f /usr/lib/systemd/user/blockie-frontend.service ]] || fail "frontend binary or unit missing"
+xdg=$(mktemp -d)
+XDG_RUNTIME_DIR=$xdg systemd-analyze verify --user --man=no /usr/lib/systemd/user/blockie-frontend.service ||
+  fail "blockie-frontend.service does not verify"
+rm -rf "${xdg:?}"
 ! grep -q '^\[Install\]' /usr/lib/systemd/system/geoclue.service || fail "geoclue.service can be enabled"
 [[ -z $(find /etc/systemd /usr/lib/systemd -path '*.wants/*' \( -name 'geoclue*' -o -name 'xdg-*portal*' \)) ]] || fail "a geoclue or portal unit is enabled"
 

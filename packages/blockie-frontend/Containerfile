@@ -1,0 +1,14 @@
+FROM localhost/blockie-pkg-builder
+
+COPY SOURCE.sha256 blockie-frontend.spec /tmp/blockie-frontend/
+RUN dnf -y --setopt=install_weak_deps=False install gcc-c++ wayland-devel pkgconf-pkg-config \
+ && dnf clean all \
+ && install -d /srcpkg \
+ && rpmspec -P /tmp/blockie-frontend/blockie-frontend.spec | sed -n 's/^Source[0-9]*:[[:space:]]*//p' > /tmp/blockie-frontend/urls \
+ && while read -r u; do \
+      n=${u##*#/}; [ "$n" != "$u" ] || n=${u##*/}; \
+      curl -fsSL --retry 3 -o "/srcpkg/$n" "${u%%#/*}" || exit 1; \
+    done < /tmp/blockie-frontend/urls \
+ && (cd /srcpkg && sha256sum -c /tmp/blockie-frontend/SOURCE.sha256) \
+ && [ "$(ls /srcpkg | LC_ALL=C sort)" = "$(awk '{ print $2 }' /tmp/blockie-frontend/SOURCE.sha256 | LC_ALL=C sort)" ] \
+ && rm -rf /tmp/blockie-frontend
