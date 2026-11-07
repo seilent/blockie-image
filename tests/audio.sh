@@ -97,7 +97,7 @@ while read -r t name id _; do
 done < <(cat /usr/lib/sysusers.d/*.conf 2> /dev/null || true)
 
 noalsa=(blockie-wifi.service blockie-regdom.service blockie-bt.service blockie-blobs.service blockie-boot-ok.service
-  blockie-data.service)
+  blockie-data.service blockie-session-switch@.service blockie-session-switcher.service blockie-setd.service)
 
 clients=0
 for f in /usr/lib/systemd/system/*.service /etc/systemd/system/*.service; do

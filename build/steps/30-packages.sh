@@ -45,6 +45,10 @@ dnf -y "${opts[@]}" install \
   alsa-ucm \
   alsa-ucm-utils \
   alsa-utils \
+  polkit \
+  python3-gobject-base \
+  python3-evdev \
+  wlrctl \
   retroarch \
   libretro-mgba \
   libretro-pcsx-rearmed

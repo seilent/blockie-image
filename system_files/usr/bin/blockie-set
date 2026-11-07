@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+import json
+import os
+import sys
+
+import gi
+
+gi.require_version("Gio", "2.0")
+from gi.repository import Gio, GLib
+
+ME = "blockie-set"
+NAME = "net.seilent.Blockie.Settings"
+PATH = "/net/seilent/Blockie/Settings"
+IFACE = "net.seilent.Blockie.Settings1"
+BUS = os.environ.get("BLOCKIE_SETD_BUS", "system")
+
+
+def usage():
+    print(f"usage: {ME} get <key> | set <key> <value> | list [prefix] | schema [prefix]", file=sys.stderr)
+    sys.exit(2)
+
+
+def bus():
+    if BUS == "system":
+        return Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+    if BUS == "session":
+        return Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    return Gio.DBusConnection.new_for_address_sync(
+        BUS, Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION,
+        None, None)
+
+
+def call(conn, method, args, out):
+    return conn.call_sync(NAME, PATH, IFACE, method, args, GLib.VariantType(out) if out else None,
+                          Gio.DBusCallFlags.NONE, 10000, None).unpack()
+
+
+def show(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def parse(t, text):
+    if t == "s":
+        return text
+    if t == "b":
+        if text not in ("true", "false"):
+            raise ValueError("true or false")
+        return text == "true"
+    if t in ("i", "u"):
+        value = int(text, 10)
+        lo, hi = (-2**31, 2**31 - 1) if t == "i" else (0, 2**32 - 1)
+        if not lo <= value <= hi:
+            raise ValueError(f"{value} is out of range")
+        return value
+    if t == "d":
+        return float(text)
+    raise ValueError(f"type {t}")
+
+
+def main(argv):
+    if not argv:
+        usage()
+    cmd, args = argv[0], argv[1:]
+    try:
+        conn = bus()
+        if cmd == "get" and len(args) == 1:
+            (value,) = call(conn, "Get", GLib.Variant("(s)", (args[0],)), "(v)")
+            print(show(value))
+        elif cmd == "set" and len(args) == 2:
+            (text,) = call(conn, "Schema", GLib.Variant("(s)", (args[0],)), "(s)")
+            spec = json.loads(text)["keys"].get(args[0])
+            if spec is None:
+                print(f"{ME}: no key {args[0]}", file=sys.stderr)
+                return 1
+            try:
+                value = parse(spec["type"], args[1])
+            except ValueError as err:
+                print(f"{ME}: {args[0]} takes {spec['type']}: {err}", file=sys.stderr)
+                return 1
+            call(conn, "Set", GLib.Variant("(sv)", (args[0], GLib.Variant(spec["type"], value))), None)
+        elif cmd == "list" and len(args) <= 1:
+            (values,) = call(conn, "List", GLib.Variant("(s)", (args[0] if args else "",)), "(a{sv})")
+            for k in sorted(values):
+                print(f"{k}={show(values[k])}")
+        elif cmd == "schema" and len(args) <= 1:
+            (text,) = call(conn, "Schema", GLib.Variant("(s)", (args[0] if args else "",)), "(s)")
+            print(json.dumps(json.loads(text), indent=1, sort_keys=True))
+        else:
+            usage()
+    except GLib.Error as err:
+        Gio.dbus_error_strip_remote_error(err)
+        print(f"{ME}: {err.message}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

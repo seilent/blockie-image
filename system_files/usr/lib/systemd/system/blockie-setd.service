@@ -1,0 +1,26 @@
+[Unit]
+Description=Blockie settings
+
+[Service]
+Type=dbus
+BusName=net.seilent.Blockie.Settings
+ExecStart=/usr/libexec/blockie/blockie-setd
+User=blockie-set
+Group=blockie-set
+StateDirectory=blockie/settings
+StateDirectoryMode=0755
+Restart=on-failure
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+CapabilityBoundingSet=
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

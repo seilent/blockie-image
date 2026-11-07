@@ -1,0 +1,11 @@
+[Unit]
+Description=Start the default session
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/blockie-session boot
+
+[Install]
+WantedBy=graphical-session.target

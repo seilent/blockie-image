@@ -1,0 +1,16 @@
+[Unit]
+Description=Request the %i session
+CollectMode=inactive-or-failed
+
+[Service]
+Type=oneshot
+TimeoutStartSec=30
+ExecStart=/usr/bin/blockie-session request %i requested
+ProtectSystem=strict
+ReadWritePaths=/run/blockie/session
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectHome=read-only
+RestrictSUIDSGID=yes
+CapabilityBoundingSet=

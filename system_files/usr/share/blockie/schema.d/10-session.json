@@ -1,0 +1,12 @@
+{
+  "owner": "blockie-set",
+  "keys": {
+    "session.default": {
+      "type": "s",
+      "default": "emulation",
+      "enum_from": "sessions",
+      "group": "session",
+      "label": "Default session"
+    }
+  }
+}

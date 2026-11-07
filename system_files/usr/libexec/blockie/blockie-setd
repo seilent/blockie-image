@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+import glob
+import json
+import os
+import pwd
+import re
+import sys
+import tempfile
+
+import gi
+
+gi.require_version("Gio", "2.0")
+from gi.repository import Gio, GLib
+
+ME = "blockie-setd"
+NAME = "net.seilent.Blockie.Settings"
+PATH = "/net/seilent/Blockie/Settings"
+IFACE = "net.seilent.Blockie.Settings1"
+ERR = "net.seilent.Blockie.Settings.Error"
+SCHEMAS = os.environ.get("BLOCKIE_SETD_SCHEMAS", "/usr/share/blockie/schema.d")
+STORE = os.environ.get("BLOCKIE_SETD_STORE", "/var/lib/blockie/settings/settings.json")
+SESSIONS = os.environ.get("BLOCKIE_SETD_SESSIONS", "/etc/blockie/sessions.d:/usr/lib/blockie/sessions.d").split(":")
+BUS = os.environ.get("BLOCKIE_SETD_BUS", "system")
+WRITERS = os.environ.get("BLOCKIE_SETD_WRITERS", "root blockie").split()
+TYPES = {"s": str, "b": bool, "i": int, "u": int, "d": float}
+RANGES = {"i": (-2**31, 2**31 - 1), "u": (0, 2**32 - 1)}
+SESSION_NAME = re.compile(r"[a-z0-9][a-z0-9-]*")
+XML = f"""
+<node>
+  <interface name="{IFACE}">
+    <method name="Get">
+      <arg name="key" type="s" direction="in"/>
+      <arg name="value" type="v" direction="out"/>
+    </method>
+    <method name="Set">
+      <arg name="key" type="s" direction="in"/>
+      <arg name="value" type="v" direction="in"/>
+    </method>
+    <method name="List">
+      <arg name="prefix" type="s" direction="in"/>
+      <arg name="values" type="a{{sv}}" direction="out"/>
+    </method>
+    <method name="Schema">
+      <arg name="prefix" type="s" direction="in"/>
+      <arg name="json" type="s" direction="out"/>
+    </method>
+    <signal name="Changed">
+      <arg name="key" type="s"/>
+      <arg name="value" type="v"/>
+    </signal>
+  </interface>
+</node>
+"""
+
+
+def log(msg):
+    print(f"{ME}: {msg}", file=sys.stderr, flush=True)
+
+
+class Refused(Exception):
+    def __init__(self, kind, msg):
+        super().__init__(msg)
+        self.kind = kind
+
+
+def default_sessions():
+    found = {}
+    for d in SESSIONS:
+        for path in sorted(glob.glob(os.path.join(glob.escape(d), "*.conf"))):
+            name = os.path.basename(path)[:-5]
+            if name in found or not SESSION_NAME.fullmatch(name):
+                continue
+            found[name] = False
+            try:
+                with open(path) as f:
+                    for line in f:
+                        k, _, v = line.strip().partition("=")
+                        if k.strip() == "DEFAULT" and v.strip().strip("\"'") == "yes":
+                            found[name] = True
+            except OSError as err:
+                log(f"cannot read {path}: {err}")
+    return sorted(n for n, ok in found.items() if ok)
+
+
+def load_schema():
+    keys = {}
+    for path in sorted(glob.glob(os.path.join(glob.escape(SCHEMAS), "*.json"))):
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except (OSError, ValueError) as err:
+            log(f"cannot load {path}: {err}")
+            continue
+        for key, spec in data.get("keys", {}).items():
+            if key in keys:
+                log(f"{path}: {key} is defined twice, the first one stays")
+                continue
+            if not isinstance(spec, dict) or spec.get("type") not in TYPES:
+                log(f"{path}: {key} has no valid type, ignored")
+                continue
+            try:
+                spec["default"] = check(key, spec, spec.get("default"), defaults=True)
+            except Refused as err:
+                log(f"{path}: {key}: default refused: {err}")
+                continue
+            keys[key] = spec
+    return keys
+
+
+def check(key, spec, value, defaults=False):
+    t = spec["type"]
+    if t in ("i", "u") and isinstance(value, bool):
+        raise Refused("Invalid", f"{key} takes {t}, not a boolean")
+    if t == "d" and isinstance(value, int) and not isinstance(value, bool):
+        value = float(value)
+    if not isinstance(value, TYPES[t]):
+        raise Refused("Invalid", f"{key} takes {t}")
+    if t in RANGES and not RANGES[t][0] <= value <= RANGES[t][1]:
+        raise Refused("Invalid", f"{key} takes {t}, {value} is out of its range")
+    if t in ("i", "u", "d"):
+        if "min" in spec and value < spec["min"]:
+            raise Refused("Invalid", f"{key} is at least {spec['min']}")
+        if "max" in spec and value > spec["max"]:
+            raise Refused("Invalid", f"{key} is at most {spec['max']}")
+    if "enum" in spec and value not in spec["enum"]:
+        raise Refused("Invalid", f"{key} is one of {', '.join(map(str, spec['enum']))}")
+    if spec.get("enum_from") == "sessions" and not defaults:
+        allowed = default_sessions()
+        if value not in allowed:
+            raise Refused("Invalid", f"{key} is one of the default sessions: {', '.join(allowed) or 'none'}")
+    return value
+
+
+class Store:
+    def __init__(self, keys):
+        self.keys = keys
+        self.values = {}
+        try:
+            with open(STORE) as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            data = {}
+        except (OSError, ValueError) as err:
+            log(f"cannot load {STORE}: {err}, starting from the defaults")
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        for key, value in data.items():
+            spec = keys.get(key)
+            if spec is None:
+                log(f"{STORE}: {key} is not in the schema, dropped")
+                continue
+            try:
+                self.values[key] = check(key, spec, value)
+            except Refused as err:
+                log(f"{STORE}: {key}: {err}, the default applies")
+
+    def get(self, key):
+        spec = self.keys.get(key)
+        if spec is None:
+            raise Refused("UnknownKey", f"no key {key}")
+        return self.values.get(key, spec["default"])
+
+    def set(self, key, value):
+        spec = self.keys.get(key)
+        if spec is None:
+            raise Refused("UnknownKey", f"no key {key}")
+        if spec.get("writable", True) is False:
+            raise Refused("ReadOnly", f"{key} is read only")
+        value = check(key, spec, value)
+        if self.get(key) == value and key in self.values:
+            return False
+        values = dict(self.values)
+        values[key] = value
+        self.save(values)
+        self.values = values
+        return True
+
+    def save(self, values):
+        d = os.path.dirname(STORE)
+        fd, tmp = tempfile.mkstemp(prefix=".settings.", dir=d)
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(values, f, indent=1, sort_keys=True)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp, 0o644)
+            os.replace(tmp, STORE)
+            dfd = os.open(d, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+
+class Service:
+    def __init__(self, bus, store):
+        self.bus = bus
+        self.store = store
+        self.writers = set()
+        for name in WRITERS:
+            try:
+                self.writers.add(pwd.getpwnam(name).pw_uid)
+            except KeyError:
+                log(f"writer {name} is not a user, skipped")
+        info = Gio.DBusNodeInfo.new_for_xml(XML).interfaces[0]
+        bus.register_object(PATH, info, self.call, None, None)
+
+    def caller_uid(self, sender):
+        r = self.bus.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                               "GetConnectionUnixUser", GLib.Variant("(s)", (sender,)), GLib.VariantType("(u)"),
+                               Gio.DBusCallFlags.NONE, -1, None)
+        return r.unpack()[0]
+
+    def call(self, conn, sender, path, iface, method, params, inv):
+        try:
+            if method == "Get":
+                (key,) = params.unpack()
+                value = self.store.get(key)
+                inv.return_value(GLib.Variant("(v)", (GLib.Variant(self.store.keys[key]["type"], value),)))
+            elif method == "List":
+                (prefix,) = params.unpack()
+                out = {k: GLib.Variant(s["type"], self.store.get(k)) for k, s in sorted(self.store.keys.items())
+                       if k.startswith(prefix)}
+                inv.return_value(GLib.Variant("(a{sv})", (out,)))
+            elif method == "Schema":
+                (prefix,) = params.unpack()
+                out = {k: s for k, s in sorted(self.store.keys.items()) if k.startswith(prefix)}
+                inv.return_value(GLib.Variant("(s)", (json.dumps({"keys": out}, sort_keys=True),)))
+            elif method == "Set":
+                key, value = params.unpack()
+                uid = self.caller_uid(sender)
+                if uid not in self.writers:
+                    raise Refused("Denied", f"uid {uid} may not set {key}")
+                got = params.get_child_value(1).get_variant().get_type_string()
+                spec = self.store.keys.get(key)
+                if spec is not None and got != spec["type"]:
+                    raise Refused("Invalid", f"{key} takes {spec['type']}, not {got}")
+                if self.store.set(key, value):
+                    spec = self.store.keys[key]
+                    log(f"{key} set by uid {uid}")
+                    self.bus.emit_signal(None, PATH, IFACE, "Changed",
+                                         GLib.Variant("(sv)", (key, GLib.Variant(spec["type"], self.store.get(key)))))
+                inv.return_value(None)
+            else:
+                inv.return_dbus_error(f"{ERR}.UnknownMethod", method)
+        except Refused as err:
+            inv.return_dbus_error(f"{ERR}.{err.kind}", str(err))
+        except OSError as err:
+            log(f"store write failed: {err}")
+            inv.return_dbus_error(f"{ERR}.Failed", f"store write failed: {err.strerror}")
+        except Exception as err:
+            log(f"{method} failed: {err!r}")
+            inv.return_dbus_error(f"{ERR}.Failed", f"{method} failed")
+
+
+def main():
+    keys = load_schema()
+    store = Store(keys)
+    loop = GLib.MainLoop()
+    if BUS == "system":
+        bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+    elif BUS == "session":
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    else:
+        bus = Gio.DBusConnection.new_for_address_sync(
+            BUS, Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION,
+            None, None)
+    Service(bus, store)
+    failed = []
+
+    def lost(conn, name):
+        log(f"lost or could not own {name}")
+        failed.append(name)
+        loop.quit()
+
+    Gio.bus_own_name_on_connection(bus, NAME, Gio.BusNameOwnerFlags.NONE, None, lost)
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, 15, loop.quit)
+    log(f"{len(keys)} keys from {SCHEMAS}, store {STORE}")
+    loop.run()
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

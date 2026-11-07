@@ -1,0 +1,7 @@
+[Unit]
+Description=Test session A
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/foot --app-id=blockie.test-a --title=test-a

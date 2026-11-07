@@ -1,0 +1,9 @@
+[Unit]
+Description=Switch when a session is wanted
+
+[Path]
+PathExists=/run/blockie/session/session-pending
+Unit=blockie-session-switcher.service
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,423 @@
+#!/usr/bin/env bash
+
+me=blockie-session
+root=${BLOCKIE_ROOT:-}
+rundir=${BLOCKIE_RUNDIR:-/run/blockie/session}
+statedir=${BLOCKIE_STATEDIR:-/var/lib/blockie/session}
+user=${BLOCKIE_SESSION_USER:-blockie}
+display=${BLOCKIE_WAYLAND_DISPLAY:-wayland-0}
+fallback=${BLOCKIE_SESSION_FALLBACK:-emulation}
+step=${BLOCKIE_SESSION_STEP:-0.2}
+t_lock=${BLOCKIE_SESSION_LOCK_WAIT:-20}
+t_start=${BLOCKIE_SESSION_START_WAIT:-20}
+t_stop=${BLOCKIE_SESSION_STOP_WAIT:-20}
+t_check=${BLOCKIE_SESSION_CHECK_WAIT:-1}
+uptime=${BLOCKIE_UPTIME:-/proc/uptime}
+dirs=("$root/etc/blockie/sessions.d" "$root/usr/lib/blockie/sessions.d")
+units=("$root/etc/systemd/user" "$root/usr/lib/systemd/user")
+namere='^[a-z0-9][a-z0-9-]*$'
+appre='^[A-Za-z0-9][A-Za-z0-9._-]*$'
+
+log() { echo "$me: $*" >&2; }
+
+usage() {
+  echo "usage: $me list | current | get-default | set-default <name> | switch <name> | request <name> [reason] | switcher | next | back | boot | menu <from> | install <name>" >&2
+  exit 2
+}
+
+boottime_us() {
+  local up=0
+  read -r up _ < "$uptime" 2> /dev/null || up=0
+  [[ $up =~ ^[0-9]+\.[0-9]{2}$ ]] || up=0.00
+  echo $(( 10#${up/./} * 10000 ))
+}
+
+trim() {
+  local s=$1
+  s=${s#"${s%%[![:space:]]*}"}
+  printf '%s' "${s%"${s##*[![:space:]]}"}"
+}
+
+plain() { [[ $1 == ?*"$2" && $1 != */* && $1 != .* ]]; }
+
+conf() {
+  local d
+  for d in "${dirs[@]}"; do
+    [[ -f $d/$1.conf ]] && { echo "$d/$1.conf"; return 0; }
+  done
+  return 1
+}
+
+unit_file() {
+  local d
+  for d in "${units[@]}"; do
+    [[ -f $d/$1 ]] && return 0
+    [[ $1 == ?*@?*.service && -f $d/${1%%@*}@.service ]] && return 0
+  done
+  return 1
+}
+
+load() {
+  local f line k v
+  LABEL="" UNIT="" APP_ID="" FOCUS="" SLICE="" DEFAULT="" BACKGROUND="" CHECK="" INSTALL=""
+  [[ $1 =~ $namere ]] && f=$(conf "$1") || return 1
+  while IFS= read -r line || [[ -n $line ]]; do
+    line=$(trim "$line")
+    [[ $line == \#* || $line != ?*=* ]] && continue
+    k=$(trim "${line%%=*}")
+    v=$(trim "${line#*=}")
+    if (( ${#v} >= 2 )) && [[ ${v:0:1} == [\"\'] && ${v: -1} == "${v:0:1}" ]]; then
+      v=${v:1:-1}
+    fi
+    case $k in
+      LABEL | UNIT | APP_ID | FOCUS | SLICE | DEFAULT | BACKGROUND | CHECK | INSTALL) printf -v "$k" '%s' "$v" ;;
+    esac
+  done < "$f"
+  BACKGROUND=${BACKGROUND:-freeze}
+  [[ $UNIT == blockie-?*.service ]] && plain "$UNIT" .service && unit_file "$UNIT" || return 1
+  [[ $APP_ID =~ $appre ]] || return 1
+  for k in $FOCUS; do
+    [[ $k =~ $appre ]] || return 1
+  done
+  [[ -z $SLICE || $SLICE == blockie-?*.slice ]] && { [[ -z $SLICE ]] || plain "$SLICE" .slice; } || return 1
+  [[ $BACKGROUND == freeze || $BACKGROUND == stop || $BACKGROUND == run ]] || return 1
+  [[ -z $DEFAULT || $DEFAULT == yes || $DEFAULT == no ]] || return 1
+  [[ -z $CHECK || ($CHECK == /usr/* && $CHECK != *..*) ]] && [[ -z $INSTALL || ($INSTALL == /usr/* && $INSTALL != *..*) ]]
+}
+
+names() {
+  local d f n
+  for d in "${dirs[@]}"; do
+    for f in "$d"/*.conf; do
+      [[ -f $f ]] || continue
+      n=${f##*/}
+      echo "${n%.conf}"
+    done
+  done | LC_ALL=C sort -u
+}
+
+list() {
+  local n
+  for n in $(names); do
+    load "$n" || continue
+    printf '%s\t%s\t%s\n' "$n" "${LABEL:-$n}" "$([[ $DEFAULT == yes ]] && echo yes || echo no)"
+  done
+}
+
+check_state() {
+  local rc=0
+  [[ -n $CHECK ]] || { echo available; return; }
+  timeout -k 1 "$t_check" "$root$CHECK" < /dev/null > /dev/null || rc=$?
+  case $rc in
+    0) echo available ;;
+    1) echo not-installed ;;
+    2) echo refused ;;
+    *) log "check of $1 exited $rc, taking it as available"; echo available ;;
+  esac
+}
+
+menu() {
+  local n label
+  [[ $1 =~ $namere ]] || usage
+  for n in $(names); do
+    load "$n" || continue
+    label=${LABEL:-$n}
+    if [[ $label == *[[:cntrl:]]* ]]; then
+      log "label of $n holds a control character, skipped"
+      continue
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\n' "$n" "$label" "$(check_state "$n")" "$([[ -n $INSTALL ]] && echo yes || echo no)" \
+      "$([[ $n == "$1" ]] && echo current || echo other)"
+  done
+}
+
+install_action() {
+  load "$1" && [[ -n $INSTALL ]] || exit 2
+  exec "$root$INSTALL"
+}
+
+get_default() {
+  local d
+  d=$(timeout 5 blockie-set get session.default 2> /dev/null) || d=""
+  if load "$d" && [[ $DEFAULT == yes ]]; then
+    echo "$d"
+    return 0
+  fi
+  if load "$fallback"; then
+    echo "$fallback"
+    return 0
+  fi
+  for d in $(names); do
+    load "$d" && [[ $DEFAULT == yes ]] && { echo "$d"; return 0; }
+  done
+  return 1
+}
+
+read_current() {
+  cur_name="" cur_unit="" cur_serial=""
+  if [[ -f $rundir/session-current ]]; then
+    read -r cur_name cur_unit cur_serial < "$rundir/session-current" || true
+  fi
+  [[ $cur_serial =~ ^[0-9]+$ ]] || cur_serial=0
+}
+
+new_serial() {
+  local s c=0
+  s=$(boottime_us)
+  if [[ -f $rundir/session-current ]]; then
+    read -r _ _ c < "$rundir/session-current" || true
+  fi
+  if [[ $c =~ ^[0-9]+$ ]] && (( s <= c )); then
+    s=$(( c + 1 ))
+  fi
+  echo "$s"
+}
+
+put() {
+  local f=$1 t
+  shift
+  t=$(mktemp "${f%/*}/.${f##*/}.XXXXXX") || return 1
+  if ! { printf '%s\n' "$@" > "$t" && chmod 0644 "$t" && mv -fT "$t" "$f"; }; then
+    rm -f "$t"
+    return 1
+  fi
+}
+
+lockfile() {
+  [[ -e $1 || -L $1 ]] || put "$1"
+}
+
+ids() {
+  uid=$(id -u "$user") && gid=$(id -g "$user") || return 1
+  home=$(getent passwd "$user" | cut -d: -f6)
+}
+
+as_user() {
+  if [[ $(id -u) == "$uid" ]]; then
+    env XDG_RUNTIME_DIR="/run/user/$uid" WAYLAND_DISPLAY="$display" "$@" < /dev/null
+  else
+    setpriv --reuid="$uid" --regid="$gid" --init-groups --no-new-privs env -i PATH="$PATH" HOME="$home" \
+      XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+      WAYLAND_DISPLAY="$display" "$@" < /dev/null
+  fi
+}
+
+prop() { as_user systemctl --user show -p "$2" --value "$1" 2> /dev/null; }
+
+active() { [[ $(prop "$1" ActiveState) =~ ^(active|reloading)$ ]]; }
+
+inactive() { [[ $(prop "$1" ActiveState) =~ ^(inactive|failed)$ ]]; }
+
+thawed() { [[ $(prop "$1" FreezerState) == running ]]; }
+
+within() {
+  local t=$1 n i=0
+  shift
+  n=$(awk -v t="$t" -v s="$step" 'BEGIN { printf "%d", t / s }')
+  until "$@"; do
+    (( i < n )) || return 1
+    i=$(( i + 1 ))
+    sleep "$step"
+  done
+}
+
+window() { as_user timeout "$t_start" wlrctl toplevel waitfor "app_id:$1" > /dev/null 2>&1; }
+
+has_window() { as_user wlrctl toplevel find "app_id:$1" > /dev/null 2>&1; }
+
+focus() {
+  local a
+  for a in $2; do
+    if has_window "$a"; then
+      as_user wlrctl toplevel focus "app_id:$a" > /dev/null 2>&1 && return 0
+    fi
+  done
+  as_user wlrctl toplevel focus "app_id:$1" > /dev/null 2>&1 || log "focus of $1 failed"
+}
+
+minimize() {
+  local a
+  for a in $2; do
+    as_user wlrctl toplevel minimize "app_id:$a" > /dev/null 2>&1 || true
+  done
+  as_user wlrctl toplevel minimize "app_id:$1" > /dev/null 2>&1 || log "minimize of $1 failed"
+}
+
+wake() {
+  if ! thawed "$1"; then
+    as_user systemctl --user thaw "$1" || log "thaw of $1 failed"
+  fi
+}
+
+frozen_unit() {
+  if [[ -n $2 ]] && active "$2"; then
+    echo "$2"
+  else
+    echo "$1"
+  fi
+}
+
+park() {
+  local unit=$1 app=$2 bg=$3 extra=$4 slice=$5 f
+  case $bg in
+    freeze)
+      minimize "$app" "$extra"
+      f=$(frozen_unit "$unit" "$slice")
+      as_user systemctl --user freeze "$f" || log "freeze of $f failed"
+      ;;
+    stop)
+      as_user systemctl --user stop --no-block "$unit" || log "stop of $unit failed"
+      within "$t_stop" inactive "$unit" || log "$unit still running after stop"
+      ;;
+    run) minimize "$app" "$extra" ;;
+  esac
+}
+
+source_back() {
+  [[ -n $s_unit ]] || return 0
+  wake "$(frozen_unit "$s_unit" "$s_slice")"
+  if active "$s_unit"; then
+    focus "$s_app" "$s_focus"
+    log "back on $s_name"
+  else
+    log "$s_name is not running either"
+  fi
+}
+
+switch_once() {
+  local want=$1 t_unit t_app t_focus t_slice serial
+  s_name="" s_unit="" s_app="" s_bg="" s_focus="" s_slice=""
+  load "$want" || { log "$want is not a listed session"; return 1; }
+  t_unit=$UNIT t_app=$APP_ID t_focus=$FOCUS t_slice=$SLICE
+  read_current
+  if [[ -n $cur_name && $cur_name != "$want" ]] && load "$cur_name" && [[ $UNIT == "$cur_unit" ]]; then
+    s_name=$cur_name s_unit=$UNIT s_app=$APP_ID s_bg=$BACKGROUND s_focus=$FOCUS s_slice=$SLICE
+  fi
+  if [[ $cur_name == "$want" ]] && active "$t_unit" && thawed "$(frozen_unit "$t_unit" "$t_slice")"; then
+    focus "$t_app" "$t_focus"
+    log "$want is current"
+    return 0
+  fi
+  wake "$(frozen_unit "$t_unit" "$t_slice")"
+  if ! active "$t_unit"; then
+    as_user systemctl --user start --no-block "$t_unit" || { log "start of $t_unit failed"; source_back; return 1; }
+  fi
+  if ! within "$t_start" active "$t_unit"; then
+    log "$t_unit is not active after $t_start s"
+    source_back
+    return 1
+  fi
+  if ! window "$t_app"; then
+    log "no window of $t_app after $t_start s"
+    source_back
+    return 1
+  fi
+  focus "$t_app" "$t_focus"
+  serial=$(new_serial)
+  put "$rundir/session-current" "$want $t_unit $serial" || log "cannot write session-current"
+  put "$statedir/last" "$want" || log "cannot write $statedir/last"
+  [[ -z $s_unit ]] || park "$s_unit" "$s_app" "$s_bg" "$s_focus" "$s_slice"
+  log "switched to $want${s_name:+ from $s_name}"
+}
+
+request() {
+  local want=$1 why=${2:-requested}
+  [[ $(id -u) == 0 ]] || { log "request runs as root, start blockie-session-switch@$want.service"; exit 2; }
+  [[ $want =~ $namere && $why =~ $namere ]] || usage
+  load "$want" || { log "$want is not a listed session"; exit 1; }
+  install -d -m 0755 "$rundir"
+  put "$rundir/session-wanted" "$want $why" || exit 1
+  put "$rundir/session-pending" "$want" || exit 1
+}
+
+switcher() {
+  local i=0 want why rc=0
+  [[ $(id -u) == 0 ]] || { log "switcher runs as root"; exit 2; }
+  ids || { log "no user $user"; exit 1; }
+  install -d -m 0755 "$rundir" "$statedir"
+  install -d -m 0700 "$rundir/lock"
+  lockfile "$rundir/lock/session.lock"
+  exec 9< "$rundir/lock/session.lock"
+  flock -w "$t_lock" 9 || { log "session lock busy"; exit 75; }
+  while [[ -e $rundir/session-pending ]]; do
+    if (( i >= 3 )); then
+      log "3 switches in this run, the next run takes the rest"
+      break
+    fi
+    i=$(( i + 1 ))
+    rm -f "$rundir/session-pending"
+    want="" why=""
+    read -r want why < "$rundir/session-wanted" || true
+    switch_once "$want" || rc=1
+  done
+  return "$rc"
+}
+
+switch() {
+  load "$1" || { log "$1 is not a listed session"; exit 1; }
+  if [[ $(id -u) == 0 ]]; then
+    request "$1" requested
+  else
+    exec systemctl start --no-block "blockie-session-switch@$1.service"
+  fi
+}
+
+next() {
+  local n first="" pick="" seen=0
+  read_current
+  for n in $(names); do
+    load "$n" || continue
+    [[ -n $first ]] || first=$n
+    if (( seen )); then
+      pick=$n
+      break
+    fi
+    [[ $n != "$cur_name" ]] || seen=1
+  done
+  pick=${pick:-$first}
+  [[ -n $pick ]] || { log "no listed session"; exit 1; }
+  [[ $pick != "$cur_name" ]] || { log "$pick is the only session"; exit 0; }
+  switch "$pick"
+}
+
+back() {
+  local t
+  t=$(get_default) || { log "no default session"; exit 1; }
+  read_current
+  [[ $t != "$cur_name" ]] || { log "back: $t is current"; exit 0; }
+  switch "$t"
+}
+
+boot() {
+  local t
+  t=$(get_default) || { log "no default session"; exit 1; }
+  switch "$t"
+}
+
+main() {
+  case ${1:-} in
+    list) (( $# == 1 )) || usage; list ;;
+    current)
+      (( $# == 1 )) || usage
+      read_current
+      [[ -n $cur_name ]] || exit 1
+      echo "$cur_name"
+      ;;
+    get-default) (( $# == 1 )) || usage; get_default ;;
+    set-default) (( $# == 2 )) && [[ $2 =~ $namere ]] || usage; exec blockie-set set session.default "$2" ;;
+    switch) (( $# == 2 )) && [[ $2 =~ $namere ]] || usage; switch "$2" ;;
+    request) (( $# == 2 || $# == 3 )) || usage; request "$2" "${3:-requested}" ;;
+    switcher) (( $# == 1 )) || usage; switcher ;;
+    next) (( $# == 1 )) || usage; next ;;
+    back) (( $# == 1 )) || usage; back ;;
+    boot) (( $# == 1 )) || usage; boot ;;
+    menu) (( $# == 2 )) || usage; menu "$2" ;;
+    install) (( $# == 2 )) || usage; install_action "$2" ;;
+    *) usage ;;
+  esac
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  set -euo pipefail
+  main "$@"
+fi

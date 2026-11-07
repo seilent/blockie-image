@@ -19,6 +19,16 @@ if (( ${#units[@]} )); then
   systemctl preset "${units[@]}"
 fi
 
+units=()
+for u in /usr/lib/systemd/user/blockie-*; do
+  if [[ -f $u ]] && grep -q '^\[Install\]' "$u"; then
+    units+=("${u##*/}")
+  fi
+done
+if (( ${#units[@]} )); then
+  systemctl --global preset "${units[@]}"
+fi
+
 systemctl mask \
   systemd-oomd.service \
   systemd-oomd.socket \
