@@ -31,3 +31,6 @@ component licences under /usr/share/licenses/libretro-ppsspp/), built unchanged 
 with FFmpeg (https://github.com/FFmpeg/FFmpeg, n7.1.5 3a0867c, LGPL-2.1-or-later) built with only the PSP decoders.
 SFMT-LICENSE.txt is SFMT's LICENSE.txt (https://github.com/MersenneTwister-Lab/SFMT, d69c917), which the vendored
 ext/sfmt19937 refers to.
+packages/libretro-flycast: Flycast (https://github.com/flyinghead/flycast, v2.7 5aa091f, GPL-2.0-or-later with the
+component licences under /usr/share/licenses/libretro-flycast/), built as the libretro core with the version string
+set to v2.7. md5-LICENSE is the LICENSE of https://github.com/ulwanski/md5 (bca18c2), where core/deps/md5 comes from.
