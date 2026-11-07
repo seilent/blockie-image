@@ -9,7 +9,9 @@ rpms=("$out"/blockie-frontend-*.rpm)
 (( ${#rpms[@]} == 1 )) || fail "expected one blockie-frontend RPM, found ${#rpms[@]}"
 [[ $(rpm -qp --qf '%{NAME} %{ARCH}' "${rpms[0]}") == "blockie-frontend aarch64" ]] || fail "name or arch"
 lic=/usr/share/licenses/blockie-frontend
-want=$(printf '%s\n' /usr/libexec/blockie/blockie-frontend /usr/lib/systemd/user/blockie-frontend.service "$lic" "$lic/LICENSE" "$lic/fribidi-COPYING" "$lic/harfbuzz-COPYING" \
+fonts=/usr/share/blockie/fonts
+want=$(printf '%s\n' /usr/libexec/blockie/blockie-frontend /usr/lib/systemd/user/blockie-frontend.service "$fonts" \
+  "$fonts/selawk.ttf" "$fonts/selawkb.ttf" "$fonts/selawkl.ttf" "$fonts/selawksl.ttf" "$lic/Selawik-LICENSE.txt" "$lic/sqlite-NOTICE" "$lic" "$lic/LICENSE" "$lic/fribidi-COPYING" "$lic/harfbuzz-COPYING" \
   "$lic/libspng-LICENSE" "$lic/qrcodegen.h" "$lic/stb_truetype.h" "$lic/zlib-LICENSE" | LC_ALL=C sort)
 [[ $(rpm -qpl "${rpms[0]}" | LC_ALL=C sort) == "$want" ]] || fail "file list: $(rpm -qpl "${rpms[0]}" | tr '\n' ' ')"
 t=$(mktemp -d)
@@ -37,4 +39,7 @@ grep -Eq ' __[A-Za-z0-9_]+_chk(@| |$)' <<< "$syms" || fail "blockie-frontend has
 grep -q 'Additional permission under GNU GPL version 3 section 7' "$t$lic/LICENSE" || fail "LICENSE lacks the additional permission"
 reqs=$(rpm -qpR "${rpms[0]}")
 grep -q '^libwayland-client\.so' <<< "$reqs" || fail "no libwayland-client requirement"
+grep -q '^libxkbcommon\.so' <<< "$reqs" || fail "no libxkbcommon requirement"
+grep -q 'SIL Open Font License, Version 1.1' "$t$lic/Selawik-LICENSE.txt" || fail "Selawik-LICENSE.txt is not the OFL"
+grep -q 'here is a blessing' "$t$lic/sqlite-NOTICE" || fail "sqlite-NOTICE lacks the blessing"
 echo "pkg-blockie-frontend: ok"
