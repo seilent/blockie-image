@@ -65,6 +65,18 @@ done
 rpm -q e2fsprogs erofs-utils vulkan-tools egl-utils drm-utils strace file procps-ng jq libwayland-client \
   libwayland-server NetworkManager-wifi wpa_supplicant iw wireless-regdb iperf3 bluez alsa-ucm alsa-ucm-utils \
   alsa-utils retroarch libretro-mgba libretro-pcsx-rearmed kmscube glmark2 > /dev/null || fail "packages missing"
+for id in gambatte nestopia mgba pcsx_rearmed snes9x genesis_plus_gx mupen64plus_next ppsspp flycast; do
+  so=/usr/lib64/libretro/${id}_libretro.so
+  pkg=libretro-${id//_/-}
+  [[ -f $so && $(head -c 4 "$so") == $'\x7fELF' ]] || fail "$so is missing or not an ELF"
+  [[ $(rpm -qf --qf '%{NAME}' "$so") == "$pkg" ]] || fail "$so is not from $pkg"
+  grep -qv '^(contains no files)$' <<< "$(rpm -qL "$pkg")" || fail "$pkg ships no licence text"
+done
+[[ -x /usr/bin/blockie-game && -f /usr/share/blockie/retroarch/blockie.cfg ]] || fail "blockie-game or its base config missing"
+[[ $(rpm -q --qf '%{RELEASE}' retroarch) == *.blockie ]] || fail "retroarch is not the blockie GLES build: $(rpm -q retroarch)"
+features=$(retroarch --features)
+grep -qxF '  OpenGLES        - Video driver: yes' <<< "$features" || fail "retroarch has no GLES video driver"
+[[ $(rpm -qa --qf '%{NAME}\n' 'retroarch*') == retroarch ]] || fail "a Fedora retroarch subpackage is installed: $(rpm -qa 'retroarch*' | tr '\n' ' ')"
 [[ -f /usr/lib/firmware/regulatory.db ]] || fail "regulatory.db missing"
 
 jq -e '. == {

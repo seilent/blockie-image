@@ -5,6 +5,10 @@ install -d /etc/dnf/libdnf5.conf.d
 printf '[main]\ninstall_weak_deps=False\n' > /etc/dnf/libdnf5.conf.d/10-blockie.conf
 
 own=(blk-wmt/blk-wmt blk-bt/blk-bt blockie-tools/blockie-tools blockie-gpu/blockie-gpu blockie-compositor/blockie-compositor blockie-frontend/blockie-frontend bootc/bootc ostree/ostree ostree/ostree-libs)
+for c in snes9x genesis-plus-gx mupen64plus-next ppsspp flycast; do
+  own+=("libretro-$c/libretro-$c")
+done
+own+=(retroarch/retroarch)
 
 own_rpm() {
   local dir=/pkgs/${1%%/*} name=${1#*/} f found=()
@@ -57,6 +61,7 @@ dnf -y "${opts[@]}" install \
   kmscube \
   glmark2 \
   labwc \
-  retroarch \
   libretro-mgba \
-  libretro-pcsx-rearmed
+  libretro-pcsx-rearmed \
+  libretro-gambatte \
+  libretro-nestopia
