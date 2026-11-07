@@ -18,3 +18,6 @@ rebuilt with selinux-disabled-skip.patch.
 packages/libretro-snes9x: Snes9x (https://github.com/libretro/snes9x, fae2fea, the Snes9x licence: non commercial
 use, with LGPL-2.1-or-later and MIT components; the texts under /usr/share/licenses/libretro-snes9x/), built unchanged
 as the libretro core.
+packages/libretro-genesis-plus-gx: Genesis Plus GX (https://github.com/libretro/Genesis-Plus-GX, f27655b, its own
+non commercial licence with LGPL-2.1-or-later and other component licences; the texts under
+/usr/share/licenses/libretro-genesis-plus-gx/), built unchanged as the libretro core.
