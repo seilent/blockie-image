@@ -2,7 +2,7 @@
 
 me=blockie-session
 root=${BLOCKIE_ROOT:-}
-rundir=${BLOCKIE_RUNDIR:-/run/blockie/session}
+rundir=${BLOCKIE_RUNDIR:-/run/blockie-session}
 statedir=${BLOCKIE_STATEDIR:-/var/lib/blockie/session}
 user=${BLOCKIE_SESSION_USER:-blockie}
 display=${BLOCKIE_WAYLAND_DISPLAY:-wayland-0}

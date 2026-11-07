@@ -268,6 +268,17 @@ exec 8>&-
 [[ $r == 75 ]] && grep -q 'session lock busy' "$t/out"
 res $? "a held session lock: switcher exits 75"
 
+sf=${bin%/usr/bin/blockie-session}
+run=/run/blockie-session
+grep -qxF "rundir=\${BLOCKIE_RUNDIR:-$run}" "$bin" &&
+  grep -qxF "d $run 0755 root root -" "$sf/usr/lib/tmpfiles.d/blockie.conf" &&
+  grep -qxF "PathExists=$run/session-pending" "$sf/usr/lib/systemd/system/blockie-session-switcher.path" &&
+  grep -q "^ReadWritePaths=$run\( \|$\)" "$sf/usr/lib/systemd/system/blockie-session-switcher.service" &&
+  grep -q "^ReadWritePaths=$run\( \|$\)" "$sf/usr/lib/systemd/system/blockie-session-switch@.service" &&
+  grep -qF "\"$run/session-current\"" "$sf/usr/libexec/blockie/blockie-hotkeyd" &&
+  ! grep -qs "/run/blockie/" "$bin" "$sf/usr/lib/systemd/system"/blockie-session-* "$sf/usr/libexec/blockie/blockie-hotkeyd"
+res $? "the runtime dir is $run everywhere, nothing in the init's /run/blockie"
+
 if (( fails )); then
   echo "session: $fails failed"
   exit 1
