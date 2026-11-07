@@ -1,0 +1,12 @@
+FROM localhost/blockie-pkg-builder
+
+COPY SOURCE.env /tmp/retroarch/
+RUN . /tmp/retroarch/SOURCE.env \
+ && srpm=/srpm/${SRPM_URL##*/} \
+ && install -d /srpm \
+ && curl -fsSL --retry 3 -o "$srpm" "$SRPM_URL" \
+ && echo "$SRPM_SHA256  $srpm" | sha256sum -c - \
+ && dnf -y --setopt=install_weak_deps=False builddep "$srpm" \
+ && dnf -y --setopt=install_weak_deps=False install 'pkgconfig(glesv2)' \
+ && dnf clean all \
+ && rm -rf /tmp/retroarch
