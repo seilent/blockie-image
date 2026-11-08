@@ -38,6 +38,7 @@ done
 ! grep -q '/sys/kernel/debug' "$lib/tools/helpers/lxc.py" || fail "lxc.py still binds debugfs"
 grep -q '"/dev/dma_heap/\*"' "$lib/tools/helpers/lxc.py" || fail "lxc.py no longer binds the dma_heap nodes"
 ! grep -q 'context=' "$lib/tools/helpers/mount.py" || fail "mount.py sets an SELinux context"
+! grep -qE '/vendor/lib(64)?/egl|odm_extra' "$lib/tools/helpers/images.py" || fail "images.py binds the host vendor egl or odm dirs into the guest"
 grep -q '^lxc.seccomp.profile' "$lib/data/configs/config_3" && ! grep -q apparmor "$lib/data/configs/config_3" || fail "config_3 is not Fedora's"
 net=$lib/data/scripts/waydroid-net.sh
 sh -n "$net" || fail "waydroid-net.sh does not parse"

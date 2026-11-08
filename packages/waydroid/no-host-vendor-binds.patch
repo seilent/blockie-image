@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: seilent <github@seilent.net>
+Date: Sun, 8 Nov 2026 22:40:00 +0900
+Subject: [PATCH] images: do not bind the host vendor egl and odm dirs into the
+ guest
+
+---
+ tools/helpers/images.py | 12 ------------
+ 1 file changed, 12 deletions(-)
+
+diff --git a/tools/helpers/images.py b/tools/helpers/images.py
+index 36bd09b..ee5b237 100644
+--- a/tools/helpers/images.py
++++ b/tools/helpers/images.py
+@@ -184,18 +184,6 @@ def mount_rootfs(args, images_dir, session):
+                                     upper_dir=tools.config.defaults["overlay_rw"] + "/vendor",
+                                     work_dir=tools.config.defaults["overlay_work"] + "/vendor")
+ 
+-    for egl_path in ["/vendor/lib/egl", "/vendor/lib64/egl"]:
+-        if os.path.isdir(egl_path):
+-            helpers.mount.bind(
+-                args, egl_path, tools.config.defaults["rootfs"] + egl_path)
+-    if helpers.mount.ismount("/odm"):
+-        helpers.mount.bind(
+-            args, "/odm", tools.config.defaults["rootfs"] + "/odm_extra")
+-    else:
+-        if os.path.isdir("/vendor/odm"):
+-            helpers.mount.bind(
+-                args, "/vendor/odm", tools.config.defaults["rootfs"] + "/odm_extra")
+-
+     make_prop(args, session, args.work + "/waydroid.prop")
+     helpers.mount.bind_file(args, args.work + "/waydroid.prop",
+                             tools.config.defaults["rootfs"] + "/vendor/waydroid.prop")

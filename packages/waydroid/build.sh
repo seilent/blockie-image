@@ -12,7 +12,7 @@ top=/var/tmp/waydroid-build
 mkdir -p "$top"
 rpm -i --define "_topdir $top" "$srpm"
 patches=(namespaces-includes.patch no-debugfs-bind.patch net-filter-ipforward.patch lxc-debug-log.patch container-session.patch
-  dbus-policy.patch)
+  dbus-policy.patch no-host-vendor-binds.patch)
 for p in "${patches[@]}"; do
   cp "$src/$p" "$top/SOURCES/"
 done
@@ -25,6 +25,7 @@ sed -i -e 's/^\(Release: *1%{?dist}\)$/\1.blockie/' \
   -e '/^Patch2: *no-apparmor\.patch$/a Patch6:         lxc-debug-log.patch' \
   -e '/^Patch2: *no-apparmor\.patch$/a Patch7:         container-session.patch' \
   -e '/^Patch2: *no-apparmor\.patch$/a Patch8:         dbus-policy.patch' \
+  -e '/^Patch2: *no-apparmor\.patch$/a Patch9:         no-host-vendor-binds.patch' \
   -e '/^Requires: *gtk3$/d' \
   -e '/^Requires: *nftables$/d' \
   -e '/^Requires: *(%{name}-selinux = %{version}-%{release} if selinux-policy-%{selinuxtype})$/d' \
@@ -41,6 +42,7 @@ check 'Patch5: *net-filter-ipforward\.patch' "Patch5 not added"
 check 'Patch6: *lxc-debug-log\.patch' "Patch6 not added"
 check 'Patch7: *container-session\.patch' "Patch7 not added"
 check 'Patch8: *dbus-policy\.patch' "Patch8 not added"
+check 'Patch9: *no-host-vendor-binds\.patch' "Patch9 not added"
 check 'Requires: *iptables-legacy' "iptables-legacy not required"
 check '%make_install .* USE_DBUS_ACTIVATION=0 .*' "D-Bus activation not turned off"
 absent '^Patch1:' "mount-secontext.patch still applied"
