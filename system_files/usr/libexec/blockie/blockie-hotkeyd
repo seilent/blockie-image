@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import errno
 import glob
 import os
 import re
@@ -20,6 +21,10 @@ DRY = os.environ.get("BLOCKIE_HOTKEYD_DRY") == "1"
 SYSFS = os.environ.get("BLOCKIE_HOTKEYD_SYSFS", "/sys")
 LONG_MS = int(os.environ.get("BLOCKIE_HOTKEYD_LONG_MS", "1000"))
 HOOK_MS = int(os.environ.get("BLOCKIE_HOTKEYD_HOOK_MS", "5000"))
+RUNNER = os.environ.get("BLOCKIE_HOTKEYD_HOOK_RUNNER", "/usr/libexec/blockie/blockie-hook")
+PART_MS = int(os.environ.get("BLOCKIE_HOTKEYD_PART_MS", "1000"))
+GRAB_RETRY_MS = int(os.environ.get("BLOCKIE_HOTKEYD_GRAB_RETRY_MS", "250"))
+SWITCHER_HOOK_MS = int(os.environ.get("BLOCKIE_HOTKEYD_SWITCHER_HOOK_MS", "1500"))
 BACKSTOP_MS = int(os.environ.get("BLOCKIE_HOTKEYD_BACKSTOP_MS", "35000"))
 SLEEP = os.environ.get("BLOCKIE_HOTKEYD_SLEEP", "/usr/libexec/blockie/blockie-sleep")
 SLEPT = os.environ.get("BLOCKIE_HOTKEYD_SLEPT")
@@ -211,12 +216,16 @@ class Hotkeyd:
         self.keys = {k: Key() for k in KEYS}
         self.devices = {}
         self.ignored = {}
-        self.missing_hooks = set()
+        self.missing_hooks = {"switcher-open"}
         self.bus = None
         self.wanted = "awake"
         self.applied = "unknown"
         self.busy = False
         self.kill_timer = 0
+        self.opening = False
+        self.open_timer = 0
+        self.regrab = {}
+        self.regrab_timer = 0
         self.retry = 1
         self.pending = None
         self.started = None
@@ -266,11 +275,24 @@ class Hotkeyd:
             log(f"no hook {name} in {':'.join(HOOKS)}")
         return None
 
+    def spawn(self, name, ms):
+        if not any(os.path.isdir(os.path.join(d, f"{name}.d")) for d in HOOKS):
+            path = self.find_hook(name)
+            return (self.run([path]) if path else None), path is not None, ms
+        try:
+            launcher = Gio.SubprocessLauncher.new(Gio.SubprocessFlags.STDIN_INHERIT)
+            launcher.setenv("BLOCKIE_HOOK_DIRS", ":".join(HOOKS), True)
+            launcher.setenv("BLOCKIE_HOOK_MS", str(ms), True)
+            launcher.setenv("BLOCKIE_HOOK_PART_MS", str(PART_MS), True)
+            return launcher.spawnv([RUNNER, name]), True, ms + PART_MS + 1000
+        except GLib.Error as err:
+            log(f"cannot run {RUNNER}: {err.message}")
+            return None, True, 0
+
     def hook(self, name):
-        path = self.find_hook(name)
-        p = self.run([path]) if path else None
+        p, _, ms = self.spawn(name, HOOK_MS)
         if p is not None:
-            GLib.timeout_add(HOOK_MS, lambda: p.force_exit() or False)
+            GLib.timeout_add(ms, lambda: p.force_exit() or False)
 
     def want(self, state):
         self.wanted = state
@@ -295,14 +317,13 @@ class Hotkeyd:
             if DRY:
                 self.applied = state
             else:
-                path = self.find_hook(DISPLAY[state])
-                p = self.run([path]) if path else None
+                p, found, ms = self.spawn(DISPLAY[state], HOOK_MS)
                 if p is not None:
                     self.busy = True
-                    self.kill_timer = GLib.timeout_add(HOOK_MS, self.kill, p)
+                    self.kill_timer = GLib.timeout_add(ms, self.kill, p)
                     p.wait_async(None, self.hook_done, state)
                     return
-                self.applied = state if path is None else "unknown"
+                self.applied = "unknown" if found else state
         self.start_pending()
 
     def start_pending(self):
@@ -360,6 +381,9 @@ class Hotkeyd:
         self.busy = False
         if p.get_if_exited() and p.get_exit_status() == 0:
             self.applied = state
+            timer = self.regrab_timer
+            if state == "blanked" and timer and not self.regrab_tick():
+                GLib.source_remove(timer)
         else:
             self.applied = "unknown"
             log(f"{DISPLAY[state]}: " + (f"exit {p.get_exit_status()}" if p.get_if_exited() else "killed")
@@ -391,11 +415,50 @@ class Hotkeyd:
             self.started = None
             self.want("lit-frozen")
 
-    def grab(self, dev):
+    def grab(self, dev, path):
         try:
             dev.grab()
         except OSError as err:
-            log(f"{dev.path}: grab: {err.strerror}")
+            if path not in self.regrab:
+                log(f"{path}: grab: {err.strerror}")
+            self.regrab[path] = dev
+            if not self.regrab_timer:
+                self.regrab_timer = GLib.timeout_add(GRAB_RETRY_MS, self.regrab_tick)
+            return False
+        return True
+
+    def gone(self, path):
+        del self.regrab[path]
+        if path in self.extra:
+            self.close(self.extra.pop(path)[0])
+            log(f"{path} gone")
+
+    def regrab_tick(self):
+        if not self.grabbed:
+            self.regrab.clear()
+            self.regrab_timer = 0
+            return False
+        for path, dev in list(self.regrab.items()):
+            node = self.devices.get(path, self.extra.get(path, (None,)))[0]
+            if node is not dev:
+                del self.regrab[path]
+                continue
+            real = os.path.realpath(os.path.join(SYSFS, "class/input", os.path.basename(path)))
+            if path in self.extra and self.extra[path][1] != real:
+                self.gone(path)
+                continue
+            try:
+                dev.grab()
+            except OSError as err:
+                if err.errno == errno.ENODEV:
+                    self.gone(path)
+                continue
+            del self.regrab[path]
+            log(f"{path}: grabbed on retry")
+        if self.regrab:
+            return True
+        self.regrab_timer = 0
+        return False
 
     def close(self, dev):
         try:
@@ -424,9 +487,9 @@ class Hotkeyd:
                 dev.close()
                 self.nograb[path] = real
                 continue
-            self.grab(dev)
+            if self.grab(dev, path):
+                log(f"{path} {dev.name}: grabbed while blanked")
             self.extra[path] = (dev, real)
-            log(f"{path} {dev.name}: grabbed while blanked")
 
     def set_grab(self, on):
         if on == self.grabbed:
@@ -435,12 +498,16 @@ class Hotkeyd:
         if DRY:
             print("grab" if on else "ungrab", flush=True)
         if on:
-            for dev, _, _ in self.devices.values():
-                self.grab(dev)
+            for path, (dev, _, _) in self.devices.items():
+                self.grab(dev, path)
             if not INPUT:
                 self.grab_more()
             log(f"blanked: {len(self.devices)} key nodes and {len(self.extra)} more grabbed")
             return
+        if self.regrab_timer:
+            GLib.source_remove(self.regrab_timer)
+            self.regrab_timer = 0
+        self.regrab.clear()
         for dev, _, _ in self.devices.values():
             try:
                 dev.ungrab()
@@ -685,6 +752,36 @@ class Hotkeyd:
     def switcher(self):
         if DRY:
             return
+        if self.opening:
+            log("switcher-open still running: switcher ignored")
+            return
+        p, _, ms = self.spawn("switcher-open", SWITCHER_HOOK_MS)
+        if p is None:
+            self.open_switcher()
+            return
+        self.opening = True
+        self.open_timer = GLib.timeout_add(ms, self.kill_open, p)
+        p.wait_async(None, self.opened, None)
+
+    def kill_open(self, p):
+        self.open_timer = 0
+        p.force_exit()
+        return False
+
+    def opened(self, p, res, _):
+        try:
+            p.wait_finish(res)
+        except GLib.Error as err:
+            log(f"switcher-open: {err.message}")
+        if self.open_timer:
+            GLib.source_remove(self.open_timer)
+            self.open_timer = 0
+        self.opening = False
+        if self.wanted != "awake":
+            return
+        self.open_switcher()
+
+    def open_switcher(self):
         try:
             r = self.session_bus().call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
                                              "NameHasOwner", GLib.Variant("(s)", (SWITCHER[0],)),
@@ -806,7 +903,7 @@ class Hotkeyd:
                                       self.readable, path)
             self.devices[path] = (dev, m, watch)
             if self.grabbed:
-                self.grab(dev)
+                self.grab(dev, path)
             log(f"{path} {dev.name}: {', '.join(sorted(m.values()))}")
         if self.grabbed:
             self.grab_more()
@@ -814,6 +911,7 @@ class Hotkeyd:
 
     def drop(self, path):
         dev, _, watch = self.devices.pop(path)
+        self.regrab.pop(path, None)
         if watch:
             GLib.source_remove(watch)
         try:

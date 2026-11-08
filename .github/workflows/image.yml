@@ -213,6 +213,8 @@ jobs:
           suite env BLOCKIE_ANDROID_ROOT="$PWD/system_files" tests/android.sh polkit
           t=setd-polkit
           suite env SETD_RULES="$PWD/system_files/usr/share/polkit-1/rules.d/50-blockie-timezone.rules" tests/setd.sh polkit
+          t=session-polkit
+          suite env SESSION_RULES="$PWD/system_files/usr/share/polkit-1/rules.d/50-blockie-session.rules" tests/session.sh polkit
           t=setd
           suite podman run --rm -v "$PWD/tests:/tests:ro" "$IMAGE:$TAG" \
             bash -c 'dnf -y -q install dbus-daemon > /dev/null && /tests/setd.sh'

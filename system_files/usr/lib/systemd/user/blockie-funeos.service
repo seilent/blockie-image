@@ -1,0 +1,18 @@
+[Unit]
+Description=funeOS session
+After=pipewire.service wireplumber.service
+
+[Service]
+UnsetEnvironment=LD_LIBRARY_PATH VK_DRIVER_FILES
+Environment=FUNEOS_LIBRARY_ROOT=/var/lib/blockie/data/music
+Environment=FUNEOS_MOUNT_ROOT=/var/lib/blockie/data
+Environment=FUNEOS_RUN_DIR=%t/funeos
+Environment=FUNEOS_SWITCH_FILE=/run/blockie-session/session-starting
+Environment="FUNEOS_LEAVE_CMD=blockie-session switch {} app"
+ExecStartPre=/usr/bin/mountpoint -q /var/lib/blockie/data
+ExecStart=/usr/libexec/blockie/blockie-funeos funeos
+RuntimeDirectory=funeos
+RuntimeDirectoryMode=0700
+UMask=0022
+Restart=no
+RestartForceExitStatus=3

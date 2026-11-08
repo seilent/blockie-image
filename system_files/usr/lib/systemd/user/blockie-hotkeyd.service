@@ -6,7 +6,7 @@ StartLimitIntervalSec=0
 
 [Service]
 ExecStart=/usr/libexec/blockie/blockie-hotkeyd
-ExecStopPost=-/usr/lib/blockie/hooks.d/blank-off
+ExecStopPost=-/usr/libexec/blockie/blockie-hook blank-off
 Restart=always
 RestartSec=2
 

@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+set -u
+
+me=blockie-hook
+budget=${BLOCKIE_HOOK_MS:-5000}
+part_ms=${BLOCKIE_HOOK_PART_MS:-1000}
+IFS=: read -ra dirs <<< "${BLOCKIE_HOOK_DIRS:-/etc/blockie/hooks.d:/usr/lib/blockie/hooks.d}"
+
+log() { echo "$me: $*" >&2; }
+
+exec 3>&2
+
+now_ms() {
+  local up=0
+  read -r up _ < /proc/uptime 2> /dev/null || up=0
+  [[ $up =~ ^[0-9]+\.[0-9]{2}$ ]] || up=0.00
+  echo $(( 10#${up/./} * 10 ))
+}
+
+secs() { printf '%d.%03d' $(( $1 / 1000 )) $(( $1 % 1000 )); }
+
+name=${1:-}
+(( $# == 1 )) && [[ $name =~ ^[a-z0-9][a-z0-9-]*$ ]] || { log "usage: $me <name>"; exit 2; }
+
+main=""
+declare -A parts=()
+for d in "${dirs[@]}"; do
+  [[ -n $main || ! -f $d/$name || ! -x $d/$name ]] || main=$d/$name
+  for p in "$d/$name.d"/*; do
+    [[ -e $p || -L $p ]] || continue
+    n=${p##*/}
+    if [[ ! $n =~ ^[A-Za-z0-9_-]+$ ]]; then
+      log "$p: skipped, not a part name"
+      continue
+    fi
+    [[ -n ${parts[$n]:-} ]] || parts[$n]=$p
+  done
+done
+
+start=$(now_ms)
+rc=0
+if [[ -n $main ]]; then
+  { timeout -k 0.1 "$(secs "$budget")" "$main" 2>&3 3>&-; } 2> /dev/null || rc=$?
+fi
+(( ${#parts[@]} )) || exit "$rc"
+
+deadline=$(( start + budget ))
+end=$(( $(now_ms) + part_ms ))
+(( end <= deadline )) || deadline=$end
+while IFS= read -r n; do
+  p=${parts[$n]}
+  [[ -f $p && -x $p ]] || continue
+  left=$(( deadline - $(now_ms) ))
+  if (( left < 100 )); then
+    log "$name.d/$n: skipped, $left ms left"
+    continue
+  fi
+  (( left <= part_ms )) || left=$part_ms
+  prc=0
+  { timeout -k 0.1 "$(secs "$left")" "$p" < /dev/null 2>&3 3>&-; } 2> /dev/null || prc=$?
+  (( prc != 124 && prc != 137 )) || log "$name.d/$n: cut at $left ms"
+done < <(printf '%s\n' "${!parts[@]}" | LC_ALL=C sort)
+exit "$rc"

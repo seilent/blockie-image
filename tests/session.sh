@@ -17,6 +17,81 @@ res() {
   fi
 }
 
+done_() {
+  if (( fails )); then
+    echo "session: $fails failed"
+    exit 1
+  fi
+  echo "session: ok"
+  exit 0
+}
+
+rules=${SESSION_RULES:-/usr/share/polkit-1/rules.d/50-blockie-session.rules}
+[[ -f $rules ]] || rules=$here/../system_files/usr/share/polkit-1/rules.d/50-blockie-session.rules
+
+polkit() {
+  RULES=$rules node - > "$t/polkit.out" 2>&1 << 'EOF'
+const fs = require("fs");
+const rules = [];
+const polkit = { Result: { YES: "yes", NO: "no", AUTH_ADMIN: "auth_admin" }, addRule: (f) => rules.push(f) };
+new Function("polkit", fs.readFileSync(process.env.RULES, "utf8"))(polkit);
+const units = "org.freedesktop.systemd1.manage-units";
+const cases = [
+  [units, "blockie", "blockie-session-switch@x.service", "start", "yes"],
+  [units, "blockie", "blockie-session-appswitch@x.service", "start", "yes"],
+  [units, "blockie", "blockie-session-revive@x.service", "start", "yes"],
+  [units, "blockie", "blockie-session-switch@x.service", "stop", "none"],
+  [units, "blockie", "blockie-session-appswitch@x.service", "stop", "none"],
+  [units, "blockie", "blockie-session-revive@x.service", "stop", "none"],
+  [units, "blockie", "blockie-session-switch@x.service", "restart", "none"],
+  [units, "blockie", "blockie-session-appswitch@x.service", "restart", "none"],
+  [units, "blockie", "blockie-session-revive@x.service", "restart", "none"],
+  [units, "blockie", "blockie-session-appswitch@X.service", "start", "none"],
+  [units, "blockie", "blockie-session-appswitch@.service", "start", "none"],
+  [units, "blockie", "blockie-session-appswitch@x;y.service", "start", "none"],
+  [units, "blockie", "blockie-session-switcher.service", "start", "none"],
+  [units, "blockie", "blockie-session-boot.service", "start", "none"],
+  [units, "blockie", "blockie-poweroff.service", "start", "none"],
+  [units, "other", "blockie-session-switch@x.service", "start", "none"],
+  [units, "other", "blockie-session-appswitch@x.service", "start", "none"],
+  [units, "other", "blockie-session-revive@x.service", "start", "none"],
+  ["org.freedesktop.systemd1.manage-unit-files", "blockie", "blockie-session-appswitch@x.service", "start", "none"],
+];
+let bad = 0;
+for (const [id, user, unit, verb, want] of cases) {
+  const details = { unit: unit, verb: verb };
+  const action = { id: id, lookup: (k) => details[k] };
+  let got = "none";
+  for (const r of rules) {
+    const v = r(action, { user: user });
+    if (v !== undefined) {
+      got = v;
+      break;
+    }
+  }
+  if (got !== want) {
+    console.log(`${id} ${user} ${verb} ${unit}: ${got}, want ${want}`);
+    bad++;
+  }
+}
+process.exit(bad ? 1 : 0);
+EOF
+  local rc=$?
+  [[ $rc == 0 ]] || sed 's/^/  /' "$t/polkit.out"
+  res $rc "polkit: blockie may start switch@, appswitch@ and revive@ of a session name, nothing else"
+}
+
+if [[ ${1:-} == polkit ]]; then
+  command -v node > /dev/null || { echo "session: polkit needs node" >&2; exit 2; }
+  polkit
+  done_
+fi
+if command -v node > /dev/null; then
+  polkit
+else
+  echo "polkit: no node in the image, the host leg (tests/session.sh polkit) evaluates the rules"
+fi
+
 R=$t/root
 mkdir -p "$R/usr/lib/blockie/sessions.d" "$R/etc/blockie/sessions.d" "$R/usr/lib/systemd/user" "$t/bin" "$t/run" \
   "$t/state" "$t/units" "$t/win"
@@ -606,11 +681,429 @@ res $? "seat stop stops the compositor on the user bus of uid 1000, the uid sysu
 grep -qxF 'ExecStopPost=-/usr/bin/blockie-session ended %n' "$sf/usr/lib/systemd/user/blockie-.service.d/60-blockie-session.conf" &&
   grep -qxF 'ExecStart=/usr/bin/blockie-session revive %i' "$sf/usr/lib/systemd/system/blockie-session-revive@.service" &&
   grep -qxF "ReadWritePaths=$run" "$sf/usr/lib/systemd/system/blockie-session-revive@.service" &&
-  grep -qF 'blockie-session-(switch|revive)@' "$sf/usr/share/polkit-1/rules.d/50-blockie-session.rules"
+  grep -qF 'blockie-session-(switch|appswitch|revive)@' "$sf/usr/share/polkit-1/rules.d/50-blockie-session.rules"
 res $? "every blockie user unit reports its stop, revive@ runs as root, polkit lets blockie start it"
 
-if (( fails )); then
-  echo "session: $fails failed"
-  exit 1
-fi
-echo "session: ok"
+as=$sf/usr/lib/systemd/system/blockie-session-appswitch@.service
+grep -qxF 'ExecStart=/usr/bin/blockie-session request %i app' "$as" && grep -qxF "ReadWritePaths=$run" "$as" &&
+  grep -qxF 'CapabilityBoundingSet=' "$as" && grep -qxF 'PrivateDevices=yes' "$as" &&
+  grep -qxF "d $run/lock 0700 root root -" "$sf/usr/lib/tmpfiles.d/blockie.conf" &&
+  grep -qxF "f $run/lock/request.lock 0600 root root -" "$sf/usr/lib/tmpfiles.d/blockie.conf"
+res $? "appswitch@ requests with reason app in the switch@ sandbox; tmpfiles makes the lock dir and the request lock"
+
+fo=$sf/usr/libexec/blockie/blockie-funeos
+mkdir -p "$t/fdev" "$t/fbin"
+for d in fdev fbin; do
+  for x in funeos funeos-ctl; do
+    printf '#!/bin/sh\necho "%s %s $*"\n' "$d" "$x" > "$t/$d/$x"
+    chmod +x "$t/$d/$x"
+  done
+done
+fe() { BLOCKIE_FUNEOS_DEV=$1 BLOCKIE_FUNEOS_BIN=$2 BLOCKIE_DATA_DIR=$3 "$fo" "${@:4}" 2> /dev/null; }
+fe "$t/none" "$t/none" /proc check > /dev/null
+r1=$?
+o2=$(fe "$t/none" "$t/fbin" /proc funeos-ctl leave b requested)
+o3=$(fe "$t/fdev" "$t/fbin" /proc funeos-ctl leave b requested)
+fe "$t/fdev" "$t/fbin" /proc check > /dev/null
+r4=$?
+fe "$t/fdev" "$t/fbin" "$t" check > /dev/null
+r5=$?
+fe "$t/fdev" "$t/fbin" /proc nope
+r6=$?
+rm -f "${t:?}/fdev/funeos-ctl"
+fe "$t/fdev" "$t/fbin" /proc funeos-ctl leave > /dev/null
+r7=$?
+[[ $r1 == 1 && $o2 == "fbin funeos-ctl leave b requested" && $o3 == "fdev funeos-ctl leave b requested" && $r4 == 0 &&
+  $r5 == 1 && $r6 == 2 && $r7 == 127 ]] &&
+  grep -qxF 'exec /usr/libexec/blockie/blockie-funeos check' "$sf/usr/libexec/blockie/blockie-funeos-check"
+res $? "blockie-funeos: the dev dir wins for both tools, check needs funeos and a mounted data dir, a bad verb exits 2"
+BLOCKIE_ROOT=$sf bs list | grep -qxF "$(printf 'funeos\tfuneOS\tno')"
+res $? "the shipped funeos.conf is listed"
+
+for n in g h k; do
+  : > "$R/usr/lib/systemd/user/blockie-test-$n.service"
+  echo "blockie-test-$n.service test.$n" >> "$t/apps"
+done
+session usr/lib/blockie/sessions.d g LABEL=Golf UNIT=blockie-test-g.service APP_ID=test.g BACKGROUND=run \
+  'LEAVE=/usr/libexec/leave-g arg' SWITCHED=/usr/libexec/sw-g
+session usr/lib/blockie/sessions.d h LABEL=Hotel UNIT=blockie-test-h.service APP_ID=test.h LEAVE=/usr/libexec/leave-h
+session usr/lib/blockie/sessions.d k LABEL=Kilo UNIT=blockie-test-k.service APP_ID=test.k CHECK=/usr/libexec/check-k
+session usr/lib/blockie/sessions.d lf UNIT=blockie-test-h.service APP_ID=test.h BACKGROUND=freeze LEAVE=/usr/libexec/leave-h
+session usr/lib/blockie/sessions.d bad15 UNIT=blockie-test-g.service APP_ID=test.g LEAVE=/tmp/x
+session usr/lib/blockie/sessions.d bad16 UNIT=blockie-test-g.service APP_ID=test.g LEAVE=/usr/../tmp/x
+session usr/lib/blockie/sessions.d bad17 UNIT=blockie-test-g.service APP_ID=test.g 'LEAVE=/usr/libexec/leave-g $(x)'
+session usr/lib/blockie/sessions.d bad18 UNIT=blockie-test-g.service APP_ID=test.g 'LEAVE=/usr/libexec/leave-g;x'
+session usr/lib/blockie/sessions.d bad19 UNIT=blockie-test-g.service APP_ID=test.g BACKGROUND=freeze SWITCHED=/usr/libexec/sw-g
+session usr/lib/blockie/sessions.d bad20 UNIT=blockie-test-g.service APP_ID=test.g SWITCHED=/usr/libexec/sw-g
+for h in leave-g:1 leave-h:1 sw-g:0; do
+  n=${h%:*}
+  cat > "$R/usr/libexec/$n" << EOF
+#!/bin/sh
+echo "$n \$*" >> "\$FAKE/log"
+[ ! -f "\$FAKE/$n.sleep" ] || sleep "\$(cat "\$FAKE/$n.sleep")"
+[ ! -f "\$FAKE/$n.bg" ] || { sleep 30 > /dev/null 2>&1 & echo \$! > "\$FAKE/$n.pid"; }
+exit "\$(cat "\$FAKE/$n.rc" 2> /dev/null || echo ${h#*:})"
+EOF
+  chmod +x "$R/usr/libexec/$n"
+done
+printf '#!/bin/sh\nsleep 30 > /dev/null 2>&1 &\necho $! > "$FAKE/check-k.pid"\nexit 0\n' > "$R/usr/libexec/check-k"
+chmod +x "$R/usr/libexec/check-k"
+
+gapp() {
+  : > "$t/log"
+  bs request "$1" app > "$t/out" 2>&1 && bs switcher >> "$t/out" 2>&1
+}
+nsw() { grep -c '^sw-g ' "$t/log"; }
+line() { grep -nxF -- "$1" "$t/log" | head -1 | cut -d: -f1; }
+until_log() {
+  local i
+  for ((i = 0; i < 200; i++)); do
+    grep -q -- "$1" "$t/log" && return 0
+    sleep 0.05
+  done
+  return 1
+}
+
+rm -f "${t:?}/run/session-pending" "${t:?}/run/session-starting"
+go a
+go g
+l=$(bs list | cut -f1)
+grep -qx g <<< "$l" && grep -qx h <<< "$l" && grep -qx lf <<< "$l" && ! grep -q '^bad1[5-9]$\|^bad20$' <<< "$l" &&
+  [[ $(cur) == "g blockie-test-g.service" ]]
+res $? "LEAVE and SWITCHED: /tmp, .., \$(x) or ; unlist; SWITCHED needs BACKGROUND=run (no BACKGROUND line is freeze), LEAVE does not"
+
+echo 0 > "$t/leave-g.rc"
+go b
+r=$?
+rm -f "${t:?}/leave-g.rc"
+[[ $r == 0 && $(cur) == "g blockie-test-g.service" && ! -e $t/run/session-starting && ! -e $t/run/session-pending ]] &&
+  logged "leave-g arg b requested" && grep -q 'leave taken by g' "$t/out" && ! grep -q 'test-b' "$t/log"
+res $? "LEAVE gets <target> <reason>; its exit 0 drops the switch, nothing started, g stays current, rc $r"
+
+go b
+[[ $(cur) == "b blockie-test-b.service" ]] && logged "leave-g arg b requested" && grep -q 'leave of g exited 1, switching' "$t/out" &&
+  ! grep -q '^sw-g' "$t/log"
+res $? "a LEAVE that exits 1 lets the switch go ahead, no SWITCHED"
+go g
+echo 5 > "$t/leave-g.sleep"
+s0=$(ms)
+go b
+s1=$(ms)
+rm -f "${t:?}/leave-g.sleep"
+[[ $(cur) == "b blockie-test-b.service" ]] && grep -q 'leave of g exited 124, switching' "$t/out" && (( s1 - s0 < 3500 ))
+res $? "a LEAVE that hangs is cut at 2 s and the switch goes ahead, $(( s1 - s0 )) ms"
+
+go g
+gapp b
+r=$?
+[[ $r == 0 && $(cur) == "b blockie-test-b.service" ]] && ! grep -q '^leave-' "$t/log" && logged "sw-g b ok" && [[ $(nsw) == 1 ]]
+res $? "an app request runs no LEAVE; the SWITCHED of the session in front gets <target> ok, once"
+go g
+go g
+grep -q 'g is current' "$t/out" && ! grep -q '^leave-' "$t/log"
+res $? "no LEAVE for a switch to the current session"
+CHECK_RC=1 go d
+[[ $(cur) == "g blockie-test-g.service" ]] && grep -q 'd is not-installed' "$t/out" && ! grep -q '^leave-' "$t/log"
+res $? "no LEAVE when the target's CHECK refuses it"
+go a
+go b
+! grep -q '^leave-' "$t/log"
+res $? "no LEAVE from a session without one"
+
+go g
+fresh p
+go p
+lv=$(line "leave-g arg p requested")
+mn=$(line "wlrctl toplevel minimize app_id:test.g")
+[[ $(cur) == "p blockie-test-p.service" && -n $lv && -n $mn ]] && (( lv < mn ))
+res $? "LEAVE runs before the PARK_FIRST park of the session in front"
+go g
+: > "$t/log"
+bs request b revive > /dev/null 2>&1 && bs switcher > "$t/out" 2>&1
+logged "leave-g arg b revive"
+res $? "LEAVE gets the reason revive too"
+
+go g
+echo 1.5 > "$t/leave-g.sleep"
+: > "$t/log"
+bs request b > /dev/null 2>&1
+"$bin" switcher > "$t/out" 2>&1 &
+pid=$!
+until_log '^leave-g arg b requested$'
+kill -TERM "$pid"
+wait "$pid"
+r=$?
+rm -f "${t:?}/leave-g.sleep"
+[[ $r == 143 && $(cur) == "g blockie-test-g.service" && ! -e $t/run/session-starting ]] && ! grep -q 'test-b' "$t/log" &&
+  ! grep -q '^sw-g' "$t/log"
+res $? "TERM during LEAVE: rc $r, nothing started, no SWITCHED"
+
+touch "$t/leave-g.bg"
+go b
+rm -f "${t:?}/leave-g.bg"
+BLOCKIE_SESSION_LOCK_WAIT=1 go g
+r=$?
+kill "$(cat "$t/leave-g.pid" 2> /dev/null)" 2> /dev/null
+[[ $r == 0 && $(cur) == "g blockie-test-g.service" ]]
+res $? "a process a LEAVE leaves behind does not hold the session lock for the next run, rc $r"
+go k
+BLOCKIE_SESSION_LOCK_WAIT=1 go g
+r=$?
+kill "$(cat "$t/check-k.pid" 2> /dev/null)" 2> /dev/null
+[[ $r == 0 && $(cur) == "g blockie-test-g.service" ]]
+res $? "a process a CHECK leaves behind does not hold the session lock for the next run, rc $r"
+
+: > "$t/log"
+FAKE_UID=1000 bs switch b app > /dev/null 2>&1
+logged "systemctl start --no-block blockie-session-appswitch@b.service"
+res $? "switch <name> app as the session user starts blockie-session-appswitch@<name>.service"
+bs switch b foo > /dev/null 2>&1
+r1=$?
+: > "$t/log"
+FAKE_UID=1000 bs switch bad1 app > /dev/null 2>&1
+r2=$?
+[[ $r1 == 2 && $r2 == 1 ]] && ! grep -q 'appswitch@' "$t/log"
+res $? "switch <name> foo is a usage error; an unlisted name with app exits 1 before any unit start"
+bs switch b app > /dev/null 2>&1
+[[ $(cat "$t/run/session-wanted") == "b app g" && -e $t/run/session-pending ]]
+res $? "switch <name> app as root requests with reason app and the session in front as from"
+rm -f "${t:?}/run/session-pending"
+
+fresh c
+touch "$t/fail-start"
+gapp c
+r=$?
+rm -f "${t:?}/fail-start"
+[[ $r != 0 && $(cur) == "g blockie-test-g.service" ]] && logged "sw-g c failed" && [[ $(nsw) == 1 ]]
+res $? "SWITCHED gets failed when the target does not start"
+fresh c
+touch "$t/no-window"
+gapp c
+r=$?
+rm -f "${t:?}/no-window"
+[[ $r != 0 && $(cur) == "g blockie-test-g.service" ]] && logged "sw-g c failed"
+res $? "SWITCHED gets failed when the target shows no window"
+
+fresh f
+echo '0 2' > "$t/slow"
+( sleep 0.5; bs request b > /dev/null 2>&1 ) &
+gapp f
+r=$?
+wait $!
+rm -f "${t:?}/slow"
+[[ $r == 0 && $(cur) == "g blockie-test-g.service" ]] && logged "sw-g f cancelled" && [[ $(nsw) == 1 ]]
+res $? "SWITCHED gets cancelled when a request for another session stops the start"
+bs switcher > /dev/null 2>&1
+go g
+fresh f
+echo '0 2' > "$t/slow"
+echo 1.5 > "$t/sw-g.sleep"
+: > "$t/log"
+bs request f app > /dev/null 2>&1
+"$bin" switcher > "$t/out" 2>&1 &
+pid=$!
+( sleep 0.5; bs request b > /dev/null 2>&1 ) &
+bg=$!
+until_log '^sw-g f cancelled$'
+kill -TERM "$pid"
+wait "$pid"
+r=$?
+wait "$bg"
+rm -f "${t:?}/slow" "${t:?}/sw-g.sleep" "${t:?}/run/session-pending"
+[[ $r == 143 && $(nsw) == 1 && $(cur) == "g blockie-test-g.service" ]]
+res $? "TERM during the SWITCHED hook of a cancelled switch: rc $r, one line"
+gapp g
+grep -q 'g is current' "$t/out" && logged "sw-g g ok"
+res $? "SWITCHED gets ok for a switch to the session already in front"
+
+fresh c
+printf 'g blockie-test-x.service 40\n' > "$t/run/session-current"
+touch "$t/no-window"
+gapp c
+r=$?
+rm -f "${t:?}/no-window"
+[[ $r == 0 && $(cur) == "c blockie-test-c.service" ]] && grep -q 'c kept without a window' "$t/out" && logged "sw-g c ok"
+res $? "SWITCHED gets ok when the target is kept without a window"
+go g
+
+fresh p
+touch "$t/no-window"
+: > "$t/log"
+bs request p app > /dev/null 2>&1
+"$bin" switcher > "$t/out" 2>&1 &
+pid=$!
+sleep 1
+kill -TERM "$pid"
+wait "$pid"
+r=$?
+rm -f "${t:?}/no-window"
+[[ $r == 143 && $(cur) == "g blockie-test-g.service" ]] && logged "sw-g p failed" && [[ $(nsw) == 1 ]]
+res $? "TERM during the start: SWITCHED gets failed once, rc $r"
+
+echo 1.5 > "$t/sw-g.sleep"
+: > "$t/log"
+bs request b app > /dev/null 2>&1
+"$bin" switcher > "$t/out" 2>&1 &
+pid=$!
+until_log '^sw-g b ok$'
+kill -TERM "$pid"
+wait "$pid"
+r=$?
+rm -f "${t:?}/sw-g.sleep"
+[[ $r == 143 && $(nsw) == 1 && $(cur) == "b blockie-test-b.service" ]]
+res $? "TERM during the SWITCHED hook: rc $r, still one line"
+go g
+echo 5 > "$t/sw-g.sleep"
+s0=$(ms)
+gapp b
+r=$?
+s1=$(ms)
+rm -f "${t:?}/sw-g.sleep"
+[[ $r == 0 && $(cur) == "b blockie-test-b.service" ]] && grep -q 'switched hook of g exited 124' "$t/out" && (( s1 - s0 < 4500 ))
+res $? "a SWITCHED hook that hangs is cut and leaves rc 0, $(( s1 - s0 )) ms"
+go g
+
+: > "$t/log"
+bs request b app > /dev/null 2>&1 && bs request b > /dev/null 2>&1
+w1=$(cat "$t/run/session-wanted")
+bs switcher > "$t/out" 2>&1
+[[ $w1 == "b app g" && ! -e $t/run/session-dropped ]] && ! grep -q '^leave-' "$t/log" && logged "sw-g b ok" && [[ $(nsw) == 1 ]]
+res $? "a request over a pending app request for the same target keeps one app line: no LEAVE, no drop, one ok"
+go g
+bs request b > /dev/null 2>&1 && bs request b app > /dev/null 2>&1
+w1=$(cat "$t/run/session-wanted")
+rm -f "${t:?}/run/session-pending"
+bs request b > /dev/null 2>&1 && bs request b revive > /dev/null 2>&1
+w2=$(cat "$t/run/session-wanted")
+rm -f "${t:?}/run/session-pending"
+[[ $w1 == "b app g" && $w2 == "b revive" ]]
+res $? "an app request merges into a pending request for the same target; two other reasons keep the newer"
+
+fresh c
+bs request b app > /dev/null 2>&1 && bs request c > /dev/null 2>&1
+d1=$(cat "$t/run/session-dropped" 2> /dev/null)
+: > "$t/log"
+bs switcher > "$t/out" 2>&1
+dl=$(line "sw-g b dropped")
+lv=$(line "leave-g arg c requested")
+[[ $d1 == "b g" && $(cur) == "c blockie-test-c.service" && ! -e $t/run/session-dropped && -n $dl && -n $lv ]] && (( dl < lv ))
+res $? "a request for another target over a pending app request drops it, dropped is sent before the new switch"
+go g
+
+printf '%s\n' 'Bad line' 'b g' 'b' > "$t/run/session-dropped"
+rm -f "${t:?}/run/session-pending"
+: > "$t/log"
+bs switcher > "$t/out" 2>&1
+r=$?
+[[ $r == 0 && $(cur) == "g blockie-test-g.service" && ! -e $t/run/session-dropped ]] && logged "sw-g b dropped" &&
+  [[ $(nsw) == 1 && $(grep -c 'malformed line skipped' "$t/out") == 2 ]] && ! grep -q 'systemctl --user start' "$t/log"
+res $? "drops are delivered with no pending request; malformed lines are skipped with a log"
+printf '%s g\n' a b c d e f h k p > "$t/run/session-dropped"
+: > "$t/log"
+bs switcher > "$t/out" 2>&1
+[[ $(nsw) == 8 ]] && grep -q 'over 8 drops' "$t/out" && ! logged "sw-g p dropped"
+res $? "nine distinct drops in one run send 8 and log the cap"
+
+fresh f
+echo '0 1.5' > "$t/slow"
+( sleep 0.5; bs request f app > /dev/null 2>&1 ) &
+go f
+wait $!
+rm -f "${t:?}/slow"
+[[ $(cur) == "f blockie-test-f.service" ]] && grep -q 'f requested again, still starting' "$t/out" && logged "sw-g f ok" &&
+  [[ $(nsw) == 1 ]]
+res $? "an app request consumed by a requested switch in flight gets that switch's result"
+go g
+fresh f
+echo '0 1.5' > "$t/slow"
+( sleep 0.5; bs request f app > /dev/null 2>&1 ) &
+gapp f
+wait $!
+rm -f "${t:?}/slow"
+[[ $(cur) == "f blockie-test-f.service" ]] && logged "sw-g f ok" && [[ $(nsw) == 1 ]]
+res $? "the same session as from and as joined gets one line"
+go g
+
+bs request b app > /dev/null 2>&1
+exec 8> "$t/run/lock/session.lock"
+flock 8
+: > "$t/log"
+BLOCKIE_SESSION_LOCK_WAIT=1 bs switcher > "$t/out" 2>&1
+r=$?
+exec 8>&-
+[[ $r == 75 && -e $t/run/session-pending ]] && ! grep -q '^sw-g' "$t/log"
+res $? "a held session lock: exit 75, no SWITCHED, the request stays pending"
+rm -f "${t:?}/run/session-pending"
+
+fresh f
+echo '0 2.5' > "$t/slow"
+bs request f > /dev/null 2>&1
+"$bin" switcher > "$t/out" 2>&1 &
+pid=$!
+for ((i = 0; i < 200; i++)); do
+  [[ -e $t/run/session-starting ]] && break
+  sleep 0.05
+done
+exec 6>> "$t/run/lock/request.lock"
+flock 6
+echo 'b requested' > "$t/run/session-wanted"
+: > "$t/run/session-pending"
+sleep 1
+grep -q cancelled "$t/out"
+c1=$?
+flock -u 6
+exec 6>&-
+wait "$pid"
+r=$?
+rm -f "${t:?}/slow" "${t:?}/run/session-pending"
+[[ $r == 0 && $c1 != 0 && $(cur) == "g blockie-test-g.service" ]] && grep -q 'start of f cancelled, b wanted' "$t/out"
+res $? "a held request lock skips the pending check without exit 75, the cancel comes after the release"
+exec 6>> "$t/run/lock/request.lock"
+flock 6
+s0=$(ms)
+bs request b > "$t/out" 2>&1
+r=$?
+s1=$(ms)
+flock -u 6
+exec 6>&-
+[[ $r == 75 && ! -e $t/run/session-pending ]] && grep -q 'request lock busy' "$t/out" && (( s1 - s0 >= 4500 ))
+res $? "request exits 75 when the request lock stays held past 5 s"
+
+bs request b app > /dev/null 2>&1
+exec 6>> "$t/run/lock/request.lock"
+flock 6
+: > "$t/log"
+"$bin" switcher > "$t/out" 2>&1 &
+pid=$!
+sleep 0.5
+kill -TERM "$pid"
+sleep 0.2
+flock -u 6
+exec 6>&-
+wait "$pid"
+r=$?
+[[ $r == 143 && -e $t/run/session-pending && $(cat "$t/run/session-wanted") == "b app g" ]] && ! grep -q '^sw-g' "$t/log" &&
+  ! grep -qi 'unbound\|syntax\|not found' "$t/out"
+res $? "TERM between the session lock and the read: rc $r, the request stays pending, no shell error"
+rm -f "${t:?}/run/session-pending"
+printf '%s\n' 'a g' 'c g' > "$t/run/session-dropped"
+bs request b app > /dev/null 2>&1
+echo 1 > "$t/sw-g.sleep"
+: > "$t/log"
+"$bin" switcher > "$t/out" 2>&1 &
+pid=$!
+until_log '^sw-g a dropped$'
+kill -TERM "$pid"
+wait "$pid"
+r=$?
+rm -f "${t:?}/sw-g.sleep"
+[[ $r == 143 && $(nsw) == 3 && $(cur) == "g blockie-test-g.service" ]] && logged "sw-g b failed" && logged "sw-g c dropped" &&
+  ! grep -q 'test-b' "$t/log"
+res $? "TERM during the first drop: the rest are delivered and the consumed app request gets failed, rc $r"
+rm -f "${t:?}/run/session-pending" "${t:?}/run/session-dropped"
+bs switcher > "$t/out" 2>&1
+r=$?
+[[ $r == 0 && ! -s $t/out ]]
+res $? "a run with no pending request exits 0 with nothing logged"
+
+done_

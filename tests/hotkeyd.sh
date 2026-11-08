@@ -5,6 +5,8 @@ here=$(cd "$(dirname "$0")" && pwd)
 [[ -e /run/.containerenv ]] || { echo "hotkeyd: runs only in a container, so a sleep case can never reach the host's /sys/power" >&2; exit 2; }
 bin=${HOTKEYD_BIN:-/usr/libexec/blockie/blockie-hotkeyd}
 [[ -x $bin ]] || bin=$here/../system_files/usr/libexec/blockie/blockie-hotkeyd
+runner=${HOOK_BIN:-/usr/libexec/blockie/blockie-hook}
+[[ -x $runner ]] || runner=$here/../system_files/usr/libexec/blockie/blockie-hook
 tables=/usr/lib/blockie/hotkeys.d
 [[ -d $tables ]] || tables=$here/../system_files/usr/lib/blockie/hotkeys.d
 t=$(mktemp -d "${TMPDIR:-/tmp}/hotkeyd.XXXXXX")
@@ -169,7 +171,8 @@ live() {
   PATH=$t/fbin:$PATH BLOCKIE_HOTKEYD_INPUT=$t/fifo BLOCKIE_HOTKEYD_HOOKS=$hk BLOCKIE_HOTKEYD_LONG_MS=300 \
     BLOCKIE_HOTKEYD_HOOK_MS=${HOOK_MS:-5000} BLOCKIE_HOTKEYD_BACKSTOP_MS=${BACKSTOP_MS:-20000} BLOCKIE_HOTKEYD_TABLES=$t/usr:$t/etc BLOCKIE_HOTKEYD_CURRENT=$t/current \
     BLOCKIE_HOTKEYD_SLEEP=$t/fbin/fake-sleep BLOCKIE_HOTKEYD_SLEPT=$t/slept BLOCKIE_HOTKEYD_SYSFS=$t/psys \
-    BLOCKIE_HOTKEYD_KNOB=$t/knob env "${e[@]}" timeout -k 5 30 python3 "$bin" > "$t/out" 2> "$t/err" &
+    BLOCKIE_HOTKEYD_KNOB=$t/knob BLOCKIE_HOTKEYD_HOOK_RUNNER=${RUNNER:-$runner} DBUS_SESSION_BUS_ADDRESS=unix:path=$t/nobus \
+    env "${e[@]}" timeout -k 5 30 python3 "$bin" > "$t/out" 2> "$t/err" &
   local pid=$!
   timeout -k 5 60 bash -c "exec > '$t/fifo'; $script"
   wait "$pid"
@@ -225,6 +228,137 @@ live "sleep 1; $tap; sleep 2.5"
 logis "$woke"$'\nstart blank-on\nexit blank-on\nstart blank-on\nexit blank-on' && grep -q 'blank-on: exit 1$' "$t/err"
 res $? "hooks run: a blank-on that always fails runs twice for one press, no loop"
 rm -f "$hk/blank-on.rc"
+
+rd=$t/rdirs
+mkdir -p "$rd/etc/x.d" "$rd/usr/x.d" "$rd/usr/y.d" "$rd/usr/z.d" "$rd/usr/w.d" "$rd/usr/blank-off.d"
+part() {
+  printf '#!/bin/sh\necho %s >> "%s"\nsleep %s\nexit %s\n' "$2" "$t/parts.log" "${3:-0}" "${4:-0}" > "$1"
+  chmod 755 "$1"
+}
+part "$rd/usr/x" main 0 3
+part "$rd/usr/x.d/a" usr-a
+part "$rd/etc/x.d/b" etc-b 0 1
+part "$rd/usr/x.d/c" usr-c
+part "$rd/etc/x.d/c" etc-c
+part "$rd/usr/x.d/d" usr-d
+part "$rd/etc/x.d/d" etc-d
+chmod 644 "$rd/etc/x.d/d"
+part "$rd/usr/x.d/e.sh" usr-e
+part "$rd/usr/x.d/f~" usr-f
+part "$rd/usr/y.d/a" hung 5
+part "$rd/usr/z" main 0.2
+for n in a b c; do
+  part "$rd/usr/z.d/$n" "z-$n" 1
+done
+part "$rd/usr/w" main 3
+part "$rd/usr/w.d/a" w-a
+part "$rd/usr/blank-off" main
+part "$rd/usr/blank-off.d/funeos" funeos
+hrun() {
+  rm -f "${t:?}/parts.log"
+  BLOCKIE_HOOK_DIRS=$rd/etc:$rd/usr "$runner" "$@" 2> "$t/runner.err"
+  local rc=$?
+  touch "$t/parts.log"
+  return "$rc"
+}
+now() { date +%s%3N; }
+
+hrun x
+r=$?
+[[ $r == 3 && $(paste -sd ' ' "$t/parts.log") == "main usr-a etc-b etc-c" ]] && grep -q 'x.d/e.sh: skipped' "$t/runner.err" &&
+  grep -q 'x.d/f~: skipped' "$t/runner.err"
+res $? "runner: the main hook's rc $r, parts sorted across dirs, /etc masks a name (a non executable one too), part rc ignored, other names skipped"
+s0=$(now)
+hrun y
+r=$?
+s1=$(now)
+[[ $r == 0 ]] && grep -q 'y.d/a: cut at 1000 ms' "$t/runner.err" && (( s1 - s0 >= 900 && s1 - s0 < 1600 ))
+res $? "runner: no main hook exits 0, a hung part is cut at 1 s ($(( s1 - s0 )) ms)"
+s0=$(now)
+BLOCKIE_HOOK_MS=1500 hrun z
+s1=$(now)
+grep -q 'z.d/c: skipped' "$t/runner.err" && (( s1 - s0 < 1800 ))
+res $? "runner: budget 1500 ms, a 0.2 s main and three 1 s parts end in $(( s1 - s0 )) ms with the skip logged"
+s0=$(now)
+BLOCKIE_HOOK_MS=500 hrun w
+r=$?
+s1=$(now)
+got=$(paste -sd ' ' "$t/parts.log")
+[[ $r == 124 && $got == "main w-a" ]] && (( s1 - s0 < 1600 ))
+res $? "runner: a main hook over the budget exits 124 and the part still runs after it (rc $r, ran '$got', $(( s1 - s0 )) ms)"
+hrun blank-off
+r=$?
+[[ $r == 0 && $(paste -sd ' ' "$t/parts.log") == "main funeos" ]]
+res $? "runner: blank-off with a blank-off.d part runs both (the ExecStopPost form)"
+hrun Bad
+r1=$?
+hrun
+r2=$?
+[[ $r1 == 2 && $r2 == 2 ]]
+res $? "runner: a bad name or no name exits 2"
+
+cat > "$t/fbin/fake-runner" << EOF
+#!/bin/sh
+echo "runner \$*" >> "$t/hooks.log"
+exec "$runner" "\$@"
+EOF
+cat > "$t/fbin/blockie-session" << EOF
+#!/bin/sh
+echo "blockie-session \$*" >> "$t/hooks.log"
+echo "next \$(date +%s%3N)" >> "$t/times"
+EOF
+chmod 755 "$t/fbin/fake-runner" "$t/fbin/blockie-session"
+dpart() {
+  mkdir -p "$hk/$1.d"
+  cat > "$hk/$1.d/funeos" << EOF
+#!/bin/sh
+echo "part $1" >> "$t/hooks.log"
+echo "part \$(date +%s%3N)" >> "$t/times"
+s=0
+[ ! -f "$hk/$1.d.sleep" ] || read -r s < "$hk/$1.d.sleep"
+sleep "\$s"
+exit 1
+EOF
+  chmod 755 "$hk/$1.d/funeos"
+}
+fr=$t/fbin/fake-runner
+
+printf 'nobody-here 1 1\n' > "$t/current"
+dpart blank-on
+RUNNER=$fr live "sleep 1; $tap; sleep 1.5"
+logis "$woke"$'\nrunner blank-on\nstart blank-on\nexit blank-on\npart blank-on' && ! grep -q 'blank-on: exit' "$t/err"
+res $? "hooks run: a blank-on.d part runs after the main hook through the runner, its exit 1 leaves blanked applied"
+echo 5 > "$hk/blank-on.d.sleep"
+RUNNER=$fr live "sleep 1; $tap; sleep 0.1; $tap; sleep 3"
+g=$(awk '$1 == "exit" && $2 == "blank-on" {e = $3} $1 == "start" && $2 == "blank-off" {b = $3} END {print b - e}' "$t/times")
+logis "$woke"$'\nrunner blank-on\nstart blank-on\nexit blank-on\npart blank-on\n'"$woke" && ((g >= 900 && g < 1600))
+res $? "hooks run: a hung blank-on.d part delays the next blank-off by at most 1 s ($g ms)"
+rm -rf "${hk:?}/blank-on.d" "${hk:?}/blank-on.d.sleep"
+
+mv "$hk/screen-on" "$t/screen-on.main"
+dpart screen-on
+printf 'test-l 1 1\n' > "$t/current"
+RUNNER=$fr live "sleep 1; echo power down; sleep 0.8; echo power up; sleep 1.2"
+logis "$woke"$'\nstart blank-on\nexit blank-on\nrunner screen-on\npart screen-on\nsystemctl --user start --no-block blockie-poweroff.service'
+res $? "hooks run: only a screen-on.d dir and no main hook: the part runs and lit-frozen applies"
+rm -rf "${hk:?}/screen-on.d"
+mv "$t/screen-on.main" "$hk/screen-on"
+
+printf 'nobody-here 1 1\n' > "$t/current"
+RUNNER=$fr live "sleep 1; echo volup down; echo volup up; sleep 0.5"
+logis "$woke" && grep -q "no hook volume-up in $hk" "$t/err"
+res $? "hooks run: no main hook and no .d dir: no runner spawned, logged once"
+
+dpart switcher-open
+RUNNER=$fr live "sleep 1; echo home down; sleep 0.5; echo home up; sleep 1"
+logis "$woke"$'\nrunner switcher-open\npart switcher-open\nblockie-session next'
+res $? "switcher: a switcher-open.d part runs before the switcher opens (blockie-session next without the overlay)"
+echo 5 > "$hk/switcher-open.d.sleep"
+RUNNER=$fr live "sleep 1; echo home down; sleep 0.5; echo home up; sleep 2.5"
+g=$(awk '$1 == "part" {p = $2} $1 == "next" {n = $2} END {print n - p}' "$t/times")
+logis "$woke"$'\nrunner switcher-open\npart switcher-open\nblockie-session next' && ((g >= 900 && g < 1700))
+res $? "switcher: a hung switcher-open part delays it by at most about 1.5 s ($g ms)"
+rm -rf "${hk:?}/switcher-open.d" "${hk:?}/switcher-open.d.sleep"
 
 on=class/power_supply/mtk-master-charger/online
 mkdir -p "$t/psys/${on%/*}" "$t/psys/class/power_supply/battery"
@@ -529,6 +663,134 @@ EOF
 r=$?
 ((r == 0)) || sed 's/^/  /' "$t/drain.out"
 res $r "resume: queued key events are drained before EVIOCGKEY, a down read after the resume and up is a release, an older one is cleared"
+
+BLOCKIE_HOTKEYD_DRY=1 BLOCKIE_HOTKEYD_CURRENT=$t/none BLOCKIE_HOTKEYD_SYSFS=$t/psys BLOCKIE_HOTKEYD_INPUT=/dev/null \
+  BLOCKIE_HOTKEYD_SLEEP=$t/fbin/fake-sleep BLOCKIE_HOTKEYD_GRAB_RETRY_MS=50 timeout -k 5 60 python3 - "$bin" > "$t/grab.out" 2>&1 << 'EOF'
+import contextlib
+import errno
+import importlib.machinery
+import importlib.util
+import io
+import os
+import sys
+
+loader = importlib.machinery.SourceFileLoader("hotkeyd", sys.argv[1])
+spec = importlib.util.spec_from_loader("hotkeyd", loader)
+m = importlib.util.module_from_spec(spec)
+loader.exec_module(m)
+GLib = m.GLib
+P0 = "/dev/input/event0"
+
+
+class Dev:
+    def __init__(self, busy, err=errno.EBUSY):
+        self.busy = busy
+        self.err = err
+        self.calls = 0
+        self.closed = False
+
+    def grab(self):
+        self.calls += 1
+        if self.busy:
+            self.busy -= 1
+            raise OSError(self.err, "Device or resource busy" if self.err == errno.EBUSY else "No such device")
+
+    def ungrab(self):
+        pass
+
+    def active_keys(self):
+        return []
+
+    def close(self):
+        self.closed = True
+
+
+class Done:
+    def wait_finish(self, res):
+        pass
+
+    def get_if_exited(self):
+        return True
+
+    def get_exit_status(self):
+        return 0
+
+
+def case(name, dev, step=None, run_ms=400):
+    loop = GLib.MainLoop()
+    d = m.Hotkeyd(loop)
+    d.devices = {P0: (dev, {116: "power"}, 0)}
+    err = io.StringIO()
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+        d.set_grab(True)
+        if step:
+            step(d)
+        GLib.timeout_add(run_ms, loop.quit)
+        loop.run()
+    out = err.getvalue()
+    seen = (f"{name}: grab calls {dev.calls}, retry set {sorted(d.regrab)}, timer {bool(d.regrab_timer)},"
+            f" applied {d.applied}, log {out.splitlines()}")
+    print(seen, file=sys.stderr, flush=True)
+    return d, out, seen
+
+
+def swap(d, new):
+    d.devices[P0] = (new, {116: "power"}, 0)
+
+
+def applied(d):
+    d.wanted = "blanked"
+    d.busy = True
+    d.hook_done(Done(), None, "blanked")
+
+
+bad = []
+a = Dev(2)
+d, out, seen = case("EBUSY twice", a)
+if a.calls != 3 or out.count("grab: Device or resource busy") != 1 or out.count("grabbed on retry") != 1 \
+        or d.regrab or d.regrab_timer:
+    bad.append(seen)
+a = Dev(100)
+d, out, seen = case("awake after one failure", a, lambda d: d.set_grab(False))
+if a.calls != 1 or d.regrab or d.regrab_timer:
+    bad.append(seen)
+a = Dev(100)
+d, out, seen = case("dropped mid retry", a, lambda d: GLib.timeout_add(75, lambda: d.drop(P0) or False))
+if a.calls > 3 or d.regrab or d.regrab_timer:
+    bad.append(seen)
+a, b = Dev(100), Dev(0)
+d, out, seen = case("replaced at the same path", a, lambda d: swap(d, b))
+if a.calls != 1 or b.calls != 0 or d.regrab or d.regrab_timer:
+    bad.append(f"{seen}, new node grab calls {b.calls}")
+P1 = "/dev/input/event1"
+REAL = os.path.realpath(os.path.join(m.SYSFS, "class/input", "event1"))
+
+
+def extra(d, dev, real):
+    d.extra[P1] = (dev, real)
+    d.grab(dev, P1)
+
+
+e = Dev(100)
+d, out, seen = case("extra node replaced in sysfs", Dev(0), lambda d: extra(d, e, "/elsewhere"))
+if e.calls != 1 or not e.closed or P1 in d.extra or d.regrab or d.regrab_timer:
+    bad.append(f"{seen}, extra grab calls {e.calls}, closed {e.closed}")
+e = Dev(100, errno.ENODEV)
+d, out, seen = case("extra node gone, ENODEV", Dev(0), lambda d: extra(d, e, REAL))
+if e.calls != 2 or not e.closed or P1 in d.extra or d.regrab or d.regrab_timer:
+    bad.append(f"{seen}, extra grab calls {e.calls}, closed {e.closed}")
+m.GRAB_RETRY_MS = 10000
+a = Dev(1)
+d, out, seen = case("blank-on applied", a, applied, run_ms=100)
+if a.calls != 2 or d.regrab or d.regrab_timer or d.applied != "blanked":
+    bad.append(seen)
+for x in bad:
+    print(f"FAILED {x}", file=sys.stderr)
+sys.exit(1 if bad else 0)
+EOF
+r=$?
+((r == 0)) || sed 's/^/  /' "$t/grab.out"
+res $r "grab: an EBUSY node is retried every 250 ms while blanked, one log line; waking, a dropped or replaced node and a gone extra node end it; blank-on applied retries at once"
 
 S=$t/sys
 sysnode() {

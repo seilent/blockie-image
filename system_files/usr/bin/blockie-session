@@ -21,11 +21,14 @@ dirs=("$root/etc/blockie/sessions.d" "$root/usr/lib/blockie/sessions.d")
 units=("$root/etc/systemd/user" "$root/usr/lib/systemd/user")
 namere='^[a-z0-9][a-z0-9-]*$'
 appre='^[A-Za-z0-9][A-Za-z0-9._-]*$'
+wordre='^[A-Za-z0-9._/:=@+-]+$'
+dropre='^[a-z0-9][a-z0-9-]* [a-z0-9][a-z0-9-]*$'
+reqfd=""
 
 log() { echo "$me: $*" >&2; }
 
 usage() {
-  echo "usage: $me list | current | get-default | set-default <name> | switch <name> | request <name> [reason] | switcher | next | back | boot | menu <from> | install <name> | ended <unit> | revive <name>" >&2
+  echo "usage: $me list | current | get-default | set-default <name> | switch <name> [app] | request <name> [reason] | switcher | next | back | boot | menu <from> | install <name> | ended <unit> | revive <name>" >&2
   exit 2
 }
 
@@ -43,6 +46,15 @@ trim() {
 }
 
 plain() { [[ $1 == ?*"$2" && $1 != */* && $1 != .* ]]; }
+
+cmdline() {
+  local w words=()
+  read -ra words <<< "$1"
+  (( ${#words[@]} )) && [[ ${words[0]} == /usr/* && ${words[0]} != *..* ]] || return 1
+  for w in "${words[@]}"; do
+    [[ $w =~ $wordre ]] || return 1
+  done
+}
 
 conf() {
   local d
@@ -63,7 +75,7 @@ unit_file() {
 
 load() {
   local f line k v
-  LABEL="" UNIT="" APP_ID="" FOCUS="" SLICE="" DEFAULT="" BACKGROUND="" CHECK="" INSTALL="" START_WAIT="" PARK_FIRST=""
+  LABEL="" UNIT="" APP_ID="" FOCUS="" SLICE="" DEFAULT="" BACKGROUND="" CHECK="" INSTALL="" START_WAIT="" PARK_FIRST="" LEAVE="" SWITCHED=""
   [[ $1 =~ $namere ]] && f=$(conf "$1") || return 1
   while IFS= read -r line || [[ -n $line ]]; do
     line=$(trim "$line")
@@ -74,7 +86,7 @@ load() {
       v=${v:1:-1}
     fi
     case $k in
-      LABEL | UNIT | APP_ID | FOCUS | SLICE | DEFAULT | BACKGROUND | CHECK | INSTALL | START_WAIT | PARK_FIRST) printf -v "$k" '%s' "$v" ;;
+      LABEL | UNIT | APP_ID | FOCUS | SLICE | DEFAULT | BACKGROUND | CHECK | INSTALL | START_WAIT | PARK_FIRST | LEAVE | SWITCHED) printf -v "$k" '%s' "$v" ;;
     esac
   done < "$f"
   BACKGROUND=${BACKGROUND:-freeze}
@@ -88,6 +100,8 @@ load() {
   [[ -z $DEFAULT || $DEFAULT == yes || $DEFAULT == no ]] || return 1
   [[ -z $START_WAIT ]] || { [[ $START_WAIT =~ ^[1-9][0-9]{0,2}$ ]] && (( START_WAIT <= 600 )); } || return 1
   [[ -z $PARK_FIRST || $PARK_FIRST == yes || $PARK_FIRST == no ]] || return 1
+  [[ -z $LEAVE ]] || cmdline "$LEAVE" || return 1
+  [[ -z $SWITCHED ]] || { cmdline "$SWITCHED" && [[ $BACKGROUND == run ]]; } || return 1
   [[ -z $CHECK || ($CHECK == /usr/* && $CHECK != *..*) ]] && [[ -z $INSTALL || ($INSTALL == /usr/* && $INSTALL != *..*) ]]
 }
 
@@ -113,7 +127,7 @@ list() {
 check_state() {
   local rc=0
   [[ -n $CHECK ]] || { echo available; return; }
-  timeout -k 1 "$t_check" "$root$CHECK" < /dev/null > /dev/null || rc=$?
+  timeout -k 1 "$t_check" "$root$CHECK" < /dev/null > /dev/null 7>&- 8<&- 9<&- || rc=$?
   case $rc in
     0) echo available ;;
     1) echo not-installed ;;
@@ -206,6 +220,22 @@ as_user() {
       XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
       WAYLAND_DISPLAY="$display" "$@" < /dev/null
   fi
+}
+
+hookcmd() {
+  local argv=()
+  read -ra argv <<< "$1"
+  shift
+  as_user timeout -k 1 2 "$root${argv[0]}" "${argv[@]:1}" "$@" 7>&- 8<&- 9<&-
+}
+
+reqlock() {
+  if [[ -z $reqfd ]]; then
+    install -d -m 0700 "$rundir/lock" || return 1
+    exec 7>> "$rundir/lock/request.lock" || return 1
+    reqfd=yes
+  fi
+  flock -w "$1" 7
 }
 
 prop() { as_user systemctl --user show -p "$2" --value "$1" 2> /dev/null; }
@@ -328,7 +358,7 @@ undo() {
 }
 
 shown() {
-  local want=$1 end=$2 w
+  local want=$1 end=$2 w wwhy wrest ws=()
   until shows "$t_unit" "$t_app"; do
     if dead "$t_unit"; then
       log "$t_unit stopped while starting"
@@ -342,25 +372,33 @@ shown() {
       fi
       return 1
     fi
-    if [[ -e $rundir/session-pending ]]; then
-      rm -f "$rundir/session-pending"
-      w=""
-      read -r w _ < "$rundir/session-wanted" || true
-      if [[ $w != "$want" ]]; then
-        put "$rundir/session-pending" "$w" || log "cannot write session-pending"
-        log "start of $want cancelled, $w wanted"
-        return 3
+    if [[ -e $rundir/session-pending ]] && reqlock 1; then
+      if [[ -e $rundir/session-pending ]]; then
+        rm -f "${rundir:?}/session-pending"
+        w="" wwhy="" wrest=""
+        read -r w wwhy wrest < "$rundir/session-wanted" || true
+        if [[ $w != "$want" ]]; then
+          put "$rundir/session-pending" "$w" || log "cannot write session-pending"
+          flock -u 7 || log "cannot release the request lock"
+          log "start of $want cancelled, $w wanted"
+          return 3
+        fi
+        if [[ $wwhy == app ]]; then
+          read -ra ws <<< "$wrest"
+          joined+=("${ws[@]}")
+        fi
+        log "$want requested again, still starting"
       fi
-      log "$want requested again, still starting"
+      flock -u 7 || log "cannot release the request lock"
     fi
     sleep "$poll"
   done
 }
 
 switch_once() {
-  local want=$1 t_first state early="" serial end rc=0
+  local want=$1 why=${2:-} t_first state early="" serial end rc=0 lrc=0
   kept=""
-  s_name="" s_unit="" s_app="" s_bg="" s_focus="" s_slice="" s_wait=""
+  s_name="" s_unit="" s_app="" s_bg="" s_focus="" s_slice="" s_wait="" s_leave=""
   load "$want" || { log "$want is not a listed session"; return 1; }
   t_name=$want t_unit=$UNIT t_app=$APP_ID t_focus=$FOCUS t_slice=$SLICE t_bg=$BACKGROUND t_wait=${START_WAIT:-$t_start}
   t_first=${PARK_FIRST:-no}
@@ -369,11 +407,21 @@ switch_once() {
   read_current
   if [[ -n $cur_name && $cur_name != "$want" ]] && load "$cur_name" && [[ $UNIT == "$cur_unit" ]]; then
     s_name=$cur_name s_unit=$UNIT s_app=$APP_ID s_bg=$BACKGROUND s_focus=$FOCUS s_slice=$SLICE s_wait=${START_WAIT:-$t_start}
+    s_leave=$LEAVE
   fi
   if [[ $cur_name == "$want" ]] && active "$t_unit" && thawed "$(frozen_unit "$t_unit" "$t_slice")"; then
     focus "$t_app" "$t_focus"
     log "$want is current"
     return 0
+  fi
+  if [[ -n $s_name && -n $s_leave && $why != app ]]; then
+    hookcmd "$s_leave" "$want" "$why" || lrc=$?
+    if (( lrc == 0 )); then
+      log "leave taken by $s_name"
+      result=none
+      return 0
+    fi
+    log "leave of $s_name exited $lrc, switching"
   fi
   live=$t_unit started=""
   put "$rundir/session-starting" "$want" || log "cannot write session-starting"
@@ -392,6 +440,7 @@ switch_once() {
   end=$(ends_at "$t_wait")
   shown "$want" "$end" || rc=$?
   if (( rc == 3 )); then
+    result=cancelled
     undo cancel
     return 0
   fi
@@ -411,17 +460,115 @@ switch_once() {
 }
 
 request() {
-  local want=$1 why=${2:-requested}
+  local want=$1 why=${2:-requested} from="" ow="" owhy="" orest="" f x dup fs=() out=()
   [[ $(id -u) == 0 ]] || { log "request runs as root, start blockie-session-switch@$want.service"; exit 2; }
   [[ $want =~ $namere && $why =~ $namere ]] || usage
   load "$want" || { log "$want is not a listed session"; exit 1; }
   install -d -m 0755 "$rundir"
-  put "$rundir/session-wanted" "$want $why" || exit 1
+  reqlock 5 || { log "request lock busy"; exit 75; }
+  if [[ $why == app ]]; then
+    read_current
+    from=$cur_name
+  fi
+  if [[ -e $rundir/session-pending ]]; then
+    read -r ow owhy orest < "$rundir/session-wanted" || true
+  fi
+  if [[ $owhy == app ]]; then
+    read -ra fs <<< "$orest"
+  fi
+  if [[ -n $ow && $ow != "$want" ]]; then
+    for f in "${fs[@]}"; do
+      [[ $f =~ $namere ]] || continue
+      printf '%s %s\n' "$ow" "$f" >> "$rundir/session-dropped" || log "cannot write session-dropped"
+    done
+    fs=()
+  elif [[ $owhy == app ]]; then
+    why=app
+  fi
+  [[ -z $from ]] || fs+=("$from")
+  for f in "${fs[@]}"; do
+    [[ $f =~ $namere ]] || continue
+    dup=""
+    for x in "${out[@]}"; do
+      [[ $x != "$f" ]] || dup=yes
+    done
+    [[ -n $dup ]] || (( ${#out[@]} >= 8 )) || out+=("$f")
+  done
+  put "$rundir/session-wanted" "$want $why${out[*]:+ ${out[*]}}" || exit 1
   put "$rundir/session-pending" "$want" || exit 1
+  flock -u 7 || log "cannot release the request lock"
+}
+
+takedrops() {
+  local line d x dup got=()
+  [[ -f $rundir/session-dropped ]] || return 0
+  while IFS= read -r line || [[ -n $line ]]; do
+    if [[ $line =~ $dropre ]]; then
+      got+=("$line")
+    else
+      log "session-dropped: a malformed line skipped"
+    fi
+  done < "$rundir/session-dropped"
+  rm -f "${rundir:?}/session-dropped" || log "cannot remove session-dropped"
+  for d in "${got[@]}"; do
+    dup=""
+    for x in "${taken[@]}"; do
+      [[ $x != "$d" ]] || dup=yes
+    done
+    [[ -z $dup ]] || continue
+    if (( ${#taken[@]} >= 8 )); then
+      log "session-dropped: over 8 drops in this run, the rest not sent"
+      break
+    fi
+    taken+=("$d")
+    drops+=("$d")
+  done
+}
+
+sendto() {
+  if ! load "$1" || [[ -z $SWITCHED ]]; then
+    log "no switched hook for $1, $2 $3 not sent"
+    return 0
+  fi
+  hookcmd "$SWITCHED" "$2" "$3" || log "switched hook of $1 exited $?"
+}
+
+deliver() {
+  local d
+  while (( ${#drops[@]} )); do
+    d=${drops[0]}
+    drops=("${drops[@]:1}")
+    sendto "${d#* }" "${d%% *}" dropped || true
+  done
+}
+
+report() {
+  local n x dup names=() sent=()
+  reported=yes
+  [[ $1 != none ]] || return 0
+  [[ $why != app ]] || names=("${froms[@]}")
+  names+=("${joined[@]}")
+  for n in "${names[@]}"; do
+    dup=""
+    for x in "${sent[@]}"; do
+      [[ $x != "$n" ]] || dup=yes
+    done
+    [[ -z $dup ]] || continue
+    sent+=("$n")
+    sendto "$n" "$want" "$1" || true
+  done
+}
+
+finish() {
+  trap '' TERM
+  [[ -z $reqfd ]] || flock -u 7 || true
+  undo || true
+  [[ -n $reported ]] || report "${result:-failed}" || true
+  deliver || true
 }
 
 switcher() {
-  local want="" why="" rc=0
+  local rc=0 pending="" rest=""
   [[ $(id -u) == 0 ]] || { log "switcher runs as root"; exit 2; }
   ids || { log "no user $user"; exit 1; }
   install -d -m 0755 "$rundir" "$statedir"
@@ -429,21 +576,42 @@ switcher() {
   lockfile "$rundir/lock/session.lock"
   exec 9< "$rundir/lock/session.lock"
   flock -w "$t_lock" 9 || { log "session lock busy"; exit 75; }
-  rm -f "$rundir/session-starting" "$rundir/revive-hold"
-  [[ -e $rundir/session-pending ]] || return 0
-  rm -f "$rundir/session-pending"
-  read -r want why < "$rundir/session-wanted" || true
-  live="" parked="" started="" term="" kept="" s_unit=""
+  live="" parked="" started="" term="" kept="" s_unit="" reported="" result="" want="" why=""
+  froms=() joined=() drops=() taken=()
   trap 'term=1 t_stop=0 s_wait=0; undo; exit 143' TERM
-  trap undo EXIT
-  switch_once "$want" || rc=1
+  trap finish EXIT
+  rm -f "${rundir:?}/session-starting" "${rundir:?}/revive-hold"
+  reqlock 5 || { log "request lock busy"; exit 75; }
+  if [[ -e $rundir/session-pending ]]; then
+    pending=yes
+    rm -f "${rundir:?}/session-pending"
+    read -r want why rest < "$rundir/session-wanted" || true
+    [[ $why != app ]] || read -ra froms <<< "$rest"
+  fi
+  takedrops || log "cannot read session-dropped"
+  flock -u 7 || log "cannot release the request lock"
+  deliver || true
+  [[ -n $pending ]] || return 0
+  switch_once "$want" "$why" && result=${result:-ok} || { rc=1; result=failed; }
+  trap 'term=1 t_stop=0 s_wait=0; undo; exit 143' TERM
+  [[ -z $term ]] || exit 143
+  report "$result" || true
+  if reqlock 5; then
+    takedrops || log "cannot read session-dropped"
+    flock -u 7 || log "cannot release the request lock"
+  else
+    log "request lock busy, drops left for the next run"
+  fi
+  deliver || true
   return "$rc"
 }
 
 switch() {
   load "$1" || { log "$1 is not a listed session"; exit 1; }
   if [[ $(id -u) == 0 ]]; then
-    request "$1" requested
+    request "$1" "${2:-requested}"
+  elif [[ ${2:-} == app ]]; then
+    exec systemctl start --no-block "blockie-session-appswitch@$1.service"
   else
     exec systemctl start --no-block "blockie-session-switch@$1.service"
   fi
@@ -557,7 +725,7 @@ main() {
       ;;
     get-default) (( $# == 1 )) || usage; get_default ;;
     set-default) (( $# == 2 )) && [[ $2 =~ $namere ]] || usage; exec blockie-set set session.default "$2" ;;
-    switch) (( $# == 2 )) && [[ $2 =~ $namere ]] || usage; switch "$2" ;;
+    switch) { (( $# == 2 )) || [[ $# == 3 && $3 == app ]]; } && [[ $2 =~ $namere ]] || usage; switch "$2" "${3:-}" ;;
     request) (( $# == 2 || $# == 3 )) || usage; request "$2" "${3:-requested}" ;;
     switcher) (( $# == 1 )) || usage; switcher ;;
     next) (( $# == 1 )) || usage; next ;;

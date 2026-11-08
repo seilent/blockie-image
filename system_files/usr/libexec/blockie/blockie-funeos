@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -u
+
+me=blockie-funeos
+dev=${BLOCKIE_FUNEOS_DEV:-/var/lib/blockie/dev/funeos}
+dir=${BLOCKIE_FUNEOS_BIN:-/usr/bin}
+data=${BLOCKIE_DATA_DIR:-/var/lib/blockie/data}
+[[ ! -f $dev/funeos || ! -x $dev/funeos ]] || dir=$dev
+
+log() { echo "$me: $*" >&2; }
+
+case ${1:-} in
+  funeos | funeos-ctl)
+    [[ -f $dir/$1 && -x $dir/$1 ]] || { log "no $dir/$1"; exit 127; }
+    log "$dir/$1"
+    exec "$dir/$1" "${@:2}"
+    ;;
+  check)
+    (( $# == 1 )) || { log "usage: $me funeos|funeos-ctl [args] | check"; exit 2; }
+    [[ -f $dir/funeos && -x $dir/funeos ]] || { echo "funeos is not installed"; exit 1; }
+    mountpoint -q "$data" || { echo "$data is not mounted"; exit 1; }
+    exit 0
+    ;;
+  *)
+    log "usage: $me funeos|funeos-ctl [args] | check"
+    exit 2
+    ;;
+esac

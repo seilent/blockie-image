@@ -152,6 +152,8 @@ XDG_RUNTIME_DIR=$xdg systemd-analyze verify --user --man=no /usr/lib/systemd/use
   fail "blockie-frontend.service does not verify"
 XDG_RUNTIME_DIR=$xdg systemd-analyze verify --user --man=no /usr/lib/systemd/user/blockie-poweroff.service ||
   fail "blockie-poweroff.service does not verify"
+XDG_RUNTIME_DIR=$xdg systemd-analyze verify --user --man=no /usr/lib/systemd/user/blockie-funeos.service ||
+  fail "blockie-funeos.service does not verify"
 rm -rf "${xdg:?}"
 rpm -q wlopm > /dev/null || fail "wlopm not installed"
 rpm -q waydroid lxc dnsmasq iptables-legacy > /dev/null || fail "waydroid, lxc, dnsmasq or iptables-legacy not installed"
@@ -162,6 +164,13 @@ for h in blank-on blank-off screen-on; do
   [[ -f /usr/lib/blockie/hooks.d/$h && $(stat -c %a "/usr/lib/blockie/hooks.d/$h") == 755 ]] || fail "hook $h is not a 755 file"
 done
 [[ -x /usr/libexec/blockie/blockie-poweroff ]] || fail "blockie-poweroff missing"
+for f in blockie-hook blockie-funeos blockie-funeos-check; do
+  [[ $(stat -c %a "/usr/libexec/blockie/$f" 2> /dev/null) == 755 ]] || fail "$f is not a 755 file"
+done
+grep -qxF 'ExecStart=/usr/bin/blockie-session request %i app' /usr/lib/systemd/system/blockie-session-appswitch@.service ||
+  fail "blockie-session-appswitch@.service missing or not requesting with reason app"
+grep -qF '/^blockie-session-(switch|appswitch|revive)@[a-z0-9][a-z0-9-]*\.service$/' \
+  /usr/share/polkit-1/rules.d/50-blockie-session.rules || fail "the session polkit rule lacks appswitch@"
 [[ $(stat -c %a /usr/libexec/blockie/blockie-backlight 2> /dev/null) == 755 ]] || fail "blockie-backlight is not a 755 file"
 [[ $(stat -c %a /usr/libexec/blockie/blockie-sleep 2> /dev/null) == 755 ]] || fail "blockie-sleep is not a 755 file"
 for l in 'z /sys/power/state 0664 root blockie -' 'z /sys/power/wakeup_count 0664 root blockie -' \
@@ -171,7 +180,7 @@ done
 po=/usr/lib/systemd/user/blockie-poweroff.service
 grep -qx 'Type=oneshot' "$po" && grep -qx 'TimeoutStartSec=25s' "$po" && ! grep -q '^\[Install\]' "$po" ||
   fail "blockie-poweroff.service is not a 25 s oneshot without [Install]"
-grep -qx 'ExecStopPost=-/usr/lib/blockie/hooks.d/blank-off' /usr/lib/systemd/user/blockie-hotkeyd.service ||
+grep -qx 'ExecStopPost=-/usr/libexec/blockie/blockie-hook blank-off' /usr/lib/systemd/user/blockie-hotkeyd.service ||
   fail "a hotkeyd stop does not wake the screen"
 cmp -s <(printf '[Login]\nHandlePowerKey=ignore\nHandlePowerKeyLongPress=ignore\n') /usr/lib/systemd/logind.conf.d/50-blockie.conf ||
   fail "logind drop-in is not the two ignore lines"
