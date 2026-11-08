@@ -43,10 +43,15 @@ if [[ -z ${DATA_UNIT:-} ]]; then
   res $? "boot-ok does not wait on blockie-data"
 fi
 
-want=$(printf 'd /var/lib/blockie/data/%s 0755 blockie blockie -\n' cache media mupen64plus_next saves states)
+want="d /var/lib/blockie/data/android 0755 root root -
+d /var/lib/blockie/data/android/guest 0700 root root -
+d /var/lib/blockie/data/android/guest/data 0771 blockie blockie -
+d /var/lib/blockie/data/android/images 0755 root root -
+d /var/lib/blockie/data/android/user 0700 blockie blockie -
+$(printf 'd /var/lib/blockie/data/%s 0755 blockie blockie -\n' cache media mupen64plus_next music saves states)"
 [[ $(cat "$conf") == "$want" ]]
-res $? "tmpfiles: cache, media, mupen64plus_next, saves, states owned by blockie"
-! grep -qE 'data/(roms|bios)|data/? |data -' "$conf"
+res $? "tmpfiles: android/ and android/images root 0755, android/guest root 0700, android/guest/data blockie 0771, android/user blockie 0700; cache, media, mupen64plus_next, music, saves, states owned by blockie"
+! grep -qE '^d /var/lib/blockie/data/(roms|bios)([/ ]|$)|^d /var/lib/blockie/data/? ' "$conf"
 res $? "tmpfiles: no line for roms/, bios/ or the mount root"
 [[ ! -e /usr/lib/tmpfiles.d/blockie-data.conf ]] && ! grep -rqs 'blockie/data' /usr/lib/tmpfiles.d
 res $? "tmpfiles: not in tmpfiles.d, so nothing is made under /var before the mount"
@@ -64,11 +69,15 @@ if [[ -z ${DATA_TMPFILES:-} ]] && command -v systemd-tmpfiles > /dev/null; then
   before=$(cd "$r/var/lib/blockie/data" && find roms bios -printf '%p %u %g %m\n' | sort)
   systemd-tmpfiles --root="$r" --create "$conf" > "$top/tmpfiles.out" 2>&1
   ok=$?
-  for n in cache media mupen64plus_next saves states; do
+  for n in cache media mupen64plus_next music saves states; do
     [[ $(stat -c '%U %G %a' "$r/var/lib/blockie/data/$n") == "blockie blockie 755" ]] || ok=1
   done
+  for x in "android root root 755" "android/guest root root 700" "android/guest/data blockie blockie 771" \
+    "android/images root root 755" "android/user blockie blockie 700"; do
+    [[ $(stat -c '%U %G %a' "$r/var/lib/blockie/data/${x%% *}") == "${x#* }" ]] || ok=1
+  done
   [[ $(cd "$r/var/lib/blockie/data" && find roms bios -printf '%p %u %g %m\n' | sort) == "$before" ]] || ok=1
-  res $ok "tmpfiles applied: five blockie dirs, roms/ and bios/ unchanged"
+  res $ok "tmpfiles applied: six blockie dirs, the android tree, roms/ and bios/ unchanged"
 fi
 
 setup() {
@@ -121,28 +130,28 @@ run() {
 
 setup one
 run
-mounted="mount -t ext4 -o rw,noatime,nodev,nosuid,noexec $d/dev/mmcblk1p4 $d/target"
+mounted="mount -t ext4 -o rw,noatime,nodev,nosuid $d/dev/mmcblk1p4 $d/target"
 [[ $rc == 0 && $(cat "$d/calls") == "$(printf 'e2fsck -p %s\n%s' "$d/dev/mmcblk1p4" "$mounted")" ]]
-res $? "script: e2fsck -p, then the one BLOCKIE_DATA partition on the SD host mounted rw,noatime,nodev,nosuid,noexec"
+res $? "script: e2fsck -p, then the one BLOCKIE_DATA partition on the SD host mounted rw,noatime,nodev,nosuid"
 
 setup fsck-fixed
 echo 1 > "$d/fsck.rc"
 run
-mounted="mount -t ext4 -o rw,noatime,nodev,nosuid,noexec $d/dev/mmcblk1p4 $d/target"
+mounted="mount -t ext4 -o rw,noatime,nodev,nosuid $d/dev/mmcblk1p4 $d/target"
 [[ $rc == 0 && $(tail -n 1 "$d/calls") == "$mounted" ]] && ! grep -q reboot "$d/out"
 res $? "script: e2fsck rc 1 (errors fixed): mounted"
 
 setup fsck-reboot
 echo 2 > "$d/fsck.rc"
 run
-mounted="mount -t ext4 -o rw,noatime,nodev,nosuid,noexec $d/dev/mmcblk1p4 $d/target"
+mounted="mount -t ext4 -o rw,noatime,nodev,nosuid $d/dev/mmcblk1p4 $d/target"
 [[ $rc == 0 && $(tail -n 1 "$d/calls") == "$mounted" ]] && grep -q "asks for a reboot, mounting anyway" "$d/out"
 res $? "script: e2fsck rc 2 (reboot asked): logged, mounted"
 
 setup fsck-fixed-reboot
 echo 3 > "$d/fsck.rc"
 run
-mounted="mount -t ext4 -o rw,noatime,nodev,nosuid,noexec $d/dev/mmcblk1p4 $d/target"
+mounted="mount -t ext4 -o rw,noatime,nodev,nosuid $d/dev/mmcblk1p4 $d/target"
 [[ $rc == 0 && $(tail -n 1 "$d/calls") == "$mounted" ]] && grep -q "asks for a reboot, mounting anyway" "$d/out"
 res $? "script: e2fsck rc 3 (fixed, reboot asked): logged, mounted"
 

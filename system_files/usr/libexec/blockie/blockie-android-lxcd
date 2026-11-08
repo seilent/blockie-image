@@ -7,10 +7,10 @@ pad=${BLOCKIE_ANDROID_PAD:-/dev/input/by-blockie/pad}
 run=${BLOCKIE_ANDROID_RUN:-/run/blockie-android}
 out=$run/lxc.d
 payload=${BLOCKIE_ANDROID_PAYLOAD:-/sys/fs/cgroup/lxc.payload.waydroid}
-data2=${BLOCKIE_DATA2_DIR:-/var/lib/blockie/data2}
+data=${BLOCKIE_DATA_DIR:-/var/lib/blockie/data}
 die() { echo "$me: $*" >&2; exit 1; }
 
-mountpoint -q "$data2" || die "$data2 is not mounted"
+mountpoint -q "$data" || die "$data is not mounted"
 state=
 [[ ! -r $run/state ]] || read -r state < "$run/state"
 [[ $state == ok ]] || die "Android prep state is '${state:-none}', not ok"
@@ -60,6 +60,15 @@ else
   echo "$me: no pad at $pad, Android starts without it"
 fi
 
+music=
+if [[ ! -d $data/music ]]; then
+  echo "$me: no $data/music, Android starts without it"
+elif [[ ! -d $data/android/guest/data/media/0 ]]; then
+  echo "$me: Android has not made /data/media/0 yet, music comes with the next start"
+else
+  music="lxc.mount.entry = $data/music data/media/0/Music none bind,ro,create=dir,optional 0 0"$'\n'
+fi
+
 devices=
 if [[ ${BLOCKIE_ANDROID_NODEVICES:-} == 1 ]]; then
   echo "$me: BLOCKIE_ANDROID_NODEVICES=1, no device rules"
@@ -71,5 +80,6 @@ else
 fi
 put devices.conf "$devices"
 put pad.conf "$mount"
+put music.conf "$music"
 put memory.conf $'lxc.cgroup2.memory.high = 1900M\nlxc.cgroup2.memory.max = 2200M\n'
 echo "$me: wrote $out"

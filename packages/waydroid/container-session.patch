@@ -27,7 +27,7 @@ index 6e088bb..f0874dd 100644
  import dbus.exceptions
  from gi.repository import GLib
  
-+BLOCKIE_GUEST_DATA = "/var/lib/blockie/data2/android/guest/data"
++BLOCKIE_GUEST_DATA = "/var/lib/blockie/data/android/guest/data"
 +
  class DbusContainerManager(dbus.service.Object):
      def __init__(self, looper, bus, object_path, args):

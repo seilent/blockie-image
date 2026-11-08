@@ -30,7 +30,7 @@ lib=$t/usr/lib/waydroid
 base=$lib/data/configs/config_base
 grep -qx 'lxc.namespace.clone = mnt uts pid net cgroup' "$base" || fail "config_base does not clone mnt uts pid net cgroup"
 ! grep -q '^lxc\.namespace\.\(keep\|share\)' "$base" || fail "config_base keeps or shares a namespace"
-want=$'lxc.include = /var/lib/waydroid/lxc/waydroid/config_nodes\nlxc.include = /var/lib/waydroid/lxc/waydroid/config_session\nlxc.include = /run/blockie-android/lxc.d/devices.conf\nlxc.include = /run/blockie-android/lxc.d/pad.conf\nlxc.include = /run/blockie-android/lxc.d/memory.conf'
+want=$'lxc.include = /var/lib/waydroid/lxc/waydroid/config_nodes\nlxc.include = /var/lib/waydroid/lxc/waydroid/config_session\nlxc.include = /run/blockie-android/lxc.d/devices.conf\nlxc.include = /run/blockie-android/lxc.d/pad.conf\nlxc.include = /run/blockie-android/lxc.d/music.conf\nlxc.include = /run/blockie-android/lxc.d/memory.conf'
 [[ $(grep '^lxc\.include' "$base") == "$want" ]] || fail "config_base includes: $(grep '^lxc\.include' "$base" | tr '\n' ' ')"
 for c in block_suspend sys_time; do
   grep -qE "^lxc\.cap\.keep = (.* )?$c( |\$)" "$base" || fail "cap.keep lost $c"
@@ -60,7 +60,7 @@ grep -q 'IPTABLES_BIN="$(command -v iptables-legacy)"' "$net" || fail "iptables-
 grep -q 'BLOCKIE_ANDROID_LXCLOG") == "1"' "$lib/tools/helpers/lxc.py" &&
   grep -qF '"-o", "/run/blockie-android/lxc.log"' "$lib/tools/helpers/lxc.py" || fail "lxc.py has no opt-in lxc-start log in /run"
 cm=$lib/tools/actions/container_manager.py
-grep -qx 'BLOCKIE_GUEST_DATA = "/var/lib/blockie/data2/android/guest/data"' "$cm" &&
+grep -qx 'BLOCKIE_GUEST_DATA = "/var/lib/blockie/data/android/guest/data"' "$cm" &&
   grep -qx '        session\["waydroid_data"\] = BLOCKIE_GUEST_DATA' "$cm" &&
   grep -qx '        pw = pwd.getpwuid(int(session\["user_id"\]))' "$cm" &&
   grep -qx '        session\["group_id"\] = str(pw.pw_gid)' "$cm" ||

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -u
 
-data2=${BLOCKIE_DATA2_DIR:-/var/lib/blockie/data2}
+data=${BLOCKIE_DATA_DIR:-/var/lib/blockie/data}
 run=${BLOCKIE_ANDROID_RUN:-/run/blockie-android}
 
 state=
@@ -9,16 +9,16 @@ state=
 kind=${state%% *}
 why=${state#"$kind"}
 why=${why# }
-if ! mountpoint -q "$data2"; then
+if ! mountpoint -q "$data"; then
   if [[ $kind == failed ]]; then
     echo "$why"
     exit 2
   fi
-  echo "${why:-$data2 is not mounted}"
+  echo "${why:-$data is not mounted}"
   exit 1
 fi
 for f in system.img vendor.img; do
-  [[ -f $data2/android/images/$f ]] || { echo "no android/images/$f"; exit 1; }
+  [[ -f $data/android/images/$f ]] || { echo "no android/images/$f"; exit 1; }
 done
 case $kind in
   ok) exit 0 ;;

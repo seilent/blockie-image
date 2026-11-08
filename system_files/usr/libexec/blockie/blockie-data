@@ -35,5 +35,5 @@ e2fsck -p "$dev" || rc=$?
 (( rc < 4 )) || die "e2fsck -p $dev exited $rc, not mounted"
 (( !(rc & 2) )) || echo "$me: e2fsck -p $dev fixed errors and asks for a reboot, mounting anyway"
 install -d -m 0755 "$target"
-mount -t ext4 -o rw,noatime,nodev,nosuid,noexec "$dev" "$target"
+mount -t ext4 -o rw,noatime,nodev,nosuid "$dev" "$target"
 echo "$me: $dev mounted at $target"

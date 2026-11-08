@@ -9,7 +9,7 @@ import subprocess
 import sys
 
 ME = "blockie-android-prep"
-DATA2 = os.environ.get("BLOCKIE_DATA2_DIR", "/var/lib/blockie/data2")
+DATA = os.environ.get("BLOCKIE_DATA_DIR", "/var/lib/blockie/data")
 RUN = os.environ.get("BLOCKIE_ANDROID_RUN", "/run/blockie-android")
 WORK = os.environ.get("BLOCKIE_WAYDROID_WORK", "/var/lib/waydroid")
 PIN = os.environ.get("BLOCKIE_ANDROID_PIN", "/usr/share/blockie/android.d/lineage-20-gapps.conf")
@@ -18,7 +18,7 @@ BASE = os.environ.get("BLOCKIE_WAYDROID_BASE", "/usr/lib/waydroid/data/configs/c
 PAYLOAD = os.environ.get("BLOCKIE_ANDROID_PAYLOAD", "/sys/fs/cgroup/lxc.payload.waydroid")
 LOCALTIME = os.environ.get("BLOCKIE_LOCALTIME", "/etc/localtime")
 EXTRA = "/usr/share/waydroid-extra/images"
-ANDROID = os.path.join(DATA2, "android")
+ANDROID = os.path.join(DATA, "android")
 IMAGES = os.path.join(ANDROID, "images")
 PREPARED = os.path.join(ANDROID, "prepared")
 CFG = os.path.join(WORK, "waydroid.cfg")
@@ -165,8 +165,8 @@ def keylayout():
 
 
 def prep():
-    if subprocess.run(["mountpoint", "-q", DATA2]).returncode != 0:
-        raise Refused("missing", f"{DATA2} is not mounted")
+    if subprocess.run(["mountpoint", "-q", DATA]).returncode != 0:
+        raise Refused("missing", f"{DATA} is not mounted")
     rows = pin()
     stamp = images(rows)
     base = read(BASE)

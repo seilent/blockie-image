@@ -1,8 +1,8 @@
 [Unit]
 Description=Check the Android images and prepare Waydroid
-Requires=blockie-data2.service
-After=blockie-data2.service
-RequiresMountsFor=/var/lib/blockie/data2
+Requires=blockie-data.service
+After=blockie-data.service
+RequiresMountsFor=/var/lib/blockie/data
 
 [Service]
 Type=oneshot
