@@ -459,7 +459,8 @@ grun() {
     BLOCKIE_ANDROID_PIN=$g/imgpin BLOCKIE_WAYDROID_BASE=$g/config_base BLOCKIE_ANDROID_PAYLOAD=$g/payload \
     BLOCKIE_LOCALTIME=$g/localtime BLOCKIE_ANDROID_GPU_PIN=$g/gpin BLOCKIE_ANDROID_VENDOR=$g/vendor \
     BLOCKIE_ANDROID_HWC_SHIM=$g/hwc/hwcomposer.blockie.so BLOCKIE_KBASE_ARMED=$g/armed BLOCKIE_BOOT_ID=$g/bootid \
-    "$@" timeout 20 "$lx/blockie-android-prep" > "$g/out" 2>&1
+    BLOCKIE_SETD_STORE=$g/gpusetting \
+    timeout 20 "$lx/blockie-android-prep" > "$g/out" 2>&1
   rc=$?
   st=$(cat "$g/run/state" 2> /dev/null)
 }
@@ -610,6 +611,97 @@ gpin "$D"
 gbuildvendor
 echo gpu-boot-twelve > "$g/bootid"
 res $ok "prep gpu: when waydroid upgrade fails staging mali, the files and props stay and prepared is not advanced, so the next start retries"
+
+ok=0
+gbuildvendor
+gpin "$D"
+rm -f "${g:?}/waydroid.rc"
+echo g-soft-midway > "$g/bootid"
+grun
+[[ $(gcfg ro.hardware.egl) == mali ]] || { ok=1; echo "  soft midway setup not mali"; }
+echo '0 0' > "$g/armed"
+echo 1 > "$g/waydroid.rc"
+echo g-soft-midway-b > "$g/bootid"
+grun
+[[ $rc == 1 && $st == 'failed waydroid upgrade exited 1' && $(gcfg ro.hardware.egl) == - && -f $ov/lib/egl/egl.cfg &&
+  $(sed -n 5p "$g/data/android/prepared") != 'gpu soft' ]] || { ok=1; echo "  soft midway: rc $rc '$st' $(gcfg ro.hardware.egl)"; }
+rm -f "${g:?}/waydroid.rc"
+echo '1 0' > "$g/armed"
+res $ok "prep gpu: when waydroid upgrade fails switching to soft, the hardware props are gone from the cfg but the staged files stay and prepared keeps the mali line, so the next start retries"
+
+ok=0
+shipg=/usr/share/blockie/android.d/gpu-mt6768.conf
+cat > "$g/wdvendor.list" << 'EOF'
+lib/libdrm.so
+lib64/libdrm.so
+lib/libc.so
+lib/hw/android.hardware.graphics.mapper@4.0-impl.minigbm_gbm_mesa.so
+lib64/hw/android.hardware.graphics.mapper@4.0-impl.minigbm_gbm_mesa.so
+etc/init/android.hardware.graphics.allocator@4.0-service.minigbm_gbm_mesa.rc
+EOF
+bad=$(awk '$1 == "f" || $1 == "l" { print $2 }' "$shipg" | grep -Fxf "$g/wdvendor.list" || true)
+[[ -z $bad ]] || { ok=1; echo "  staged path shadows a Waydroid vendor path: $bad"; }
+awk '$1 == "f" || $1 == "l" { print $2 }' "$shipg" | grep -qxE 'lib/libdrm\.so|lib64/libdrm\.so' && { ok=1; echo "  libdrm.so is pinned"; } || true
+for w in $(awk '$1 == "w" { print $2 }' "$shipg"); do
+  grep -qxF "$w" "$g/wdvendor.list" || { ok=1; echo "  whiteout $w is not a Waydroid vendor path"; }
+done
+res $ok "prep gpu pin: no staged file or link is a Waydroid vendor path (libdrm.so stays Waydroid's, outside the pin), and every whiteout targets a real Waydroid vendor path so it hides the minigbm files"
+
+ok=0
+aj=/usr/share/blockie/schema.d/20-android.json
+python3 -m json.tool "$aj" > /dev/null 2>&1 || { ok=1; echo "  schema invalid json"; }
+python3 - "$aj" << 'PY' || { ok=1; echo "  schema fields"; }
+import json, sys
+k = json.load(open(sys.argv[1]))["keys"]["android.gpu"]
+ok = (k["type"] == "s" and k["default"] == "mali" and k["enum"] == ["mali", "soft"]
+      and k["group"] == "android" and k["label"] == "Android GPU")
+sys.exit(0 if ok else 1)
+PY
+res $ok "schema: android.gpu is a string, default mali, enum mali or soft, group android, labelled Android GPU"
+
+gbuildvendor
+gpin
+D=$(gdigest)
+gpin "$D"
+rm -f "${g:?}/gpusetting" "${g:?}/data/android/gpu-failed"
+
+ok=0
+echo '{"android.gpu":"soft"}' > "$g/gpusetting"
+echo g2-boot-one > "$g/bootid"
+grun
+[[ $rc == 0 && $st == ok && $(gcfg ro.hardware.egl) == - && $(sed -n 5p "$g/data/android/prepared") == 'gpu soft' ]] ||
+  { ok=1; echo "  setting soft: '$st' $(gcfg ro.hardware.egl)"; }
+rm -f "${g:?}/gpusetting"
+res $ok "prep gpu: android.gpu set to soft keeps Android on software even with a matching set and armed hook, removing the hardware props"
+
+ok=0
+echo '{"android.gpu":"mali"}' > "$g/gpusetting"
+echo g2-boot-two > "$g/bootid"
+grun
+[[ $(gcfg ro.hardware.egl) == mali && $(cat "$g/data/android/gpu-failed") == "$D 0" ]] || { ok=1; echo "  arm baseline $(cat "$g/data/android/gpu-failed" 2> /dev/null)"; }
+printf '%s 2\n' "$D" > "$g/data/android/gpu-failed"
+echo g2-boot-two-b > "$g/bootid"
+grun
+[[ $rc == 0 && $st == ok && $(gcfg ro.hardware.egl) == - ]] && grep -q "gpu failed twice on $D, soft" "$g/out" ||
+  { ok=1; echo "  honoured: '$st' $(gcfg ro.hardware.egl)"; }
+res $ok "prep gpu: a matching set arms the fail marker at zero, and two consecutive boot misses on that digest make prep use soft and log it, state ok"
+
+ok=0
+printf '%s 2\n' "$(printf '%064d' 1)" > "$g/data/android/gpu-failed"
+echo g2-boot-three > "$g/bootid"
+grun
+[[ $(gcfg ro.hardware.egl) == mali && $(cat "$g/data/android/gpu-failed") == "$D 0" ]] ||
+  { ok=1; echo "  new digest clears: $(cat "$g/data/android/gpu-failed" 2> /dev/null)"; }
+res $ok "prep gpu: a fail marker left by a different digest does not disable the GPU; prep rearms the marker at zero for the current digest and uses mali"
+
+ok=0
+printf '%s 2\n' "$D" > "$g/data/android/gpu-failed"
+echo '{"android.gpu":"soft"}' > "$g/gpusetting"
+echo g2-boot-four > "$g/bootid"
+grun
+[[ $(gcfg ro.hardware.egl) == - && ! -e $g/data/android/gpu-failed ]] || { ok=1; echo "  soft clears marker"; }
+rm -f "${g:?}/gpusetting"
+res $ok "prep gpu: setting android.gpu to soft clears the fail marker, so a later switch back to mali tries the GPU again"
 
 l=$t/lxcd
 mkdir -p "$l/proc" "$l/run" "$l/bin" "$l/data/music" "$l/data/android/guest/data/media/0"
@@ -1530,5 +1622,26 @@ rstart
 rwait
 [[ $rc == 0 ]] && grep -q 'while the system stops' "$r/out" || { ok=1; echo "  ui ends while stopping: rc $rc"; }
 res $ok "run: a removed payload is dead too; the payload or show-full-ui ending while the system stops is rc 0; a payload ending while the container unit stops, or a SIGTERM, ends with rc 0; show-full-ui's own rc passes through"
+
+ok=0
+rsetup
+mkdir -p "$r/run" "$r/android"
+GD=$(printf '%064d' 3)
+echo "boot-xyz $GD" > "$r/run/gpu-digest"
+grunrc() {
+  PATH=$r/bin:$PATH BLOCKIE_ROOT=$r BLOCKIE_ANDROID_PAYLOAD=$r/payload BLOCKIE_WAYDROID_LIB=$r/lib BLOCKIE_ANDROID_STEP=0.05 \
+    BLOCKIE_ANDROID_RUN=$r/run BLOCKIE_DATA_DIR=$r timeout 20 "$lx/blockie-android-run" > "$r/out" 2>&1
+  rc=$?
+}
+echo mali > "$r/run/gpu-mode"
+printf '%s 0\n' "$GD" > "$r/android/gpu-failed"
+grunrc
+[[ $rc == 1 && $(cat "$r/android/gpu-failed") == "$GD 1" ]] && grep -q 'not seen within the start wait' "$r/out" ||
+  { ok=1; echo "  marker written: rc $rc $(cat "$r/android/gpu-failed")"; }
+echo soft > "$r/run/gpu-mode"
+printf '%s 0\n' "$GD" > "$r/android/gpu-failed"
+grunrc
+[[ $(cat "$r/android/gpu-failed") == "$GD 0" ]] || { ok=1; echo "  soft leaves marker: $(cat "$r/android/gpu-failed")"; }
+res $ok "run: in mali mode no sys.boot_completed within START_WAIT increments the gpu fail marker for the booted digest and logs it; in soft mode the marker is left alone"
 
 done_

@@ -1,0 +1,12 @@
+{
+  "owner": "blockie-set",
+  "keys": {
+    "android.gpu": {
+      "type": "s",
+      "default": "mali",
+      "enum": ["mali", "soft"],
+      "group": "android",
+      "label": "Android GPU"
+    }
+  }
+}

@@ -12,6 +12,11 @@ ME = "blockie-android-run"
 ROOT = os.environ.get("BLOCKIE_ROOT", "")
 PAYLOAD = os.environ.get("BLOCKIE_ANDROID_PAYLOAD", "/sys/fs/cgroup/lxc.payload.waydroid")
 LIB = os.environ.get("BLOCKIE_WAYDROID_LIB", "/usr/lib/waydroid")
+RUN = os.environ.get("BLOCKIE_ANDROID_RUN", "/run/blockie-android")
+DATA = os.environ.get("BLOCKIE_DATA_DIR", "/var/lib/blockie/data")
+GPU_MODE = os.path.join(RUN, "gpu-mode")
+GPU_DIGEST = os.path.join(RUN, "gpu-digest")
+GPU_FAILED = os.path.join(DATA, "android", "gpu-failed")
 STEP = float(os.environ.get("BLOCKIE_ANDROID_STEP", "0.25"))
 TRY = 2
 TRIES = 3
@@ -37,6 +42,44 @@ stopping = False
 
 def log(msg):
     print(f"{ME}: {msg}", file=sys.stderr, flush=True)
+
+
+def gpu_mali():
+    try:
+        with open(GPU_MODE) as f:
+            return f.read().split()[:1] == ["mali"]
+    except OSError:
+        return False
+
+
+def gpu_digest():
+    try:
+        with open(GPU_DIGEST) as f:
+            return f.read().strip().partition(" ")[2]
+    except OSError:
+        return ""
+
+
+def gpu_mark(digest, count):
+    if not digest:
+        return
+    try:
+        with open(GPU_FAILED, "w") as f:
+            f.write(f"{digest} {count}\n")
+    except OSError:
+        pass
+
+
+def gpu_fail(digest):
+    count = 0
+    try:
+        with open(GPU_FAILED) as f:
+            fields = f.read().split()
+        if len(fields) == 2 and fields[0] == digest and fields[1].isdigit():
+            count = int(fields[1])
+    except OSError:
+        pass
+    gpu_mark(digest, count + 1)
 
 
 def conf():
@@ -151,6 +194,9 @@ def main():
     signal.signal(signal.SIGINT, term)
     app, wait = conf()
     deadline = time.monotonic() + wait
+    mali = gpu_mali()
+    gdigest = gpu_digest()
+    booted = marked = False
     try:
         ui = run(["waydroid", "show-full-ui"])
     except OSError as e:
@@ -181,6 +227,10 @@ def main():
             log(f"waydroid show-full-ui exited {rc}")
             return rc
         now = time.monotonic()
+        if mali and not booted and not marked and now >= deadline:
+            gpu_fail(gdigest)
+            marked = True
+            log("sys.boot_completed not seen within the start wait, the guest GPU is marked")
         if not window and now < deadline:
             if subprocess.run(["wlrctl", "toplevel", "find", f"app_id:{app}"], stdin=subprocess.DEVNULL,
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
@@ -234,6 +284,10 @@ def main():
                     last = now
                     if out[-1:] == ["1"]:
                         put = run([sys.executable, "-c", TIMEOUT, LIB], stdout=subprocess.DEVNULL)
+                        if not booted:
+                            booted = True
+                            if mali:
+                                gpu_mark(gdigest, 0)
             elif now - last >= TRY:
                 boot = run(["waydroid", "prop", "get", "sys.boot_completed"], stdout=subprocess.PIPE,
                            stderr=subprocess.DEVNULL, text=True)

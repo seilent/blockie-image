@@ -2,7 +2,9 @@
 import configparser
 import hashlib
 import io
+import json
 import os
+import pwd
 import re
 import shutil
 import subprocess
@@ -32,6 +34,9 @@ BASE_PROP = os.environ.get("BLOCKIE_WAYDROID_BASE_PROP", os.path.join(WORK, "way
 GPU_STAGED = os.path.join(ANDROID, "gpu-staged")
 GPU_DIGEST = os.path.join(RUN, "gpu-digest")
 GPU_MODE = os.path.join(RUN, "gpu-mode")
+GPU_FAILED = os.path.join(ANDROID, "gpu-failed")
+SETD_STORE = os.environ.get("BLOCKIE_SETD_STORE", "/var/lib/blockie/settings/settings.json")
+SESSION_USER = os.environ.get("BLOCKIE_SESSION_USER", "blockie")
 SHIMPATH = "lib64/hw/hwcomposer.blockie.so"
 PROPERTIES = {
     "persist.waydroid.width": "960",
@@ -226,9 +231,59 @@ def gpu_shim(spec):
     return spec["shim"]
 
 
-def gpu_decide(spec):
+def gpu_setting():
+    data = read(SETD_STORE)
+    if data is None:
+        return "mali"
+    try:
+        value = json.loads(data).get("android.gpu")
+    except ValueError:
+        return "mali"
+    return value if value in ("mali", "soft") else "mali"
+
+
+def gpu_fail_read():
+    fields = (read(GPU_FAILED) or "").split()
+    if len(fields) == 2 and re.fullmatch(r"[0-9a-f]{64}", fields[0]) and fields[1].isdigit():
+        return fields[0], int(fields[1])
+    return None, 0
+
+
+def gpu_failed_twice(digest):
+    fdigest, count = gpu_fail_read()
+    return fdigest == digest and count >= 2
+
+
+def gpu_fail_write(digest, count):
+    try:
+        put(GPU_FAILED, f"{digest} {count}\n", 0o600)
+        try:
+            info = pwd.getpwnam(SESSION_USER)
+            os.chown(GPU_FAILED, info.pw_uid, info.pw_gid)
+        except (KeyError, PermissionError, OSError):
+            pass
+    except OSError as e:
+        log(f"cannot write {GPU_FAILED}: {e}")
+
+
+def gpu_fail_arm(digest):
+    fdigest, _ = gpu_fail_read()
+    if fdigest != digest:
+        gpu_fail_write(digest, 0)
+
+
+def gpu_fail_clear():
+    try:
+        os.remove(GPU_FAILED)
+    except FileNotFoundError:
+        pass
+
+
+def gpu_decide(spec, setting):
     if spec is None or not spec["digest"]:
         return "soft", None, None, "no gpu set"
+    if setting == "soft":
+        return "soft", None, None, None
     digest, missing = gpu_digest(spec)
     if missing:
         return "soft", None, None, "no gpu set"
@@ -236,6 +291,8 @@ def gpu_decide(spec):
         return "soft", None, None, "gpu set changed"
     if not kbase_armed():
         return "soft", None, None, "kbase hook not armed"
+    if gpu_failed_twice(digest):
+        return "soft", None, None, f"gpu failed twice on {digest}"
     return "mali", digest, gpu_shim(spec), None
 
 
@@ -417,7 +474,8 @@ def prep():
     props = "".join(f"{k}={v}\n" for k, v in sorted(properties().items()))
     spec = gpu_pin()
     is_running = running()
-    mode, digest, shim, reason = gpu_decide(spec)
+    setting = gpu_setting()
+    mode, digest, shim, reason = gpu_decide(spec, setting)
     want = (f"waydroid {version()}\nconfig_base {sha256(base)}\nproperties {sha256(props)}\n"
             f"images {sha256(stamp)}\n{gpu_line(mode, digest, shim)}\n")
     initialized = os.path.isdir(os.path.join(WORK, "rootfs"))
@@ -447,6 +505,10 @@ def prep():
                     f"images {sha256(stamp)}\n{gpu_line(mode, digest, shim)}\n")
     if reason:
         log(f"{reason}, soft for this start")
+    if mode == "mali":
+        gpu_fail_arm(digest)
+    elif setting == "soft":
+        gpu_fail_clear()
     os.makedirs(RUN, 0o755, exist_ok=True)
     put(GPU_MODE, mode + "\n")
     config("mali" if mode == "mali" else "soft")
