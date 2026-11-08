@@ -28,6 +28,7 @@ install -Dm644 "$src/config" "$moddir/config"
 install -Dm644 -t "$moddir" "$in/System.map" "$in/modules.builtin" "$in/modules.builtin.modinfo"
 install -Dm644 -t "$moddir/extra" "$in"/extra/*.ko
 (cd "$moddir" && printf '%s\n' extra/*.ko > modules.order)
+install -Dm644 "$src/blockie-kbase-pidns.conf" "$stage/usr/lib/modules-load.d/blockie-kbase-pidns.conf"
 install -Dm644 "$src/LICENSE.kernel" "$stage/usr/share/licenses/blockie-kernel/LICENSE.kernel"
 if ! depmod -b "$stage/usr" -e -F "$moddir/System.map" "$kver" 2> "$top/depmod.err" || [[ -s $top/depmod.err ]]; then
   cat "$top/depmod.err" >&2

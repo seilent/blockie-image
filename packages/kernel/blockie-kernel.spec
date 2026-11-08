@@ -18,7 +18,8 @@ Provides:       kernel-modules-core = %{version}-%{release}
 
 %description
 Linux %{kver}: vmlinuz, config, System.map, the built in module lists and
-the out of tree modules in extra/. Vendor modules come from the device.
+the out of tree modules in extra/, with blockie_kbase_pidns loaded at boot
+through modules-load.d. Vendor modules come from the device.
 
 %install
 cp -a %{stage}/. %{buildroot}/
@@ -26,3 +27,4 @@ cp -a %{stage}/. %{buildroot}/
 %files
 %license /usr/share/licenses/blockie-kernel/LICENSE.kernel
 /usr/lib/modules/%{kver}
+/usr/lib/modules-load.d/blockie-kbase-pidns.conf

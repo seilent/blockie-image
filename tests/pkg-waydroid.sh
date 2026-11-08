@@ -30,7 +30,7 @@ lib=$t/usr/lib/waydroid
 base=$lib/data/configs/config_base
 grep -qx 'lxc.namespace.clone = mnt uts pid net cgroup' "$base" || fail "config_base does not clone mnt uts pid net cgroup"
 ! grep -q '^lxc\.namespace\.\(keep\|share\)' "$base" || fail "config_base keeps or shares a namespace"
-want=$'lxc.include = /var/lib/waydroid/lxc/waydroid/config_nodes\nlxc.include = /var/lib/waydroid/lxc/waydroid/config_session\nlxc.include = /run/blockie-android/lxc.d/devices.conf\nlxc.include = /run/blockie-android/lxc.d/music.conf\nlxc.include = /run/blockie-android/lxc.d/memory.conf'
+want=$'lxc.include = /var/lib/waydroid/lxc/waydroid/config_nodes\nlxc.include = /var/lib/waydroid/lxc/waydroid/config_session\nlxc.include = /run/blockie-android/lxc.d/devices.conf\nlxc.include = /run/blockie-android/lxc.d/music.conf\nlxc.include = /run/blockie-android/lxc.d/memory.conf\nlxc.include = /run/blockie-android/lxc.d/gpu.conf'
 [[ $(grep '^lxc\.include' "$base") == "$want" ]] || fail "config_base includes: $(grep '^lxc\.include' "$base" | tr '\n' ' ')"
 for c in block_suspend sys_time; do
   grep -qE "^lxc\.cap\.keep = (.* )?$c( |\$)" "$base" || fail "cap.keep lost $c"

@@ -322,7 +322,8 @@ for kv in properties:persist.waydroid.width:960 properties:persist.waydroid.heig
 done
 cmp -s /usr/share/blockie/android/Vendor_4001_Product_0428.kl "$p/work/overlay/system/usr/keylayout/Vendor_4001_Product_0428.kl" &&
   [[ -d $p/work/overlay/vendor ]] || { ok=1; echo "  keylayout"; }
-[[ $(sed -n 1p "$p/data/android/prepared") == 'waydroid 1.6.3-1.fc44.blockie' && $(wc -l < "$p/data/android/prepared") == 4 ]] ||
+[[ $(sed -n 1p "$p/data/android/prepared") == 'waydroid 1.6.3-1.fc44.blockie' && $(wc -l < "$p/data/android/prepared") == 5 &&
+  $(sed -n 5p "$p/data/android/prepared") == 'gpu soft' ]] ||
   { ok=1; echo "  prepared"; }
 [[ ! -e $p/data/android/images.old ]] || { ok=1; echo "  images.old kept"; }
 res $ok "prep: first run writes the properties, pins freeze and overlays (back to True after init), runs init once, copies the keylayout, records the stamp, drops images.old"
@@ -390,6 +391,225 @@ printf 'system.img https://example.invalid/s.zip %s 4096\n' "$sys1" > "$p/pin2"
 prun "$p/pin2"
 [[ $rc == 1 && $st == "failed pin incomplete" ]] || { ok=1; echo "  one image: '$st'"; }
 res $ok "prep: a missing image is missing, a wrong size, stamp or no stamp, a failed init, a '-' or a missing image line is failed, each with the reason"
+
+g=$t/gpu
+ov=$g/work/overlay/vendor
+mkdir -p "$g/bin" "$g/data/android/images" "$g/work/overlay/vendor" "$g/run" "$g/vendor" "$g/hwc" "$g/zoneinfo/Asia"
+cp /usr/lib/waydroid/data/configs/config_base "$g/config_base"
+: > "$g/zoneinfo/Asia/Tokyo"
+ln -sfn "$g/zoneinfo/Asia/Tokyo" "$g/localtime"
+: > "$g/mounted"
+echo 1.6.3-1.fc44.blockie > "$g/version"
+printf '#!/bin/sh\n[ -e "%s/mounted" ]\n' "$g" > "$g/bin/mountpoint"
+printf '#!/bin/sh\ncat "%s/version"\n' "$g" > "$g/bin/rpm"
+printf '#!/bin/sh\nf=$3\n: > "$f"\necho "mknod $*" >> "%s/mknod.calls"\n[ ! -e "%s/mknodfail" ] || exit 1\n' "$g" "$g" > "$g/bin/mknod"
+sed "s#$p/#$g/#g" "$p/bin/waydroid" > "$g/bin/waydroid"
+chmod 755 "$g/bin/"*
+gsys=$(printf '%064d' 7)
+gven=$(printf '%064d' 8)
+gzip=$(printf '%064d' 9)
+printf 'system.img https://example.invalid/system.zip %s 4096 %s\nvendor.img https://example.invalid/vendor.zip %s 2048\n' "$gsys" "$gzip" "$gven" > "$g/imgpin"
+printf 'system.img 4096 %s\nvendor.img 2048 %s\n' "$gsys" "$gven" > "$g/data/android/images/stamp"
+truncate -s 4096 "$g/data/android/images/system.img"
+truncate -s 2048 "$g/data/android/images/vendor.img"
+echo '1 0' > "$g/armed"
+echo gpu-boot-one > "$g/bootid"
+printf 'blockie-hwc-shim-content\n' > "$g/hwc/hwcomposer.blockie.so"
+gshim=$(sha256sum < "$g/hwc/hwcomposer.blockie.so" | cut -d' ' -f1)
+shipgpin=/usr/share/blockie/android.d/gpu-mt6768.conf
+gbuildvendor() {
+  rm -rf "${g:?}/vendor"
+  mkdir -p "$g/vendor"
+  python3 - "$shipgpin" "$g/vendor" "${1:-}" << 'PY'
+import os, sys
+pin, ven, salt = sys.argv[1], sys.argv[2], sys.argv[3]
+stock = ("service vendor.gralloc-4-0 /vendor/bin/hw/android.hardware.graphics.allocator@4.0-service-mediatek\n"
+         "    class hal\n    user system\n    group system graphics\n"
+         "    interface android.hardware.graphics.allocator@4.0::IAllocator default\n"
+         "    disabled\n\nservice other stuff\n    class late_start\n")
+for line in open(pin):
+    f = line.split()
+    if not f:
+        continue
+    if f[0] == "f":
+        full = os.path.join(ven, f[1])
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        open(full, "w").write(salt + f[1])
+        os.chmod(full, 0o755 if (len(f) > 2 and f[2] == "0755") else 0o644)
+    elif f[0] == "l":
+        full = os.path.join(ven, f[1])
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        if not os.path.lexists(full):
+            os.symlink(f[2], full)
+    elif f[0] == "rc":
+        full = os.path.join(ven, f[2])
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        open(full, "w").write(stock)
+PY
+}
+gpin() {
+  sed '/^shim /d; /^digest /d' "$shipgpin" > "$g/gpin"
+  echo "shim $gshim" >> "$g/gpin"
+  [[ -z ${1:-} ]] || echo "digest $1" >> "$g/gpin"
+}
+grun() {
+  : > "$g/calls"
+  rm -f "${g:?}/mknod.calls"
+  PATH=$g/bin:$PATH BLOCKIE_DATA_DIR=$g/data BLOCKIE_ANDROID_RUN=$g/run BLOCKIE_WAYDROID_WORK=$g/work \
+    BLOCKIE_ANDROID_PIN=$g/imgpin BLOCKIE_WAYDROID_BASE=$g/config_base BLOCKIE_ANDROID_PAYLOAD=$g/payload \
+    BLOCKIE_LOCALTIME=$g/localtime BLOCKIE_ANDROID_GPU_PIN=$g/gpin BLOCKIE_ANDROID_VENDOR=$g/vendor \
+    BLOCKIE_ANDROID_HWC_SHIM=$g/hwc/hwcomposer.blockie.so BLOCKIE_KBASE_ARMED=$g/armed BLOCKIE_BOOT_ID=$g/bootid \
+    "$@" timeout 20 "$lx/blockie-android-prep" > "$g/out" 2>&1
+  rc=$?
+  st=$(cat "$g/run/state" 2> /dev/null)
+}
+gdigest() {
+  PATH=$g/bin:$PATH BLOCKIE_ANDROID_GPU_PIN=$g/gpin BLOCKIE_ANDROID_VENDOR=$g/vendor \
+    "$lx/blockie-android-prep" gpu-digest
+}
+gcfg() { python3 -c 'import configparser, sys; c = configparser.ConfigParser(); c.read(sys.argv[1]); print(c.get("properties", sys.argv[2], fallback="-"))' "$g/work/waydroid.cfg" "$1"; }
+
+gbuildvendor
+gpin
+D=$(gdigest)
+gpin "$D"
+
+ok=0
+grun
+[[ $rc == 0 && $st == ok ]] || { ok=1; echo "  mali rc $rc '$st' $(cat "$g/out")"; }
+for kv in ro.hardware.egl:mali ro.hardware.gralloc:mediatek ro.hardware.vulkan:mt6768 ro.sf.lcd_density:240; do
+  IFS=: read -r k v <<< "$kv"
+  [[ $(gcfg "$k") == "$v" ]] || { ok=1; echo "  prop $k is $(gcfg "$k")"; }
+done
+[[ $(gcfg ro.hardware.hwcomposer) == - ]] || { ok=1; echo "  hwcomposer prop set"; }
+[[ -f $ov/lib64/egl/libGLES_mali.so && -f $ov/lib/egl/egl.cfg ]] || { ok=1; echo "  files not staged"; }
+[[ $(stat -c '%a' "$ov/bin/hw/android.hardware.graphics.allocator@4.0-service-mediatek") == 755 &&
+  $(stat -c '%a' "$ov/lib64/libged.so") == 644 && $(stat -c '%a' "$ov/lib64") == 755 ]] || { ok=1; echo "  modes"; }
+[[ $(readlink "$ov/lib64/hw/vulkan.mt6768.so") == /vendor/lib64/egl/libGLES_mali.so &&
+  $(readlink "$ov/lib/libdpframework.so") == mt6768/libdpframework.so ]] || { ok=1; echo "  links by target"; }
+[[ -f $ov/lib64/hw/hwcomposer.blockie.so ]] || { ok=1; echo "  shim not staged"; }
+[[ -f $ov/etc/init/blockie.graphics.allocator@4.0-mediatek.rc ]] &&
+  [[ $(grep -c '^    mount none ' "$ov/etc/init/blockie.graphics.allocator@4.0-mediatek.rc") == 3 ]] &&
+  grep -q '^    enable vendor.gralloc-4-0$' "$ov/etc/init/blockie.graphics.allocator@4.0-mediatek.rc" ||
+  { ok=1; echo "  blockie rc"; }
+[[ ! -e $ov/etc/init/android.hardware.graphics.allocator@4.0-service-mediatek.rc ]] || { ok=1; echo "  stock rc staged"; }
+[[ $(grep -c ' c 0 0$' "$g/mknod.calls") == 3 ]] || { ok=1; echo "  whiteout mknods $(cat "$g/mknod.calls")"; }
+[[ $(sed -n 5p "$g/data/android/prepared") == "gpu $D shim $gshim" ]] || { ok=1; echo "  prepared gpu line $(sed -n 5p "$g/data/android/prepared")"; }
+grep -qxF "lib64/hw/hwcomposer.blockie.so" "$g/data/android/gpu-staged" && grep -qxF "lib/egl/egl.cfg" "$g/data/android/gpu-staged" ||
+  { ok=1; echo "  gpu-staged list"; }
+res $ok "prep gpu: a matching set, armed and a matching shim stage the files, links by target, whiteouts, the blockie allocator rc (3 vintf binds, enable) and the shim, write egl, gralloc, vulkan and density props but no hwcomposer prop, never stage the stock rc, and record the gpu line and the staged list"
+
+ok=0
+rm -f "${g:?}/hwc/hwcomposer.blockie.so"
+grun
+[[ $rc == 0 && $st == ok && $(gcfg ro.hardware.egl) == mali && ! -e $ov/lib64/hw/hwcomposer.blockie.so &&
+  $(sed -n 5p "$g/data/android/prepared") == "gpu $D" ]] || { ok=1; echo "  no shim: '$st' $(sed -n 5p "$g/data/android/prepared")"; }
+printf 'blockie-hwc-shim-content\n' > "$g/hwc/hwcomposer.blockie.so"
+res $ok "prep gpu: a missing shim stays mali (the hwcomposer prop is gated on the device tear run, not shipped yet) and the prepared line drops the shim, it is not a fall back to soft"
+
+ok=0
+echo gpu-boot-two > "$g/bootid"
+gbuildvendor other-content
+grun
+[[ $rc == 0 && $st == ok && $(gcfg ro.hardware.egl) == - && $(sed -n 5p "$g/data/android/prepared") == 'gpu soft' ]] &&
+  grep -q 'gpu set changed, soft for this start' "$g/out" || { ok=1; echo "  mismatch: '$st' $(gcfg ro.hardware.egl)"; }
+res $ok "prep gpu: a vendor set that no longer matches the pinned digest falls back to soft for the start, removes the hardware props and logs the reason, state ok"
+
+ok=0
+echo gpu-boot-three > "$g/bootid"
+gbuildvendor
+rm -f "${g:?}/vendor/lib64/libged.so"
+grun
+[[ $rc == 0 && $st == ok && $(gcfg ro.hardware.egl) == - ]] && grep -q 'no gpu set, soft for this start' "$g/out" ||
+  { ok=1; echo "  missing file: '$st'"; }
+res $ok "prep gpu: a pinned vendor file missing from the host falls back to soft and logs no gpu set, state ok"
+
+ok=0
+echo gpu-boot-four > "$g/bootid"
+gbuildvendor
+echo '0 0' > "$g/armed"
+grun
+[[ $rc == 0 && $st == ok && $(gcfg ro.hardware.egl) == - ]] && grep -q 'kbase hook not armed, soft for this start' "$g/out" ||
+  { ok=1; echo "  not armed: '$st'"; }
+echo '1 0' > "$g/armed"
+res $ok "prep gpu: with the kbase hook site 1 not armed prep uses soft for the start and logs it, state ok"
+
+ok=0
+echo gpu-boot-five > "$g/bootid"
+gbuildvendor
+grun
+[[ $(gcfg ro.hardware.egl) == mali ]] || { ok=1; echo "  re-mali before removal"; }
+echo '0 0' > "$g/armed"
+grun
+[[ $rc == 0 && $(gcfg ro.hardware.egl) == - && $(gcfg ro.sf.lcd_density) == - && $(gcfg ro.hardware.vulkan) == - ]] ||
+  { ok=1; echo "  props not removed in soft"; }
+echo '1 0' > "$g/armed"
+res $ok "prep gpu: a switch to soft removes every hardware prop (egl, gralloc, vulkan, density) from waydroid.cfg"
+
+ok=0
+echo gpu-boot-six > "$g/bootid"
+gbuildvendor
+grun
+[[ $(gcfg ro.hardware.egl) == mali && -f $ov/lib64/libged.so ]] || { ok=1; echo "  setup for pin change"; }
+sed -i '\#^f lib64/libgpud.so$#d' "$g/gpin"
+D2=$(gdigest)
+sed -i "s/^digest .*/digest $D2/" "$g/gpin"
+echo gpu-boot-six-b > "$g/bootid"
+grun
+[[ $rc == 0 && $(gcfg ro.hardware.egl) == mali && ! -e $ov/lib64/libgpud.so ]] &&
+  ! grep -qxF 'lib64/libgpud.so' "$g/data/android/gpu-staged" || { ok=1; echo "  removal by gpu-staged"; }
+gpin "$D"
+res $ok "prep gpu: a pin that drops a file restages and removes the dropped path by the gpu-staged list, not by the new pin"
+
+ok=0
+echo gpu-boot-seven > "$g/bootid"
+gbuildvendor
+grun
+[[ $(gcfg ro.hardware.egl) == mali ]] || { ok=1; echo "  setup running"; }
+mkdir -p "$g/payload"
+printf 'populated 1\nfrozen 0\n' > "$g/payload/cgroup.events"
+echo '0 0' > "$g/armed"
+grun
+[[ $rc == 0 && $st == ok && $(gcfg ro.hardware.egl) == mali && -f $ov/lib64/libged.so && ! -s $g/calls ]] &&
+  grep -q 'gpu change waits for stop' "$g/out" || { ok=1; echo "  gpu-only while running: rc $rc '$st' $(gcfg ro.hardware.egl)"; }
+rm -rf "${g:?}/payload"
+echo '1 0' > "$g/armed"
+res $ok "prep gpu: a gpu only change while Android runs is not refused, the overlay and props are left as they are, nothing is upgraded, and it is logged"
+
+ok=0
+echo gpu-boot-eight > "$g/bootid"
+gbuildvendor
+grun
+[[ $(gcfg ro.hardware.egl) == mali ]] || { ok=1; echo "  cache setup"; }
+gbuildvendor changed-after-cache
+grun
+[[ $(gcfg ro.hardware.egl) == mali ]] || { ok=1; echo "  cache not reused within a boot"; }
+echo gpu-boot-nine > "$g/bootid"
+grun
+[[ $(gcfg ro.hardware.egl) == - ]] && grep -q 'gpu set changed' "$g/out" || { ok=1; echo "  cache not refreshed on a new boot"; }
+gbuildvendor
+echo gpu-boot-ten > "$g/bootid"
+res $ok "prep gpu: the host digest is computed once per boot id and cached, so a vendor change within a boot is not reread; a new boot id recomputes it"
+
+ok=0
+gbuildvendor
+rm -rf "${g:?}/work/rootfs" "${g:?}/data/android/prepared" "${g:?}/work/overlay/vendor"
+mkdir -p "$g/work/overlay/vendor"
+grun
+pre=$(cat "$g/data/android/prepared" 2> /dev/null)
+echo 1 > "$g/waydroid.rc"
+gbuildvendor nextset
+D3=$(gdigest)
+sed -i "s/^digest .*/digest $D3/" "$g/gpin"
+echo gpu-boot-eleven > "$g/bootid"
+grun
+[[ $rc == 1 && $st == 'failed waydroid upgrade exited 1' && -f $ov/lib/egl/egl.cfg && $(gcfg ro.hardware.egl) == mali &&
+  -n $pre && $(cat "$g/data/android/prepared") == "$pre" ]] || { ok=1; echo "  mali midway: rc $rc '$st'"; }
+rm -f "${g:?}/waydroid.rc"
+gpin "$D"
+gbuildvendor
+echo gpu-boot-twelve > "$g/bootid"
+res $ok "prep gpu: when waydroid upgrade fails staging mali, the files and props stay and prepared is not advanced, so the next start retries"
 
 l=$t/lxcd
 mkdir -p "$l/proc" "$l/run" "$l/bin" "$l/data/music" "$l/data/android/guest/data/media/0"
@@ -488,6 +708,66 @@ lrun
 [[ $rc == 1 && ! -e $l/run/lxc.d/devices.conf ]] && grep -q 'is not mounted' "$l/out" || { ok=1; echo "  unmounted: rc $rc"; }
 : > "$l/mounted"
 res $ok "lxcd: the container start is refused unless data is mounted and the prep state is ok, so a start that skips the prep dependency fails here"
+
+printf '#!/bin/sh\ncase "$*" in *gpu/dev*) exit 1 ;; *) [ -e "%s/mounted" ] ;; esac\n' "$l" > "$l/bin/mountpoint"
+printf '#!/bin/sh\necho "mount $*" >> "%s/mount.calls"\n' "$l" > "$l/bin/mount"
+printf '#!/bin/sh\n: > "$3"\necho "mknod $*" >> "%s/mknod.calls"\n' "$l" > "$l/bin/mknod"
+chmod 755 "$l/bin/mountpoint" "$l/bin/mount" "$l/bin/mknod"
+sed -i '/ mali0$/d' "$l/proc/misc"
+printf '114 mali0\n' >> "$l/proc/misc"
+mkdir -p "$l/dev/dma_heap"
+for h in mtk_mm mtk_mm-uncached system system-uncached; do : > "$l/dev/dma_heap/$h"; done
+lgrun() {
+  rm -rf "${l:?}/run/lxc.d" "${l:?}/mount.calls" "${l:?}/mknod.calls"
+  env PATH="$l/bin:$PATH" BLOCKIE_PROC="$l/proc" BLOCKIE_DEV="$l/dev" BLOCKIE_ANDROID_PAD="$l/pad" \
+    BLOCKIE_ANDROID_RUN="$l/run" BLOCKIE_ANDROID_PAYLOAD="$l/payload" BLOCKIE_DATA_DIR="$l/data" \
+    timeout 10 "$lx/blockie-android-lxcd" > "$l/out" 2>&1
+  rc=$?
+}
+ok=0
+echo mali > "$l/run/gpu-mode"
+lgrun
+[[ $rc == 0 ]] || { ok=1; echo "  mali rc $rc"; }
+want="lxc.mount.entry = $l/run/gpu/dev/mali0 dev/mali0 none bind,create=file 0 0"
+for h in mtk_mm mtk_mm-uncached system system-uncached; do
+  want+=$'\n'"lxc.mount.entry = $l/run/gpu/dev/dma_heap/$h dev/dma_heap/$h none bind,create=file 0 0"
+done
+[[ $(cat "$l/run/lxc.d/gpu.conf") == "$want" ]] || { ok=1; echo "  gpu.conf"; diff <(echo "$want") "$l/run/lxc.d/gpu.conf"; }
+[[ $(tail -n 1 "$l/run/lxc.d/devices.conf") == "lxc.cgroup2.devices.allow = c 10:114 rwm" ]] || { ok=1; echo "  mali rule"; }
+grep -qxF "mount -t tmpfs -o dev,nosuid,noexec,mode=0755,size=64k blockie-gpu $l/run/gpu/dev" "$l/mount.calls" || { ok=1; echo "  tmpfs mount"; }
+grep -qxF "mknod -m 0666 $l/run/gpu/dev/mali0 c 10 114" "$l/mknod.calls" || { ok=1; echo "  mali0 node"; }
+[[ $(grep -c 'mknod -m 0444 .*/dma_heap/' "$l/mknod.calls") == 4 ]] || { ok=1; echo "  heap nodes"; }
+[[ $(stat -c '%a' "$l/run/gpu") == 700 && $(stat -c '%a' "$l/run/gpu/dev") == 755 ]] || { ok=1; echo "  gpu dir modes"; }
+res $ok "lxcd: in mali mode the guest nodes are made in a private 0700 tmpfs, mali0 at 0666 c 10:minor and each present heap at 0444, gpu.conf binds them after config_nodes, and devices.conf gains the mali rule"
+
+ok=0
+rm -f "${l:?}/dev/dma_heap/system-uncached"
+lgrun
+[[ $rc == 0 ]] && grep -q 'no system-uncached heap' "$l/out" &&
+  ! grep -q 'system-uncached' "$l/run/lxc.d/gpu.conf" && grep -q '/dma_heap/system ' "$l/run/lxc.d/gpu.conf" ||
+  { ok=1; echo "  missing heap"; }
+: > "$l/dev/dma_heap/system-uncached"
+res $ok "lxcd: a heap the kernel does not expose is logged and left out of gpu.conf, the others still bind"
+
+ok=0
+echo soft > "$l/run/gpu-mode"
+lgrun
+[[ $rc == 0 && -f $l/run/lxc.d/gpu.conf && ! -s $l/run/lxc.d/gpu.conf && ! -e $l/mknod.calls ]] &&
+  ! grep -q '10:114' "$l/run/lxc.d/devices.conf" || { ok=1; echo "  soft: rc $rc"; }
+rm -f "${l:?}/run/gpu-mode"
+lgrun
+[[ $rc == 0 && -f $l/run/lxc.d/gpu.conf && ! -s $l/run/lxc.d/gpu.conf ]] || { ok=1; echo "  default soft: rc $rc"; }
+res $ok "lxcd: soft mode or no gpu-mode makes no node, writes an empty gpu.conf and adds no mali rule to devices.conf"
+
+ok=0
+echo mali > "$l/run/gpu-mode"
+sed -i '/ mali0$/d' "$l/proc/misc"
+lgrun
+[[ $rc == 0 && -f $l/run/lxc.d/gpu.conf && ! -s $l/run/lxc.d/gpu.conf ]] && grep -q 'no mali0 minor' "$l/out" &&
+  ! grep -q '10:114' "$l/run/lxc.d/devices.conf" || { ok=1; echo "  no mali0 minor: rc $rc"; }
+printf '114 mali0\n' >> "$l/proc/misc"
+rm -f "${l:?}/run/gpu-mode"
+res $ok "lxcd: with no mali0 in /proc/misc mali mode writes an empty gpu.conf and no mali rule, logged, so the container still starts"
 
 z=$t/freeze
 mkdir -p "$z/bin" "$z/payload"

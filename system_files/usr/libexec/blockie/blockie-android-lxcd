@@ -8,6 +8,10 @@ run=${BLOCKIE_ANDROID_RUN:-/run/blockie-android}
 out=$run/lxc.d
 payload=${BLOCKIE_ANDROID_PAYLOAD:-/sys/fs/cgroup/lxc.payload.waydroid}
 data=${BLOCKIE_DATA_DIR:-/var/lib/blockie/data}
+dev=${BLOCKIE_DEV:-/dev}
+heaps=(mtk_mm mtk_mm-uncached system system-uncached)
+gpudir=$run/gpu
+gpudev=$gpudir/dev
 die() { echo "$me: $*" >&2; exit 1; }
 
 mountpoint -q "$data" || die "$data is not mounted"
@@ -80,7 +84,37 @@ else
     devices+="lxc.cgroup2.devices.allow = c $r rwm"$'\n'
   done
 fi
+gpu=
+mode=soft
+[[ ! -r $run/gpu-mode ]] || read -r mode < "$run/gpu-mode"
+if [[ $mode == mali ]]; then
+  gminor=$(minor mali0)
+  if [[ -z $gminor ]]; then
+    echo "$me: no mali0 minor in $proc/misc, Android starts without the guest GPU nodes"
+  else
+    install -d -m 0700 "$gpudir"
+    install -d -m 0755 "$gpudev"
+    mountpoint -q "$gpudev" || mount -t tmpfs -o dev,nosuid,noexec,mode=0755,size=64k blockie-gpu "$gpudev"
+    rm -f "${gpudev:?}/mali0"
+    mknod -m 0666 "$gpudev/mali0" c 10 "$gminor"
+    gpu="lxc.mount.entry = $gpudev/mali0 dev/mali0 none bind,create=file 0 0"$'\n'
+    install -d -m 0755 "$gpudev/dma_heap"
+    for n in "${heaps[@]}"; do
+      src=$dev/dma_heap/$n
+      if [[ ! -e $src ]]; then
+        echo "$me: no $n heap in $dev/dma_heap"
+        continue
+      fi
+      read -r maj min < <(stat -L -c '%t %T' "$src")
+      rm -f "${gpudev:?}/dma_heap/${n:?}"
+      mknod -m 0444 "$gpudev/dma_heap/$n" c "$((16#$maj))" "$((16#$min))"
+      gpu+="lxc.mount.entry = $gpudev/dma_heap/$n dev/dma_heap/$n none bind,create=file 0 0"$'\n'
+    done
+    [[ -z $devices ]] || devices+="lxc.cgroup2.devices.allow = c 10:$gminor rwm"$'\n'
+  fi
+fi
 put devices.conf "$devices"
 put music.conf "$music"
 put memory.conf $'lxc.cgroup2.memory.high = 1900M\nlxc.cgroup2.memory.max = 2200M\n'
+put gpu.conf "$gpu"
 echo "$me: wrote $out"

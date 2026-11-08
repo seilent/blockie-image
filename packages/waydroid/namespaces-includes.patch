@@ -1,18 +1,18 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: seilent <github@seilent.net>
 Date: Sun, 8 Nov 2026 18:00:00 +0900
-Subject: [PATCH] lxc: clone no IPC namespace, include the Blockie device, music
- and memory configs
+Subject: [PATCH] lxc: clone no IPC namespace, include the Blockie device,
+ music, memory and gpu configs
 
 ---
- data/configs/config_base | 5 +++++
- 1 file changed, 5 insertions(+)
+ data/configs/config_base | 6 ++++++
+ 1 file changed, 6 insertions(+)
 
 diff --git a/data/configs/config_base b/data/configs/config_base
 index 99fd198..c47e7a8 100644
 --- a/data/configs/config_base
 +++ b/data/configs/config_base
-@@ -9,10 +9,15 @@ lxc.cap.keep = audit_control sys_nice wake_alarm setpcap setgid setuid sys_ptrac
+@@ -9,10 +9,16 @@ lxc.cap.keep = audit_control sys_nice wake_alarm setpcap setgid setuid sys_ptrac
  
  lxc.mount.auto = cgroup:ro sys:ro proc
  
@@ -25,6 +25,7 @@ index 99fd198..c47e7a8 100644
 +lxc.include = /run/blockie-android/lxc.d/devices.conf
 +lxc.include = /run/blockie-android/lxc.d/music.conf
 +lxc.include = /run/blockie-android/lxc.d/memory.conf
++lxc.include = /run/blockie-android/lxc.d/gpu.conf
  
  lxc.hook.post-stop = /dev/null
  

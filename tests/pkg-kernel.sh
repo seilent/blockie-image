@@ -13,7 +13,8 @@ rpm=${rpms[0]}
 [[ $(rpm -qp --qf '%{NAME} %{ARCH}' "$rpm") == "blockie-kernel aarch64" ]] || fail "name or arch"
 want=$(printf '%s\n' "$k" "$k/System.map" "$k/config" "$k/extra" "$k/extra/blockie_kbase_pidns.ko" \
   "$k/extra/hci_vhci.ko" "$k/extra/softdog.ko" \
-  "$k/vmlinuz" /usr/share/licenses/blockie-kernel/LICENSE.kernel | LC_ALL=C sort)
+  "$k/vmlinuz" /usr/lib/modules-load.d/blockie-kbase-pidns.conf \
+  /usr/share/licenses/blockie-kernel/LICENSE.kernel | LC_ALL=C sort)
 got=$(rpm -qpl "$rpm" | grep -vF "$k/modules." | LC_ALL=C sort)
 [[ $got == "$want" ]] || fail "file list: $got"
 
@@ -30,6 +31,8 @@ done
 for m in softdog hci_vhci blockie_kbase_pidns; do
   grep -q "^extra/$m.ko:" "$root$k/modules.dep" || fail "modules.dep lacks $m"
 done
+[[ $(cat "$root/usr/lib/modules-load.d/blockie-kbase-pidns.conf") == blockie_kbase_pidns ]] ||
+  fail "modules-load.d does not load blockie_kbase_pidns"
 zcat "$root$k/vmlinuz" > "$root/Image"
 [[ $(head -c 60 "$root/Image" | tail -c 4) == ARMd ]] || fail "vmlinuz is not a gzip arm64 Image"
 grep -aqF "Linux version $kver " "$root/Image" || fail "vmlinuz banner"

@@ -22,6 +22,17 @@ ANDROID = os.path.join(DATA, "android")
 IMAGES = os.path.join(ANDROID, "images")
 PREPARED = os.path.join(ANDROID, "prepared")
 CFG = os.path.join(WORK, "waydroid.cfg")
+GPU_PIN = os.environ.get("BLOCKIE_ANDROID_GPU_PIN", "/usr/share/blockie/android.d/gpu-mt6768.conf")
+VENDOR = os.environ.get("BLOCKIE_ANDROID_VENDOR", "/vendor")
+OVERLAY = os.path.join(WORK, "overlay", "vendor")
+HWC_SHIM = os.environ.get("BLOCKIE_ANDROID_HWC_SHIM", os.path.join(ANDROID, "hwc", "hwcomposer.blockie.so"))
+BOOT_ID = os.environ.get("BLOCKIE_BOOT_ID", "/proc/sys/kernel/random/boot_id")
+KBASE_ARMED = os.environ.get("BLOCKIE_KBASE_ARMED", "/sys/module/blockie_kbase_pidns/parameters/armed")
+BASE_PROP = os.environ.get("BLOCKIE_WAYDROID_BASE_PROP", os.path.join(WORK, "waydroid_base.prop"))
+GPU_STAGED = os.path.join(ANDROID, "gpu-staged")
+GPU_DIGEST = os.path.join(RUN, "gpu-digest")
+GPU_MODE = os.path.join(RUN, "gpu-mode")
+SHIMPATH = "lib64/hw/hwcomposer.blockie.so"
 PROPERTIES = {
     "persist.waydroid.width": "960",
     "persist.waydroid.height": "720",
@@ -29,6 +40,14 @@ PROPERTIES = {
     "persist.waydroid.suspend": "false",
 }
 PINNED = {"suspend_action": "freeze", "mount_overlays": "True"}
+GPU_PROPS = {
+    "ro.hardware.egl": "mali",
+    "ro.hardware.gralloc": "mediatek",
+    "ro.hardware.vulkan": "mt6768",
+    "ro.sf.lcd_density": "240",
+}
+GPU_KEYS = ("ro.hardware.egl", "ro.hardware.gralloc", "ro.hardware.vulkan", "ro.hardware.hwcomposer",
+            "ro.sf.lcd_density")
 
 
 def properties():
@@ -80,6 +99,14 @@ def sha256(data):
     return hashlib.sha256(data.encode()).hexdigest()
 
 
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def pin():
     rows = []
     with open(PIN) as f:
@@ -116,7 +143,217 @@ def images(rows):
     return want
 
 
-def config():
+def gpu_pin():
+    text = read(GPU_PIN)
+    if text is None:
+        return None
+    spec = {"files": [], "links": [], "whiteouts": [], "rc": None, "shim": None, "digest": None}
+    for line in text.splitlines():
+        fields = line.split()
+        if not fields:
+            continue
+        kind = fields[0]
+        if kind == "f" and len(fields) >= 2:
+            spec["files"].append((fields[1], fields[2] if len(fields) > 2 else "0644"))
+        elif kind == "l" and len(fields) >= 3:
+            spec["links"].append((fields[1], fields[2]))
+        elif kind == "w" and len(fields) >= 2:
+            spec["whiteouts"].append(fields[1])
+        elif kind == "rc" and len(fields) >= 3:
+            spec["rc"] = (fields[1], fields[2])
+        elif kind == "shim" and len(fields) >= 2 and re.fullmatch(r"[0-9a-f]{64}", fields[1]):
+            spec["shim"] = fields[1]
+        elif kind == "digest" and len(fields) >= 2 and re.fullmatch(r"[0-9a-f]{64}", fields[1]):
+            spec["digest"] = fields[1]
+    return spec
+
+
+def gpu_vendor_digest(spec):
+    lines = []
+    missing = []
+    for path, mode in spec["files"]:
+        full = os.path.join(VENDOR, path)
+        if os.path.islink(full) or not os.path.isfile(full):
+            missing.append(path)
+            continue
+        lines.append(f"f {path} {mode} {sha256_file(full)}")
+    for path, target in spec["links"]:
+        full = os.path.join(VENDOR, path)
+        if not os.path.islink(full) or os.readlink(full) != target:
+            missing.append(path)
+            continue
+        lines.append(f"l {path} - {target}")
+    for path in spec["whiteouts"]:
+        lines.append(f"w {path} 0644 -")
+    if spec["rc"]:
+        src = os.path.join(VENDOR, spec["rc"][1])
+        if os.path.islink(src) or not os.path.isfile(src):
+            missing.append(spec["rc"][1])
+        else:
+            lines.append(f"rc {spec['rc'][1]} 0644 {sha256_file(src)}")
+    if missing:
+        return None, missing
+    lines.sort()
+    return sha256("".join(line + "\n" for line in lines)), []
+
+
+def gpu_digest(spec):
+    bid = (read(BOOT_ID) or "").strip()
+    cached = read(GPU_DIGEST)
+    if cached and bid:
+        cbid, _, cdig = cached.strip().partition(" ")
+        if cbid == bid and re.fullmatch(r"[0-9a-f]{64}", cdig or ""):
+            return cdig, []
+    digest, missing = gpu_vendor_digest(spec)
+    if digest is not None:
+        os.makedirs(RUN, 0o755, exist_ok=True)
+        put(GPU_DIGEST, f"{bid} {digest}\n")
+    return digest, missing
+
+
+def kbase_armed():
+    value = read(KBASE_ARMED)
+    return bool(value) and value.split()[:1] == ["1"]
+
+
+def gpu_shim(spec):
+    if not spec["shim"]:
+        return None
+    if os.path.islink(HWC_SHIM) or not os.path.isfile(HWC_SHIM):
+        return None
+    if sha256_file(HWC_SHIM) != spec["shim"]:
+        return None
+    return spec["shim"]
+
+
+def gpu_decide(spec):
+    if spec is None or not spec["digest"]:
+        return "soft", None, None, "no gpu set"
+    digest, missing = gpu_digest(spec)
+    if missing:
+        return "soft", None, None, "no gpu set"
+    if digest != spec["digest"]:
+        return "soft", None, None, "gpu set changed"
+    if not kbase_armed():
+        return "soft", None, None, "kbase hook not armed"
+    return "mali", digest, gpu_shim(spec), None
+
+
+def gpu_line(mode, digest, shim):
+    if mode != "mali":
+        return "gpu soft"
+    return f"gpu {digest} shim {shim}" if shim else f"gpu {digest}"
+
+
+def gpu_servicerc(source):
+    text = read(os.path.join(VENDOR, source))
+    if text is None:
+        return None
+    block = []
+    started = False
+    for line in text.splitlines():
+        if not started:
+            if line.startswith("service vendor.gralloc-4-0 "):
+                started = True
+                block.append(line)
+            continue
+        if re.match(r"[ \t]+[^ \t]", line):
+            if line.split()[0] != "disabled":
+                block.append(line)
+            continue
+        break
+    body = "\n".join(block)
+    svc = "bin/hw/android.hardware.graphics.allocator@4.0-service-mediatek"
+    iface = "interface android.hardware.graphics.allocator@4.0::IAllocator default"
+    if not body.startswith(f"service vendor.gralloc-4-0 /vendor/{svc}") or iface not in body:
+        return None
+    out = body + "\n    disabled\n\n"
+    out += "on early-init && property:ro.hardware.gralloc=mediatek\n"
+    out += ("    mount none /vendor/etc/vintf/manifest.disabled/gbm_mesa.allocator@4.0.xml "
+            "/vendor/etc/vintf/manifest/gbm_mesa.allocator@4.0.xml ro bind\n")
+    out += ("    mount none /vendor/etc/vintf/manifest.disabled/gbm_mesa.mapper@4.0.xml "
+            "/vendor/etc/vintf/manifest/gbm_mesa.mapper@4.0.xml ro bind\n")
+    out += ("    mount none /vendor/etc/vintf/manifest.disabled/empty_vintf.xml "
+            "/vendor/etc/vintf/manifest/gralloc1.xml ro bind\n")
+    out += "    stop vendor.gralloc-2-0\n    enable vendor.gralloc-4-0\n"
+    return out
+
+
+def gpu_staged_add(path):
+    with open(GPU_STAGED, "a") as f:
+        f.write(path + "\n")
+
+
+def gpu_parents(rel):
+    parent = os.path.dirname(rel)
+    acc = ""
+    for part in parent.split("/") if parent else []:
+        acc = f"{acc}/{part}" if acc else part
+        full = os.path.join(OVERLAY, acc)
+        if not os.path.isdir(full):
+            gpu_staged_add(acc)
+            os.mkdir(full, 0o755)
+
+
+def gpu_unstage():
+    text = read(GPU_STAGED)
+    if text is None:
+        return
+    for path in reversed(text.splitlines()):
+        full = os.path.join(OVERLAY, path)
+        try:
+            if os.path.isdir(full) and not os.path.islink(full):
+                os.rmdir(full)
+            else:
+                os.remove(full)
+        except (FileNotFoundError, OSError):
+            pass
+    try:
+        os.remove(GPU_STAGED)
+    except FileNotFoundError:
+        pass
+
+
+def gpu_stage(spec, shim):
+    gpu_unstage()
+    os.makedirs(OVERLAY, 0o755, exist_ok=True)
+    put(GPU_STAGED, "")
+    try:
+        for path, mode in spec["files"]:
+            gpu_parents(path)
+            gpu_staged_add(path)
+            dest = os.path.join(OVERLAY, path)
+            shutil.copyfile(os.path.join(VENDOR, path), dest)
+            os.chmod(dest, int(mode, 8))
+        for path, target in spec["links"]:
+            gpu_parents(path)
+            gpu_staged_add(path)
+            os.symlink(target, os.path.join(OVERLAY, path))
+        for path in spec["whiteouts"]:
+            gpu_parents(path)
+            gpu_staged_add(path)
+            if subprocess.run(["mknod", "-m", "0644", os.path.join(OVERLAY, path), "c", "0", "0"]).returncode != 0:
+                return False
+        if spec["rc"]:
+            dest, source = spec["rc"]
+            text = gpu_servicerc(source)
+            if text is None:
+                return False
+            gpu_parents(dest)
+            gpu_staged_add(dest)
+            put(os.path.join(OVERLAY, dest), text)
+        if shim:
+            gpu_parents(SHIMPATH)
+            gpu_staged_add(SHIMPATH)
+            dest = os.path.join(OVERLAY, SHIMPATH)
+            shutil.copyfile(HWC_SHIM, dest)
+            os.chmod(dest, 0o644)
+    except OSError:
+        return False
+    return True
+
+
+def config(gpu_action):
     cfg = configparser.ConfigParser()
     old = read(CFG)
     if old is not None:
@@ -126,6 +363,11 @@ def config():
             cfg[section] = {}
     cfg["waydroid"].update(PINNED)
     cfg["properties"].update(properties())
+    if gpu_action == "mali":
+        cfg["properties"].update(GPU_PROPS)
+    elif gpu_action == "soft":
+        for key in GPU_KEYS:
+            cfg.remove_option("properties", key)
     out = io.StringIO()
     cfg.write(out)
     if out.getvalue() != old:
@@ -173,17 +415,41 @@ def prep():
     if base is None:
         raise Refused("failed", f"no {BASE}")
     props = "".join(f"{k}={v}\n" for k, v in sorted(properties().items()))
+    spec = gpu_pin()
+    is_running = running()
+    mode, digest, shim, reason = gpu_decide(spec)
     want = (f"waydroid {version()}\nconfig_base {sha256(base)}\nproperties {sha256(props)}\n"
-            f"images {sha256(stamp)}\n")
-    config()
+            f"images {sha256(stamp)}\n{gpu_line(mode, digest, shim)}\n")
     initialized = os.path.isdir(os.path.join(WORK, "rootfs"))
     action = None
     if not initialized:
         action = "init"
     elif read(PREPARED) != want:
         action = "upgrade"
-    if action and running():
+    prepared = read(PREPARED)
+    gpu_only = (prepared is not None and action == "upgrade"
+                and [ln for ln in want.splitlines() if not ln.startswith("gpu ")]
+                == [ln for ln in prepared.splitlines() if not ln.startswith("gpu ")])
+    if action and is_running:
+        if gpu_only:
+            config(None)
+            keylayout()
+            log("gpu change waits for stop")
+            state("ok")
+            log("ok")
+            return 0
         raise Refused("failed", "change pending, stop Android")
+    if mode == "mali" and action:
+        if not gpu_stage(spec, shim):
+            gpu_unstage()
+            mode, digest, shim, reason = "soft", None, None, "gpu stage failed"
+            want = (f"waydroid {version()}\nconfig_base {sha256(base)}\nproperties {sha256(props)}\n"
+                    f"images {sha256(stamp)}\n{gpu_line(mode, digest, shim)}\n")
+    if reason:
+        log(f"{reason}, soft for this start")
+    os.makedirs(RUN, 0o755, exist_ok=True)
+    put(GPU_MODE, mode + "\n")
+    config("mali" if mode == "mali" else "soft")
     if action == "init":
         waydroid("init")
     elif action == "upgrade":
@@ -193,7 +459,7 @@ def prep():
         cfg.read_string(read(CFG) or "")
         if cfg.get("waydroid", "images_path", fallback=None) != EXTRA:
             raise Refused("failed", f"waydroid {action} did not take the images in {EXTRA}")
-        config()
+        config("mali" if mode == "mali" else "soft")
         put(PREPARED, want)
         log(f"waydroid {action} done")
     keylayout()
@@ -210,6 +476,17 @@ def prep():
 
 
 def main():
+    if sys.argv[1:2] == ["gpu-digest"]:
+        spec = gpu_pin()
+        if spec is None:
+            print("no gpu pin", file=sys.stderr)
+            return 1
+        digest, missing = gpu_vendor_digest(spec)
+        if digest is None:
+            print("missing: " + " ".join(missing), file=sys.stderr)
+            return 1
+        print(digest)
+        return 0
     try:
         return prep()
     except Refused as e:
