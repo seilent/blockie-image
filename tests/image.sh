@@ -156,8 +156,8 @@ for l in 'z /sys/power/state 0664 root blockie -' 'z /sys/power/wakeup_count 066
   grep -qxF "$l" /usr/lib/tmpfiles.d/blockie.conf || fail "no tmpfiles line '$l'"
 done
 po=/usr/lib/systemd/user/blockie-poweroff.service
-grep -qx 'Type=oneshot' "$po" && grep -qx 'TimeoutStartSec=15s' "$po" && ! grep -q '^\[Install\]' "$po" ||
-  fail "blockie-poweroff.service is not a 15 s oneshot without [Install]"
+grep -qx 'Type=oneshot' "$po" && grep -qx 'TimeoutStartSec=25s' "$po" && ! grep -q '^\[Install\]' "$po" ||
+  fail "blockie-poweroff.service is not a 25 s oneshot without [Install]"
 grep -qx 'ExecStopPost=-/usr/lib/blockie/hooks.d/blank-off' /usr/lib/systemd/user/blockie-hotkeyd.service ||
   fail "a hotkeyd stop does not wake the screen"
 cmp -s <(printf '[Login]\nHandlePowerKey=ignore\nHandlePowerKeyLongPress=ignore\n') /usr/lib/systemd/logind.conf.d/50-blockie.conf ||

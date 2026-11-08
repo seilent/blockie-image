@@ -1,0 +1,13 @@
+[Unit]
+Description=Android session
+
+[Service]
+UnsetEnvironment=LD_PRELOAD LD_LIBRARY_PATH VK_DRIVER_FILES
+Environment=XDG_DATA_HOME=/var/lib/blockie/data2/android/user
+ExecStartPre=/usr/bin/mountpoint -q /var/lib/blockie/data2
+ExecStartPre=/usr/bin/systemctl start waydroid-container.service
+ExecStart=/usr/libexec/blockie/blockie-android-run
+ExecStop=/usr/bin/systemctl stop waydroid-container.service
+ExecStopPost=-/usr/bin/systemctl stop waydroid-container.service
+TimeoutStartSec=infinity
+TimeoutStopSec=25

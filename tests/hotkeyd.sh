@@ -571,6 +571,20 @@ sys.exit(1 if bad else 0)
 EOF
 res $? "virtual nodes stay out except the AYANEO Controller by name, ids and phys"
 
+env -u BLOCKIE_HOTKEYD_BACKSTOP_MS timeout -k 5 60 python3 - "$bin" > "$t/backstop.out" 2>&1 << 'EOF'
+import importlib.machinery
+import importlib.util
+import sys
+
+loader = importlib.machinery.SourceFileLoader("hotkeyd", sys.argv[1])
+spec = importlib.util.spec_from_loader("hotkeyd", loader)
+m = importlib.util.module_from_spec(spec)
+loader.exec_module(m)
+print(m.BACKSTOP_MS)
+sys.exit(0 if m.BACKSTOP_MS == 35000 else 1)
+EOF
+res $? "the power off backstop defaults to 35000 ms, past the 25 s limit of blockie-poweroff.service"
+
 if (( fails )); then
   echo "hotkeyd: $fails failed"
   exit 1

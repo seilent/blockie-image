@@ -16,6 +16,11 @@ esac
 systemctl --user kill --signal=SIGCONT "$scope" 2> /dev/null ||
     [ "$(systemctl --user show -P ActiveState "$scope")" != active ] || echo "$me: SIGCONT to $scope failed" >&2
 [ "$bl" != 2 ] || /usr/libexec/blockie/blockie-backlight on lookup
+[ "$(systemctl --user show -P FreezerState blockie-emulation.slice)" = running ] ||
+    systemctl --user thaw blockie-emulation.slice || echo "$me: thaw of blockie-emulation.slice failed" >&2
+if [ -e "${BLOCKIE_ANDROID_PAYLOAD:-/sys/fs/cgroup/lxc.payload.waydroid}" ]; then
+    timeout 2 systemctl start blockie-android-freeze@thaw.service || echo "$me: thaw of Android failed" >&2
+fi
 if systemctl --user is-active --quiet "$scope"; then
     /usr/libexec/blockie/blockie-game-cmd QUIT
     echo "$me: QUIT sent" >&2
@@ -29,6 +34,10 @@ if systemctl --user is-active --quiet "$scope"; then
         n=$((n + 1))
     done
     [ $n -ge 25 ] || echo "$me: $scope inactive" >&2
+fi
+if [ -e "${BLOCKIE_ANDROID_PAYLOAD:-/sys/fs/cgroup/lxc.payload.waydroid}" ]; then
+    sync
+    timeout 8 systemctl stop waydroid-container.service || echo "$me: stop of waydroid-container.service failed" >&2
 fi
 sync
 echo "$me: sync done" >&2

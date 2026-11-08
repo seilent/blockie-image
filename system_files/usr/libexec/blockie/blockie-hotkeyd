@@ -20,7 +20,7 @@ DRY = os.environ.get("BLOCKIE_HOTKEYD_DRY") == "1"
 SYSFS = os.environ.get("BLOCKIE_HOTKEYD_SYSFS", "/sys")
 LONG_MS = int(os.environ.get("BLOCKIE_HOTKEYD_LONG_MS", "1000"))
 HOOK_MS = int(os.environ.get("BLOCKIE_HOTKEYD_HOOK_MS", "5000"))
-BACKSTOP_MS = int(os.environ.get("BLOCKIE_HOTKEYD_BACKSTOP_MS", "20000"))
+BACKSTOP_MS = int(os.environ.get("BLOCKIE_HOTKEYD_BACKSTOP_MS", "35000"))
 SLEEP = os.environ.get("BLOCKIE_HOTKEYD_SLEEP", "/usr/libexec/blockie/blockie-sleep")
 SLEPT = os.environ.get("BLOCKIE_HOTKEYD_SLEPT")
 KNOB = os.environ.get("BLOCKIE_HOTKEYD_KNOB", "/run/blockie-sleep/on-vbus")

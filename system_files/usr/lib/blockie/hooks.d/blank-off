@@ -1,5 +1,8 @@
 #!/bin/sh
 rc=0
+if [ -e "${BLOCKIE_ANDROID_PAYLOAD:-/sys/fs/cgroup/lxc.payload.waydroid}" ]; then
+    timeout 1 systemctl start blockie-android-freeze@thaw.service || rc=1
+fi
 timeout 2 wlopm --on '*' || rc=1
 /usr/libexec/blockie/blockie-backlight on cached
 bl=$?

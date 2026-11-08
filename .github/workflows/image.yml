@@ -205,9 +205,12 @@ jobs:
             esac
             return "$rc"
           }
-          for t in image units blobs audio wifi bt boot-ok data session hotkeyd power game game-cmd; do
+          for t in image units blobs audio wifi bt boot-ok data session hotkeyd power game game-cmd android; do
             suite podman run --rm -v "$PWD/tests:/tests:ro" -v "$PWD/boot:/repo-boot:ro" "$IMAGE:$TAG" "/tests/$t.sh"
           done
+          t=android-polkit
+          build/ci-need.sh node:nodejs
+          suite env BLOCKIE_ANDROID_ROOT="$PWD/system_files" tests/android.sh polkit
           t=setd
           suite podman run --rm -v "$PWD/tests:/tests:ro" "$IMAGE:$TAG" \
             bash -c 'dnf -y -q install dbus-daemon > /dev/null && /tests/setd.sh'

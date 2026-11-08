@@ -52,6 +52,7 @@ case "\$*" in
     ;;
   is-system-running) cat "$s/sysrun" 2> /dev/null || echo running ;;
   '--user show -P ActiveState blockie-poweroff.service') cat "$s/po.state" 2> /dev/null || echo inactive ;;
+  '--user show -P FreezerState blockie-emulation.slice') cat "$s/slice" 2> /dev/null || echo running ;;
   *) echo "systemctl \$*" >> "$t/log" ;;
 esac
 EOF
@@ -377,6 +378,15 @@ read -r -t 1 line <&4
 [[ $rc == 0 && $line == QUIT ]] && logis $'wlopm --on *\n'"$cont_line"$'\n'"$bl102"$'\nsync\n'"$off_line" &&
   grep -q 'SIGCONT to blockie-game.scope failed' "$t/err"
 res $? "blockie-poweroff: a failing SIGCONT to an active scope is logged, QUIT, sync and PowerOff still follow"
+
+dark 1 stopped
+echo frozen > "$s/slice"
+run "$off"
+line=
+read -r -t 1 line <&4
+[[ $rc == 0 && $line == QUIT ]] &&
+  logis $'wlopm --on *\n'"$cont_line"$'\n'"$bl102"$'\nsystemctl --user thaw blockie-emulation.slice\nsync\n'"$off_line"
+res $? "blockie-poweroff thaws a frozen blockie-emulation.slice before QUIT"
 
 dark -1 stopped
 : > "$s/wlopm.hang"

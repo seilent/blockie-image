@@ -1,0 +1,228 @@
+#!/usr/bin/python3
+import ctypes
+import os
+import select
+import signal
+import struct
+import subprocess
+import sys
+import time
+
+ME = "blockie-android-run"
+ROOT = os.environ.get("BLOCKIE_ROOT", "")
+PAYLOAD = os.environ.get("BLOCKIE_ANDROID_PAYLOAD", "/sys/fs/cgroup/lxc.payload.waydroid")
+LIB = os.environ.get("BLOCKIE_WAYDROID_LIB", "/usr/lib/waydroid")
+STEP = float(os.environ.get("BLOCKIE_ANDROID_STEP", "0.25"))
+TRY = 2
+TRIES = 3
+IN_MODIFY = 0x2
+IN_IGNORED = 0x8000
+TIMEOUT = """
+import sys
+import types
+sys.path.insert(0, sys.argv[1])
+from tools.interfaces import IPlatform
+want = "2147483647"
+args = types.SimpleNamespace(work="/var/lib/waydroid", config="/var/lib/waydroid/waydroid.cfg", cache={})
+p = IPlatform.get_service(args)
+if p is None:
+    sys.exit(2)
+if p.settingsGetString(1, "screen_off_timeout") != want:
+    p.settingsPutInt(1, "screen_off_timeout", int(want))
+sys.exit(0 if p.settingsGetString(1, "screen_off_timeout") == want else 1)
+"""
+
+stopping = False
+
+
+def log(msg):
+    print(f"{ME}: {msg}", file=sys.stderr, flush=True)
+
+
+def conf():
+    app, wait = "Waydroid", 20
+    for d in ("/etc/blockie/sessions.d", "/usr/lib/blockie/sessions.d"):
+        try:
+            with open(f"{ROOT}{d}/android.conf") as f:
+                lines = f.read().splitlines()
+        except FileNotFoundError:
+            continue
+        for line in lines:
+            k, sep, v = line.partition("=")
+            k, v = k.strip(), v.strip().strip("\"'")
+            if not sep:
+                continue
+            if k == "APP_ID" and v:
+                app = v
+            elif k == "START_WAIT" and v.isdigit():
+                wait = min(max(int(v), 1), 600)
+        break
+    return app, wait
+
+
+def events():
+    out = {}
+    try:
+        with open(os.path.join(PAYLOAD, "cgroup.events")) as f:
+            for line in f:
+                k, _, v = line.partition(" ")
+                out[k] = v.strip()
+    except FileNotFoundError:
+        return None
+    return out
+
+
+def watch():
+    libc = ctypes.CDLL(None, use_errno=True)
+    fd = libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
+    if fd < 0:
+        raise OSError(ctypes.get_errno(), "inotify_init1")
+    if libc.inotify_add_watch(fd, os.path.join(PAYLOAD, "cgroup.events").encode(), IN_MODIFY) < 0:
+        e = ctypes.get_errno()
+        os.close(fd)
+        raise OSError(e, "inotify_add_watch")
+    return fd
+
+
+def ignored(fd):
+    try:
+        data = os.read(fd, 4096)
+    except BlockingIOError:
+        return False
+    off = 0
+    while off + 16 <= len(data):
+        _wd, mask, _cookie, n = struct.unpack_from("iIII", data, off)
+        if mask & IN_IGNORED:
+            return True
+        off += 16 + n
+    return False
+
+
+def container_stopping():
+    r = subprocess.run(["systemctl", "show", "-P", "ActiveState", "waydroid-container.service"],
+                       capture_output=True, text=True)
+    return r.stdout.strip() in ("deactivating", "inactive", "failed")
+
+
+def shutting_down():
+    r = subprocess.run(["systemctl", "is-system-running"], capture_output=True, text=True)
+    return r.stdout.strip() == "stopping"
+
+
+def run(argv, **kw):
+    return subprocess.Popen(argv, stdin=subprocess.DEVNULL, **kw)
+
+
+def end(procs, rc):
+    for p in procs:
+        if p is not None and p.poll() is None:
+            p.terminate()
+    for p in procs:
+        if p is None:
+            continue
+        try:
+            p.wait(10)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.wait()
+    return rc
+
+
+def term(_sig, _frame):
+    global stopping
+    stopping = True
+
+
+def main():
+    signal.signal(signal.SIGTERM, term)
+    signal.signal(signal.SIGINT, term)
+    app, wait = conf()
+    deadline = time.monotonic() + wait
+    try:
+        ui = run(["waydroid", "show-full-ui"])
+    except OSError as e:
+        log(f"cannot run waydroid: {e}")
+        return 1
+    window = False
+    fd = -1
+    seen = False
+    frozen = False
+    boot = put = None
+    tries = 0
+    settled = False
+    last = 0.0
+    while True:
+        procs = (ui, boot, put)
+        if stopping:
+            log("stopping")
+            return end(procs, 0)
+        rc = ui.poll()
+        if rc is not None:
+            end(procs, 0)
+            if shutting_down():
+                log(f"waydroid show-full-ui exited {rc} while the system stops")
+                return 0
+            if rc == 0 and not window:
+                log(f"waydroid show-full-ui exited before a window of {app} appeared")
+                return 1
+            log(f"waydroid show-full-ui exited {rc}")
+            return rc
+        now = time.monotonic()
+        if not window and now < deadline:
+            if subprocess.run(["wlrctl", "toplevel", "find", f"app_id:{app}"], stdin=subprocess.DEVNULL,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+                window = True
+                log(f"the window of {app} appeared")
+        if fd < 0 and os.path.isdir(PAYLOAD):
+            fd = watch()
+            log(f"watching {PAYLOAD}/cgroup.events")
+        if fd >= 0:
+            gone = ignored(fd)
+            ev = events()
+            alive = ev is not None and ev.get("populated") == "1"
+            frozen = alive and ev.get("frozen") == "1"
+            if alive and not seen:
+                seen = True
+                log("the Android payload is populated")
+            if seen and (gone or not alive):
+                if container_stopping() or shutting_down():
+                    log("the Android payload ended while waydroid-container.service or the system stops")
+                    return end(procs, 0)
+                log("the Android payload ended")
+                return end(procs, 1)
+            if gone:
+                os.close(fd)
+                fd = -1
+        if not seen and now >= deadline:
+            log(f"the Android payload was not populated within {wait} s")
+            return end(procs, 1)
+        if window and seen and not settled and not frozen:
+            if put is not None:
+                if put.poll() is not None:
+                    tries += 1
+                    if put.returncode == 0:
+                        settled = True
+                        log("screen_off_timeout is 2147483647")
+                    elif tries >= TRIES:
+                        settled = True
+                        log(f"screen_off_timeout still not 2147483647 after {tries} tries, the next session tries again")
+                    else:
+                        log(f"screen_off_timeout not set (exit {put.returncode}), trying again")
+                    put = None
+                    last = now
+            elif boot is not None:
+                if boot.poll() is not None:
+                    out = boot.stdout.read().split()
+                    boot.stdout.close()
+                    boot = None
+                    last = now
+                    if out[-1:] == ["1"]:
+                        put = run([sys.executable, "-c", TIMEOUT, LIB], stdout=subprocess.DEVNULL)
+            elif now - last >= TRY:
+                boot = run(["waydroid", "prop", "get", "sys.boot_completed"], stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, text=True)
+        select.select([fd] if fd >= 0 else [], [], [], STEP)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

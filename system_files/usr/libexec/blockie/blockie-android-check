@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -u
+
+data2=${BLOCKIE_DATA2_DIR:-/var/lib/blockie/data2}
+run=${BLOCKIE_ANDROID_RUN:-/run/blockie-android}
+
+state=
+[[ ! -r $run/state ]] || read -r state < "$run/state"
+kind=${state%% *}
+why=${state#"$kind"}
+why=${why# }
+if ! mountpoint -q "$data2"; then
+  if [[ $kind == failed ]]; then
+    echo "$why"
+    exit 2
+  fi
+  echo "${why:-$data2 is not mounted}"
+  exit 1
+fi
+for f in system.img vendor.img; do
+  [[ -f $data2/android/images/$f ]] || { echo "no android/images/$f"; exit 1; }
+done
+case $kind in
+  ok) exit 0 ;;
+  missing) echo "$why"; exit 1 ;;
+  failed) echo "$why"; exit 2 ;;
+  '') echo "prep not run"; exit 2 ;;
+  *) echo "unknown state: $state"; exit 2 ;;
+esac
