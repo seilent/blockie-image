@@ -107,7 +107,7 @@ state() {
 }
 run() {
   local t0=${EPOCHREALTIME//[!0-9]/}
-  BLOCKIE_SYSFS=$t/sys XDG_RUNTIME_DIR=$t/run PATH=$t/bin:$PATH timeout -k 2 20 "$@" > "$t/out" 2> "$t/err"
+  BLOCKIE_SYSFS=$t/sys BLOCKIE_SLEEP_KNOB=$t/knob XDG_RUNTIME_DIR=$t/run PATH=$t/bin:$PATH timeout -k 2 20 "$@" > "$t/out" 2> "$t/err"
   rc=$?
   ms=$(((${EPOCHREALTIME//[!0-9]/} - t0) / 1000))
   touch "$t/log"
@@ -466,6 +466,16 @@ run "$sl"
 [[ $(< "$t/out") == events && ! -s $P/state ]] || { ok=1; echo "  events: $(< "$t/out")"; }
 res $ok "a wakeup_count read held past 3 s gives active with the active sources, a rejected count write gives events, no mem write"
 
+sfix
+rm -f "$P/wakeup_count"
+mkfifo "$P/wakeup_count"
+: > "$t/knob"
+run "$sl" first
+rm -f "$t/knob"
+[[ $(< "$t/out") == "slept power 10.250000000" && $(< "$P/state") == mem ]] && ((ms < 2500)) &&
+  grep -qx "blockie-sleep: $t/knob set, wakeup_count skipped, active: disp_crtc0_wakelock" "$t/err"
+res $? "with the test knob set the wakeup_count handshake is skipped (a held source no longer blocks), the active sources are logged and mem is written ($ms ms)"
+
 ok=0
 sfix
 rm -f "$P/state"
@@ -521,7 +531,7 @@ sfix
 rm -f "$P/wakeup_count"
 mkfifo "$P/wakeup_count"
 t0=${EPOCHREALTIME//[!0-9]/}
-BLOCKIE_SYSFS=$t/sys XDG_RUNTIME_DIR=$t/run PATH=$t/bin:$PATH timeout -k 10 20 "$sl" first > "$t/out" 2> "$t/err" &
+BLOCKIE_SYSFS=$t/sys BLOCKIE_SLEEP_KNOB=$t/knob XDG_RUNTIME_DIR=$t/run PATH=$t/bin:$PATH timeout -k 10 20 "$sl" first > "$t/out" 2> "$t/err" &
 hp=$!
 sleep 0.5
 kill -TERM "$hp"
