@@ -3,9 +3,11 @@ set -u
 me=blockie-poweroff
 scope=blockie-game.scope
 timeout 2 wlopm --on '*' || echo "$me: wlopm --on failed" >&2
+/usr/libexec/blockie/blockie-backlight on cached
+bl=$?
 systemctl --user kill --signal=SIGCONT "$scope" 2> /dev/null ||
     [ "$(systemctl --user show -P ActiveState "$scope")" != active ] || echo "$me: SIGCONT to $scope failed" >&2
-/usr/libexec/blockie/blockie-backlight on
+[ "$bl" != 2 ] || /usr/libexec/blockie/blockie-backlight on lookup
 if systemctl --user is-active --quiet "$scope"; then
     /usr/libexec/blockie/blockie-game-cmd QUIT
     n=0

@@ -3,6 +3,7 @@ set -uf
 me=blockie-backlight
 led=${BLOCKIE_SYSFS:-/sys}/class/leds/lcd-backlight
 saved=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/blockie-backlight
+cache=$saved.session
 
 num() {
     case $1 in '' | *[!0-9]*) return 1 ;; esac
@@ -33,11 +34,30 @@ session() {
     done
 }
 
+call() {
+    timeout 1 busctl call org.freedesktop.login1 "$1" org.freedesktop.login1.Session SetBrightness ssu leds \
+        lcd-backlight "$2" > /dev/null
+}
+
 set_to() {
+    if [ "$2" != lookup ]; then
+        obj=
+        [ ! -f "$cache" ] || read -r obj < "$cache"
+        if [ -n "$obj" ]; then
+            call "$obj" "$1" 2> /dev/null
+            rc=$?
+            [ "$rc" != 0 ] || return 0
+            if [ "$rc" = 124 ]; then
+                echo "$me: SetBrightness $1 on $obj timed out" >&2
+                return 1
+            fi
+        fi
+        [ "$2" != cached ] || return 2
+    fi
     obj=$(timeout 1 "$0" session | tail -n 1)
     [ -n "$obj" ] || { echo "$me: no seat0 session of uid $(id -u) in ListSessions" >&2; return 1; }
-    timeout 1 busctl call org.freedesktop.login1 "$obj" org.freedesktop.login1.Session SetBrightness ssu leds \
-        lcd-backlight "$1" > /dev/null || { echo "$me: SetBrightness $1 on $obj failed" >&2; return 1; }
+    call "$obj" "$1" || { echo "$me: SetBrightness $1 on $obj failed" >&2; return 1; }
+    echo "$obj" > "$cache" || echo "$me: cannot write $cache" >&2
 }
 
 cur=
@@ -50,9 +70,16 @@ off)
     if num "$cur"; then
         echo "$cur" > "$saved" || echo "$me: cannot write $saved" >&2
     fi
-    set_to 0
+    set_to 0 all
     ;;
 on)
+    case ${2:-all} in
+    all | cached | lookup) ;;
+    *)
+        echo "usage: $me on [cached|lookup]" >&2
+        exit 64
+        ;;
+    esac
     v=
     [ ! -f "$saved" ] || read -r v < "$saved"
     if ! num "$v"; then
@@ -67,10 +94,11 @@ on)
             fi
         fi
     fi
-    set_to "$v" && rm -f "$saved"
+    set_to "$v" "${2:-all}" || exit
+    rm -f "$saved"
     ;;
 *)
-    echo "usage: $me on|off" >&2
+    echo "usage: $me on [cached|lookup] | off" >&2
     exit 64
     ;;
 esac

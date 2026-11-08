@@ -38,6 +38,8 @@ case "\$*" in
     ;;
   '--user kill --signal=SIGSTOP blockie-game.scope' | '--user kill --signal=SIGCONT blockie-game.scope')
     echo "systemctl \$*" >> "$t/log"
+    echo "\${3#--signal=}" >> "$s/calls"
+    [ "\$3" != --signal=SIGCONT ] || date +%s%6N > "$s/cont.us"
     if [ "\$n" = 0 ]; then
       echo "Failed to kill unit blockie-game.scope: Unit blockie-game.scope not loaded." >&2
       exit 1
@@ -53,6 +55,7 @@ cat > "$t/bin/busctl" << EOF
 #!/bin/sh
 case "\$*" in
   *' org.freedesktop.login1.Manager ListSessions')
+    echo ListSessions >> "$s/calls"
     [ ! -f "$s/ls.fail" ] || exit 1
     [ ! -f "$s/ls.hang" ] || exec sleep 30
     if [ -f "$s/two" ]; then
@@ -62,17 +65,26 @@ case "\$*" in
     fi
     ;;
   'get-property org.freedesktop.login1 '*' org.freedesktop.login1.Session Active')
+    echo "get-property \$3" >> "$s/calls"
     [ ! -f "$s/gp.hang" ] || exec sleep 30
     if [ -f "$s/act\${3##*/}" ]; then echo 'b true'; else echo 'b false'; fi
     ;;
   *' SetBrightness ssu leds lcd-backlight '*)
     echo "busctl \$*" >> "$t/log"
+    for v; do :; done
+    echo "SetBrightness \$3 \$v" >> "$s/calls"
+    if grep -qxF -- "\$3" "$s/gone" 2> /dev/null; then
+      echo "Call failed: Unknown object '\$3'." >&2
+      exit 1
+    fi
     [ ! -f "$s/sb.fail" ] || exit 1
     [ ! -f "$s/sb.hang" ] || exec sleep 30
-    for v; do :; done
     echo "\$v" > "$led/brightness"
     ;;
-  *) echo "busctl \$*" >> "$t/log" ;;
+  *)
+    echo "busctl \$*" >> "$t/log"
+    echo "\$5" >> "$s/calls"
+    ;;
 esac
 EOF
 chmod 755 "$t/bin/wlopm" "$t/bin/systemctl" "$t/bin/busctl"
@@ -83,7 +95,7 @@ state() {
   [[ $2 != stopped ]] || : > "$s/stopped"
   echo 102 > "$led/brightness"
   echo 255 > "$led/max_brightness"
-  rm -f "$t/run/blockie-backlight"
+  rm -f "$t/run/blockie-backlight" "$t/run/blockie-backlight.session"
 }
 run() {
   local t0=${EPOCHREALTIME//[!0-9]/}
@@ -98,6 +110,8 @@ stop_line='systemctl --user kill --signal=SIGSTOP blockie-game.scope'
 cont_line='systemctl --user kill --signal=SIGCONT blockie-game.scope'
 bl() { printf 'busctl call org.freedesktop.login1 /org/freedesktop/login1/session/%s org.freedesktop.login1.Session SetBrightness ssu leds lcd-backlight %s' "${2:-_37}" "$1"; }
 bl0=$(bl 0)
+sp=/org/freedesktop/login1/session
+cache=$t/run/blockie-backlight.session
 bl102=$(bl 102)
 off_line='busctl call org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager PowerOff b false'
 
@@ -118,11 +132,11 @@ res $((r1 || $?)) "blank-on sends SIGSTOP to an active game scope before wlopm -
 
 rm -f "$t/log"
 run "$hooks/blank-off"
-[[ $rc == 0 ]] && logis $'wlopm --on *\n'"$cont_line"$'\n'"$bl102" && ! stopped
+[[ $rc == 0 ]] && logis $'wlopm --on *\n'"$bl102"$'\n'"$cont_line" && ! stopped
 r1=$?
 rm -f "$t/log"
 run "$hooks/blank-off"
-[[ $rc == 0 ]] && logis $'wlopm --on *\n'"$cont_line"$'\n'"$bl102"
+[[ $rc == 0 ]] && logis $'wlopm --on *\n'"$bl102"$'\n'"$cont_line"
 res $((r1 || $?)) "blank-off runs wlopm --on before SIGCONT, and sends SIGCONT again on a second blank-off"
 
 ok=0
@@ -131,7 +145,7 @@ run "$hooks/blank-on"
 [[ $rc == 0 ]] && logis $'wlopm --off *\n'"$bl0" || ok=1
 rm -f "$t/log"
 run "$hooks/blank-off"
-[[ $rc == 0 && ! -s $t/err ]] && logis $'wlopm --on *\n'"$cont_line"$'\n'"$bl102" || ok=1
+[[ $rc == 0 && ! -s $t/err ]] && logis $'wlopm --on *\n'"$bl102"$'\n'"$cont_line" || ok=1
 res $ok "no game scope: blank-on sends no signal, blank-off still sends SIGCONT, its failure is not an error, exit 0"
 
 ok=0
@@ -141,14 +155,14 @@ run "$hooks/blank-on"
 [[ $rc == 1 ]] && logis "$stop_line"$'\nwlopm --off *\n'"$bl0" && stopped || ok=1
 rm -f "$t/log"
 run "$hooks/blank-off"
-[[ $rc == 1 ]] && logis $'wlopm --on *\n'"$cont_line"$'\n'"$bl102" && ! stopped || ok=1
+[[ $rc == 1 ]] && logis $'wlopm --on *\n'"$bl102"$'\n'"$cont_line" && ! stopped || ok=1
 state 1 running
 echo 1 > "$s/kill.rc"
 run "$hooks/blank-on"
 [[ $rc == 1 ]] && logis "$stop_line"$'\nwlopm --off *\n'"$bl0" || ok=1
 rm -f "$t/log"
 run "$hooks/blank-off"
-[[ $rc == 1 ]] && logis $'wlopm --on *\n'"$cont_line"$'\n'"$bl102" || ok=1
+[[ $rc == 1 ]] && logis $'wlopm --on *\n'"$bl102"$'\n'"$cont_line" || ok=1
 res $ok "a failing wlopm, or a failing signal to an active scope, exits 1 and the other step still runs"
 
 state 1 stopped
@@ -164,7 +178,7 @@ run "$hooks/blank-on"
   { ok=1; echo "  blank-on: rc $rc $ms ms"; }
 rm -f "$t/log"
 run "$hooks/blank-off"
-[[ $rc == 1 ]] && logis $'wlopm --on *\n'"$cont_line"$'\n'"$bl102" && ((ms >= 2000 && ms < 5000)) ||
+[[ $rc == 1 ]] && logis $'wlopm --on *\n'"$bl102"$'\n'"$cont_line" && ((ms >= 2000 && ms < 5000)) ||
   { ok=1; echo "  blank-off: rc $rc $ms ms"; }
 rm -f "$t/log"
 run "$hooks/screen-on"
@@ -221,20 +235,56 @@ state 0 running
 : > "$s/act_37"
 run "$hooks/blank-on"
 [[ $rc == 0 ]] && logis $'wlopm --off *\n'"$(bl 0 _37)" || { ok=1; echo "  second active: rc $rc"; }
-rm -f "$s/act_37" "$t/log"
+rm -f "$s/act_37" "$t/log" "$cache"
 run "$hooks/blank-off"
 [[ $rc == 0 ]] && logis $'wlopm --on *\n'"$cont_line"$'\n'"$(bl 102 _38)" || { ok=1; echo "  none active: rc $rc"; }
 : > "$s/act_38"
 : > "$s/act_37"
-rm -f "$t/log"
+rm -f "$t/log" "$cache"
 run "$hooks/blank-on"
 [[ $rc == 0 ]] && logis $'wlopm --off *\n'"$(bl 0 _38)" || { ok=1; echo "  both active: rc $rc"; }
 : > "$s/gp.hang"
-rm -f "$t/log"
+rm -f "$t/log" "$cache"
 run "$hooks/blank-off"
 [[ $rc == 0 ]] && logis $'wlopm --on *\n'"$cont_line"$'\n'"$(bl 102 _38)" && ((ms >= 1000 && ms < 2500)) ||
   { ok=1; echo "  Active hangs: rc $rc $ms ms"; }
 res $ok "two seat0 sessions of the uid: the first active one gets SetBrightness, none active or Active hanging past the 1 s lookup gives the first row"
+
+ok=0
+state 0 running
+run "$hooks/blank-on"
+[[ $(< "$cache") == "$sp/_37" && $(< "$s/calls") == "ListSessions"$'\n'"SetBrightness $sp/_37 0" ]] || { ok=1; echo "  off: $(tr '\n' ' ' < "$s/calls")"; }
+echo "$sp/_34" > "$cache"
+rm -f "$s/calls"
+run "$hooks/blank-off"
+[[ $rc == 0 && $(< "$s/calls") == "SetBrightness $sp/_34 102"$'\n'SIGCONT && $(< "$led/brightness") == 102 ]] ||
+  { ok=1; echo "  on: $(tr '\n' ' ' < "$s/calls")"; }
+rm -f "$s/calls"
+run "$hooks/blank-on"
+[[ $rc == 0 && $(< "$s/calls") == "SetBrightness $sp/_34 0" ]] || { ok=1; echo "  cached off: $(tr '\n' ' ' < "$s/calls")"; }
+res $ok "the session path is cached at off; a cached wake is one SetBrightness on it, then SIGCONT, and a cached off one SetBrightness, with no ListSessions"
+
+ok=0
+state 0 running
+echo 0 > "$led/brightness"
+echo 102 > "$t/run/blockie-backlight"
+echo "$sp/_36" > "$cache"
+echo "$sp/_36" > "$s/gone"
+run "$hooks/blank-off"
+[[ $rc == 0 && $(< "$s/calls") == "SetBrightness $sp/_36 102"$'\n'SIGCONT$'\n'"ListSessions"$'\n'"SetBrightness $sp/_37 102" ]] &&
+  [[ $(< "$cache") == "$sp/_37" && $(< "$led/brightness") == 102 && ! -s $t/err ]] || { ok=1; echo "  stale: $(tr '\n' ' ' < "$s/calls")"; }
+state 0 running
+echo 0 > "$led/brightness"
+run "$hooks/blank-off"
+[[ $rc == 0 && $(< "$s/calls") == SIGCONT$'\n'"ListSessions"$'\n'"SetBrightness $sp/_37 102" && $(< "$cache") == "$sp/_37" ]] ||
+  { ok=1; echo "  no cache: $(tr '\n' ' ' < "$s/calls")"; }
+state 0 running
+echo "$sp/_37" > "$cache"
+: > "$s/sb.hang"
+run "$hooks/blank-off"
+[[ $rc == 0 && $(< "$s/calls") == "SetBrightness $sp/_37 102"$'\n'SIGCONT ]] && grep -q 'timed out' "$t/err" && ((ms >= 1000 && ms < 1800)) ||
+  { ok=1; echo "  hung logind: rc $rc $ms ms $(tr '\n' ' ' < "$s/calls")"; }
+res $ok "SIGCONT never waits on the lookup: stale cache is cached call, SIGCONT, lookup and cache rewrite; no cache is SIGCONT, lookup; a timed out cached call (logind hung) is SIGCONT and no lookup"
 
 ok=0
 for h in blank-on blank-off; do
@@ -242,11 +292,18 @@ for h in blank-on blank-off; do
   for f in wlopm.hang two gp.hang sb.hang; do
     : > "$s/$f"
   done
+  echo "$sp/_36" > "$cache"
+  echo "$sp/_36" > "$s/gone"
+  s0=${EPOCHREALTIME//[!0-9]/}
   run "$hooks/$h"
   ((rc == 1 && ms >= 4000 && ms < 4800)) && grep -q 'SetBrightness [0-9]* on /org/freedesktop/login1/session/_38 failed' "$t/err" ||
     { ok=1; echo "  $h: rc $rc $ms ms"; }
+  if [[ $h == blank-off ]]; then
+    c=$((($(< "$s/cont.us") - s0) / 1000))
+    ((c >= 1900 && c < 2600)) || { ok=1; echo "  $h: SIGCONT $c ms after the start"; }
+  fi
 done
-res $ok "the worst case stays inside hotkeyd's 5 s hook limit: wlopm 2 s, the session lookup 1 s, SetBrightness 1 s"
+res $ok "the worst case stays inside 4 s plus a little and hotkeyd's 5 s hook limit (wlopm 2 s, a stale cached call, lookup 1 s, SetBrightness 1 s), and blank-off sends SIGCONT about 2.1 s in, before the lookup"
 
 ok=0
 for f in "$hooks/blank-on" "$hooks/blank-off" "$hooks/screen-on" "$off" /usr/libexec/blockie/blockie-backlight; do
