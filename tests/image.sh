@@ -63,9 +63,11 @@ rpm -q systemd bootc ostree skopeo podman NetworkManager kmod > /dev/null || fai
 for p in ostree ostree-libs; do
   [[ $(rpm -q --qf '%{RELEASE}' "$p") == *.blockie ]] || fail "$p is not the blockie build: $(rpm -q "$p")"
 done
-rpm -q e2fsprogs erofs-utils vulkan-tools egl-utils drm-utils strace file procps-ng jq libwayland-client \
+rpm -q e2fsprogs tzdata erofs-utils vulkan-tools egl-utils drm-utils strace file procps-ng jq libwayland-client \
   libwayland-server NetworkManager-wifi wpa_supplicant iw wireless-regdb iperf3 bluez alsa-ucm alsa-ucm-utils \
   alsa-utils retroarch libretro-mgba libretro-pcsx-rearmed kmscube glmark2 > /dev/null || fail "packages missing"
+[[ $(readlink /etc/localtime) == ../usr/share/zoneinfo/Asia/Tokyo && -f /usr/share/zoneinfo/Asia/Tokyo ]] ||
+  fail "/etc/localtime is not Asia/Tokyo"
 for id in gambatte nestopia mgba pcsx_rearmed snes9x genesis_plus_gx mupen64plus_next ppsspp flycast; do
   so=/usr/lib64/libretro/${id}_libretro.so
   pkg=libretro-${id//_/-}

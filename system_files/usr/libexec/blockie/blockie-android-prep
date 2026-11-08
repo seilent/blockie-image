@@ -16,6 +16,7 @@ PIN = os.environ.get("BLOCKIE_ANDROID_PIN", "/usr/share/blockie/android.d/lineag
 KL = os.environ.get("BLOCKIE_ANDROID_KL", "/usr/share/blockie/android/Vendor_4001_Product_0428.kl")
 BASE = os.environ.get("BLOCKIE_WAYDROID_BASE", "/usr/lib/waydroid/data/configs/config_base")
 PAYLOAD = os.environ.get("BLOCKIE_ANDROID_PAYLOAD", "/sys/fs/cgroup/lxc.payload.waydroid")
+LOCALTIME = os.environ.get("BLOCKIE_LOCALTIME", "/etc/localtime")
 EXTRA = "/usr/share/waydroid-extra/images"
 ANDROID = os.path.join(DATA2, "android")
 IMAGES = os.path.join(ANDROID, "images")
@@ -28,6 +29,14 @@ PROPERTIES = {
     "persist.waydroid.suspend": "false",
 }
 PINNED = {"suspend_action": "freeze", "mount_overlays": "True"}
+
+
+def properties():
+    props = dict(PROPERTIES)
+    zone = os.path.realpath(LOCALTIME).partition("/zoneinfo/")[2]
+    if re.fullmatch(r"[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*", zone):
+        props["persist.sys.timezone"] = zone
+    return props
 
 
 class Refused(Exception):
@@ -116,7 +125,7 @@ def config():
         if section not in cfg:
             cfg[section] = {}
     cfg["waydroid"].update(PINNED)
-    cfg["properties"].update(PROPERTIES)
+    cfg["properties"].update(properties())
     out = io.StringIO()
     cfg.write(out)
     if out.getvalue() != old:
@@ -163,7 +172,7 @@ def prep():
     base = read(BASE)
     if base is None:
         raise Refused("failed", f"no {BASE}")
-    props = "".join(f"{k}={v}\n" for k, v in sorted(PROPERTIES.items()))
+    props = "".join(f"{k}={v}\n" for k, v in sorted(properties().items()))
     want = (f"waydroid {version()}\nconfig_base {sha256(base)}\nproperties {sha256(props)}\n"
             f"images {sha256(stamp)}\n")
     config()

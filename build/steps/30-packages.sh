@@ -30,6 +30,7 @@ read -ra opts <<< "${BLOCKIE_DNF_OPTS:-}"
 dnf -y "${opts[@]}" install \
   "${rpms[@]}" \
   e2fsprogs \
+  tzdata \
   erofs-utils \
   vulkan-tools \
   egl-utils \

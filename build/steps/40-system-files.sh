@@ -2,6 +2,7 @@
 set -euo pipefail
 
 cp -a /ctx/system_files/. /
+ln -sfn ../usr/share/zoneinfo/Asia/Tokyo /etc/localtime
 
 while read -r t u g; do
   if [[ $t == m && $u == blockie ]] && ! grep -q "^$g:" /etc/group; then

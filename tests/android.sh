@@ -312,7 +312,7 @@ prun() {
   : > "$p/calls"
   PATH=$p/bin:$PATH BLOCKIE_DATA2_DIR=$p/data2 BLOCKIE_ANDROID_RUN=$p/run BLOCKIE_WAYDROID_WORK=$p/work \
     BLOCKIE_ANDROID_PIN=${1:-$p/pin} BLOCKIE_WAYDROID_BASE=$p/config_base BLOCKIE_ANDROID_PAYLOAD=$p/payload \
-    timeout 20 "$lx/blockie-android-prep" > "$p/out" 2>&1
+    BLOCKIE_LOCALTIME=$p/localtime timeout 20 "$lx/blockie-android-prep" > "$p/out" 2>&1
   rc=$?
   st=$(cat "$p/run/state" 2> /dev/null)
 }
@@ -333,11 +333,14 @@ fi
 res $ok "prep: the shipped pin names the GAPPS system and MAINLINE vendor zips; while a field is '-' prep refuses with pin incomplete and runs nothing"
 
 ok=0
-mkdir -p "$p/data2/android/images.old"
+mkdir -p "$p/data2/android/images.old" "$p/zoneinfo/Asia"
+: > "$p/zoneinfo/Asia/Tokyo"
+ln -sfn "$p/zoneinfo/Asia/Tokyo" "$p/localtime"
 prun
 [[ $rc == 0 && $st == ok && $(cat "$p/calls") == '--details-to-stdout init' ]] || { ok=1; echo "  first: rc $rc '$st' $(cat "$p/calls")"; }
 for kv in properties:persist.waydroid.width:960 properties:persist.waydroid.height:720 properties:persist.waydroid.uevent:false \
-  properties:persist.waydroid.suspend:false waydroid:suspend_action:freeze waydroid:mount_overlays:True; do
+  properties:persist.waydroid.suspend:false properties:persist.sys.timezone:Asia/Tokyo waydroid:suspend_action:freeze \
+  waydroid:mount_overlays:True; do
   IFS=: read -r sec key val <<< "$kv"
   [[ $(cfgget "$sec" "$key") == "$val" ]] || { ok=1; echo "  $sec $key: $(cfgget "$sec" "$key")"; }
 done
