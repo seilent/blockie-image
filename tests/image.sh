@@ -50,7 +50,8 @@ for g in wheel systemd-journal input video render audio; do
 done
 [[ $(getent passwd blockie | cut -d: -f6,7) == /var/home/blockie:/bin/bash ]] || fail "blockie home or shell"
 grep -qx 'd /var/home/blockie 0700 blockie blockie -' /usr/lib/tmpfiles.d/blockie.conf || fail "home tmpfiles line"
-for p in /var/cache/libX11 /var/cache/libX11/compose /var/lib/alsa /var/lib/bluetooth /var/lib/bluetooth/mesh /var/lib/geoclue; do
+for p in /var/cache/libX11 /var/cache/libX11/compose /var/lib/alsa /var/lib/bluetooth /var/lib/bluetooth/mesh /var/lib/geoclue \
+  /var/lib/lxc /var/cache/lxc /var/lib/lxcfs; do
   [[ -d $p && ! -L $p ]] || fail "$p is not a directory in the image"
   l="d $p $(stat -c '%04a %U %G' "$p") -"
   grep -qxF "$l" /usr/lib/tmpfiles.d/blockie.conf || fail "no tmpfiles line '$l'"
@@ -140,6 +141,10 @@ XDG_RUNTIME_DIR=$xdg systemd-analyze verify --user --man=no /usr/lib/systemd/use
   fail "blockie-poweroff.service does not verify"
 rm -rf "${xdg:?}"
 rpm -q wlopm > /dev/null || fail "wlopm not installed"
+rpm -q waydroid lxc dnsmasq iptables-legacy > /dev/null || fail "waydroid, lxc, dnsmasq or iptables-legacy not installed"
+[[ $(rpm -q --qf '%{RELEASE}' waydroid) == *.blockie ]] || fail "waydroid is not the blockie build: $(rpm -q waydroid)"
+! rpm -q waydroid-selinux > /dev/null || fail "waydroid-selinux is installed"
+grep -qx 'd /var/lib/dnsmasq 0755 root dnsmasq -' /usr/lib/tmpfiles.d/dnsmasq.conf || fail "no tmpfiles line for /var/lib/dnsmasq"
 for h in blank-on blank-off screen-on; do
   [[ -f /usr/lib/blockie/hooks.d/$h && $(stat -c %a "/usr/lib/blockie/hooks.d/$h") == 755 ]] || fail "hook $h is not a 755 file"
 done

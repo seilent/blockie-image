@@ -13,6 +13,12 @@ done
 for d in /usr/lib/udev/rules.d /etc/udev/rules.d; do
   [[ ! -e $d/99-blockie-emmc.rules ]] || fail "$d/99-blockie-emmc.rules has the name of the ramdisk eMMC rule"
 done
+for u in waydroid-container.service lxc.service lxc-net.service lxc-monitord.service lxcfs.service dnsmasq.service; do
+  [[ -f /usr/lib/systemd/system/$u ]] || fail "$u is not installed"
+  [[ -z $(find /etc/systemd/system /usr/lib/systemd/system -path '*.wants/*' -name "$u") ]] || fail "$u is enabled"
+done
+[[ -z $(find /etc/systemd/system /usr/lib/systemd/system -path '*.wants/*' -name nftables.service) ]] ||
+  fail "nftables.service is enabled"
 cycles=$(systemd-analyze verify --man=no default.target 2>&1 | grep 'ordering cycle' | head -n 3 || true)
 [[ -z $cycles ]] || fail "ordering cycles in the default.target transaction: $cycles"
 

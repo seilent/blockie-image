@@ -68,12 +68,16 @@ def text(path):
 check(root.tag == "labwc_config", "rc.xml root is labwc_config")
 check(text("core/allowTearing") == "no", "tearing is off")
 check(text("core/adaptiveSync") == "no", "adaptive sync is off")
-binds = root.findall("keyboard/keybind")
-check(len(binds) == 1 and [a.get("name") for a in binds[0].findall("action")] == ["None"], "one empty keybind, so no default keybinds")
+binds = {b.get("key"): [(a.get("name"), a.get("command")) for a in b.findall("action")] for b in root.findall("keyboard/keybind")}
+check(len(root.findall("keyboard/keybind")) == len(binds) == 4, "four keybinds, one per key")
+check(binds.get("XF86Launch9") == [("None", None)], "one empty keybind, so no default keybinds")
+held = ("XF86PowerOff", "XF86AudioRaiseVolume", "XF86AudioLowerVolume")
+check(all(binds.get(k) == [("Execute", "true")] for k in held), "power and volume run true, so no client gets them")
 mice = root.findall("mouse/context/mousebind")
 check(len(mice) == 1 and [a.get("name") for a in mice[0].findall("action")] == ["None"], "one empty mousebind, so no default mousebinds")
-names = [a.get("name") for a in root.iter("action")]
-check("Execute" not in names and "ToggleFullscreen" not in names, "no Execute and no ToggleFullscreen action")
+actions = [(a.get("name"), a.get("command")) for a in root.iter("action")]
+check(actions.count(("Execute", "true")) == len(held) and all(n != "Execute" or c == "true" for n, c in actions), "no Execute action other than true")
+check("ToggleFullscreen" not in [n for n, _ in actions], "no ToggleFullscreen action")
 rules = root.findall("windowRules/windowRule")
 check(any(r.get("identifier") == "*" and r.get("serverDecoration") == "no" for r in rules), "no server decorations")
 check(any(r.get("identifier") == "*" and r.get("type") == "normal" and [a.get("name") for a in r.findall("action")] == ["Maximize"] for r in rules), "normal windows are maximized on first map")

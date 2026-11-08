@@ -30,8 +30,12 @@ done
 for d in /etc/NetworkManager/system-connections /usr/lib/NetworkManager/system-connections; do
   [[ ! -d $d ]] || [[ -z $(find "$d" -mindepth 1 -print -quit) ]] || fail "$d is not empty"
 done
-only='unmanaged-devices=interface-name:ap0;interface-name:wlan1;interface-name:p2p0'
-grep -qxF "$only" /usr/lib/NetworkManager/conf.d/50-blockie-wifi.conf || fail "50-blockie-wifi.conf does not leave ap0, wlan1 and p2p0 unmanaged"
+only='unmanaged-devices=interface-name:ap0;interface-name:wlan1;interface-name:p2p0;interface-name:waydroid0;interface-name:veth*'
+fw='firewall-backend=none'
+for l in "$only" "$fw"; do
+  grep -qxF "$l" /usr/lib/NetworkManager/conf.d/50-blockie-wifi.conf || fail "50-blockie-wifi.conf lacks $l"
+done
 nm=$(NetworkManager --print-config 2> /dev/null) || fail "NetworkManager --print-config failed"
-grep -qxF "$only" <<< "$nm" || fail "NetworkManager's merged config does not leave ap0, wlan1 and p2p0 unmanaged"
+grep -qxF "$only" <<< "$nm" || fail "NetworkManager's merged config does not leave ap0, wlan1, p2p0, waydroid0 and veth* unmanaged"
+grep -qxF "$fw" <<< "$nm" || fail "NetworkManager's merged config has a firewall backend"
 echo "wifi: ok"

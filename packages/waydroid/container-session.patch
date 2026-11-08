@@ -1,0 +1,111 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: seilent <github@seilent.net>
+Date: Sun, 8 Nov 2026 18:00:00 +0900
+Subject: [PATCH] container: session user, group and runtime paths from the
+ passwd entry, no control characters, spaces or backslashes, guest data from a
+ root owned path, no world writable device modes
+
+---
+ tools/actions/container_manager.py | 47 ++++++++++++------------------
+ tools/helpers/lxc.py               |  7 +++--
+ 2 files changed, 24 insertions(+), 30 deletions(-)
+
+diff --git a/tools/actions/container_manager.py b/tools/actions/container_manager.py
+index 6e088bb..f0874dd 100644
+--- a/tools/actions/container_manager.py
++++ b/tools/actions/container_manager.py
+@@ -3,6 +3,8 @@
+ 
+ import logging
+ import os
++import pwd
++import re
+ import glob
+ import signal
+ import tools.config
+@@ -16,6 +18,8 @@ import dbus.service
+ import dbus.exceptions
+ from gi.repository import GLib
+ 
++BLOCKIE_GUEST_DATA = "/var/lib/blockie/data2/android/guest/data"
++
+ class DbusContainerManager(dbus.service.Object):
+     def __init__(self, looper, bus, object_path, args):
+         self.args = args
+@@ -32,6 +36,19 @@ class DbusContainerManager(dbus.service.Object):
+         pid = dbus_info.GetConnectionUnixProcessID(sender)
+         if str(uid) != "0" and str(pid) != session["pid"]:
+             raise RuntimeError("Invalid session pid")
++        for k, v in session.items():
++            if any(ord(c) < 32 or ord(c) == 127 or c in " \\" for c in str(k) + str(v)):
++                raise RuntimeError("Session value with a control character, a space or a backslash")
++        pw = pwd.getpwuid(int(session["user_id"]))
++        session["user_name"] = pw.pw_name
++        session["group_id"] = str(pw.pw_gid)
++        session["xdg_runtime_dir"] = "/run/user/" + str(pw.pw_uid)
++        if not re.fullmatch(r"wayland-[0-9]+", str(session.get("wayland_display", ""))):
++            raise RuntimeError("Session wayland_display is not wayland-<n>")
++        session["pulse_runtime_path"] = session["xdg_runtime_dir"] + "/pulse"
++        if not os.path.isdir(BLOCKIE_GUEST_DATA):
++            raise RuntimeError("No guest data directory " + BLOCKIE_GUEST_DATA)
++        session["waydroid_data"] = BLOCKIE_GUEST_DATA
+         do_start(self.args, session)
+ 
+     @helpers.logging.log_exceptions
+@@ -71,35 +88,9 @@ def set_permissions(args, perm_list=None, mode="777"):
+             command = ["chmod", mode, "-R", path]
+             tools.helpers.run.user(args, command, check=False)
+ 
+-    # Nodes list
+     if not perm_list:
+-        perm_list = [
+-            "/dev/ashmem",
+-
+-            # sw_sync for HWC
+-            "/dev/sw_sync",
+-            "/sys/kernel/debug/sync/sw_sync",
+-
+-            # Media
+-            "/dev/Vcodec",
+-            "/dev/MTK_SMI",
+-            "/dev/mdp_sync",
+-            "/dev/mtk_cmdq",
+-
+-            # Graphics
+-            "/dev/graphics",
+-            "/dev/pvr_sync",
+-            "/dev/ion",
+-        ]
+-
+-        # DRM render nodes
+-        perm_list.extend(glob.glob("/dev/dri/renderD*"))
+-        # Framebuffers
+-        perm_list.extend(glob.glob("/dev/fb*"))
+-        # Videos
+-        perm_list.extend(glob.glob("/dev/video*"))
+-        # DMA-BUF Heaps
+-        perm_list.extend(glob.glob("/dev/dma_heap/*"))
++        perm_list = ["/dev/ashmem"]
++        mode = "666"
+ 
+     for path in perm_list:
+         chmod(path, mode)
+diff --git a/tools/helpers/lxc.py b/tools/helpers/lxc.py
+index 42ed8c8..4493f1a 100644
+--- a/tools/helpers/lxc.py
++++ b/tools/helpers/lxc.py
+@@ -198,9 +198,12 @@ def generate_session_lxc_config(args, session):
+         raise OSError("Failed to bind Wayland socket")
+ 
+     # Make sure PULSE_RUNTIME_DIR exists
+-    pulse_host_socket = os.path.join(session["pulse_runtime_path"], "native")
++    pulse_host_socket = os.path.realpath(os.path.join(session["pulse_runtime_path"], "native"))
+     pulse_container_socket = os.path.join(tools.config.defaults["container_pulse_runtime_path"], "native")
+-    make_entry(pulse_host_socket, pulse_container_socket[1:])
++    if os.path.exists(pulse_host_socket) and str(os.stat(pulse_host_socket).st_uid) == session["user_id"]:
++        make_entry(pulse_host_socket, pulse_container_socket[1:])
++    else:
++        logging.warning("Pulse socket is missing or not owned by user: " + pulse_host_socket)
+ 
+     if not make_entry(session["waydroid_data"], "data", options="rbind 0 0"):
+         raise OSError("Failed to bind userdata")

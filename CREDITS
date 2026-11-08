@@ -15,6 +15,9 @@ packages/bootc: Fedora's bootc 1.17.1-1.fc44 source RPM (https://github.com/boot
 rebuilt with ipc-ns-not-found.patch.
 packages/ostree: Fedora's ostree 2026.4-1.fc44 source RPM (https://github.com/ostreedev/ostree, LGPL-2.0-or-later),
 rebuilt with selinux-disabled-skip.patch.
+packages/waydroid: Fedora's waydroid 1.6.3-1.fc44 source RPM (https://github.com/waydroid/waydroid, GPL-3.0-only),
+rebuilt without mount-secontext.patch and the D-Bus activation file, with namespaces-includes.patch,
+no-debugfs-bind.patch, net-filter-ipforward.patch, lxc-debug-log.patch, container-session.patch and dbus-policy.patch.
 packages/retroarch: Fedora's retroarch 1.22.0-20.fc44 source RPM (https://github.com/libretro/RetroArch,
 GPL-3.0-or-later), rebuilt for GLES with gles-context.patch, upstream RetroArch commit db91cdbf (#18436).
 packages/libretro-snes9x: Snes9x (https://github.com/libretro/snes9x, fae2fea, the Snes9x licence: non commercial

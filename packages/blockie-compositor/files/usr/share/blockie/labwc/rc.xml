@@ -15,6 +15,15 @@
     <keybind key="XF86Launch9">
       <action name="None"/>
     </keybind>
+    <keybind key="XF86PowerOff">
+      <action name="Execute" command="true"/>
+    </keybind>
+    <keybind key="XF86AudioRaiseVolume">
+      <action name="Execute" command="true"/>
+    </keybind>
+    <keybind key="XF86AudioLowerVolume">
+      <action name="Execute" command="true"/>
+    </keybind>
   </keyboard>
   <mouse>
     <context name="Root">

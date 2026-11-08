@@ -1,0 +1,66 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: seilent <github@seilent.net>
+Date: Sun, 8 Nov 2026 18:00:00 +0900
+Subject: [PATCH] net: stateful bridge filter, optional CHECKSUM rule,
+ ip_forward restored on stop
+
+---
+ data/scripts/waydroid-net.sh | 21 ++++++++++++++++++---
+ 1 file changed, 18 insertions(+), 3 deletions(-)
+
+diff --git a/data/scripts/waydroid-net.sh b/data/scripts/waydroid-net.sh
+index 1c4479f..8799869 100755
+--- a/data/scripts/waydroid-net.sh
++++ b/data/scripts/waydroid-net.sh
+@@ -94,10 +94,14 @@ start_iptables() {
+     $IPTABLES_BIN $use_iptables_lock -I INPUT -i ${LXC_BRIDGE} -p tcp --dport 67 -j ACCEPT
+     $IPTABLES_BIN $use_iptables_lock -I INPUT -i ${LXC_BRIDGE} -p udp --dport 53 -j ACCEPT
+     $IPTABLES_BIN $use_iptables_lock -I INPUT -i ${LXC_BRIDGE} -p tcp --dport 53 -j ACCEPT
++    $IPTABLES_BIN $use_iptables_lock -I INPUT -i ${LXC_BRIDGE} -p icmp --icmp-type echo-request -j ACCEPT
++    $IPTABLES_BIN $use_iptables_lock -I INPUT -i ${LXC_BRIDGE} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
++    $IPTABLES_BIN $use_iptables_lock -A INPUT -i ${LXC_BRIDGE} -j DROP
+     $IPTABLES_BIN $use_iptables_lock -I FORWARD -i ${LXC_BRIDGE} -j ACCEPT
+-    $IPTABLES_BIN $use_iptables_lock -I FORWARD -o ${LXC_BRIDGE} -j ACCEPT
++    $IPTABLES_BIN $use_iptables_lock -I FORWARD -o ${LXC_BRIDGE} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
++    $IPTABLES_BIN $use_iptables_lock -A FORWARD -o ${LXC_BRIDGE} -j DROP
+     $IPTABLES_BIN $use_iptables_lock -t nat -A POSTROUTING -s ${LXC_NETWORK} ! -d ${LXC_NETWORK} -j MASQUERADE
+-    $IPTABLES_BIN $use_iptables_lock -t mangle -A POSTROUTING -o ${LXC_BRIDGE} -p udp -m udp --dport 68 -j CHECKSUM --checksum-fill
++    $IPTABLES_BIN $use_iptables_lock -t mangle -A POSTROUTING -o ${LXC_BRIDGE} -p udp -m udp --dport 68 -j CHECKSUM --checksum-fill || true
+ }
+ 
+ start_nftables() {
+@@ -152,6 +156,9 @@ start() {
+ 
+     # set up the lxc network
+     [ ! -d /sys/class/net/${LXC_BRIDGE} ] && ip link add dev ${LXC_BRIDGE} type bridge
++    echo 1 > /proc/sys/net/ipv6/conf/${LXC_BRIDGE}/disable_ipv6 || true
++    mkdir -p "${varrun}"
++    [ -f "${varrun}/ip_forward" ] || cat /proc/sys/net/ipv4/ip_forward > "${varrun}/ip_forward"
+     echo 1 > /proc/sys/net/ipv4/ip_forward
+     echo 0 > /proc/sys/net/ipv6/conf/${LXC_BRIDGE}/accept_dad || true
+ 
+@@ -216,8 +223,12 @@ stop_iptables() {
+     $IPTABLES_BIN $use_iptables_lock -D INPUT -i ${LXC_BRIDGE} -p tcp --dport 67 -j ACCEPT
+     $IPTABLES_BIN $use_iptables_lock -D INPUT -i ${LXC_BRIDGE} -p udp --dport 53 -j ACCEPT
+     $IPTABLES_BIN $use_iptables_lock -D INPUT -i ${LXC_BRIDGE} -p tcp --dport 53 -j ACCEPT
++    $IPTABLES_BIN $use_iptables_lock -D INPUT -i ${LXC_BRIDGE} -p icmp --icmp-type echo-request -j ACCEPT
++    $IPTABLES_BIN $use_iptables_lock -D INPUT -i ${LXC_BRIDGE} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
++    $IPTABLES_BIN $use_iptables_lock -D INPUT -i ${LXC_BRIDGE} -j DROP
+     $IPTABLES_BIN $use_iptables_lock -D FORWARD -i ${LXC_BRIDGE} -j ACCEPT
+-    $IPTABLES_BIN $use_iptables_lock -D FORWARD -o ${LXC_BRIDGE} -j ACCEPT
++    $IPTABLES_BIN $use_iptables_lock -D FORWARD -o ${LXC_BRIDGE} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
++    $IPTABLES_BIN $use_iptables_lock -D FORWARD -o ${LXC_BRIDGE} -j DROP
+     $IPTABLES_BIN $use_iptables_lock -t nat -D POSTROUTING -s ${LXC_NETWORK} ! -d ${LXC_NETWORK} -j MASQUERADE
+     $IPTABLES_BIN $use_iptables_lock -t mangle -D POSTROUTING -o ${LXC_BRIDGE} -p udp -m udp --dport 68 -j CHECKSUM --checksum-fill
+     if [ "$LXC_IPV6_NAT" = "true" ]; then
+@@ -260,6 +271,10 @@ stop() {
+         ls /sys/class/net/${LXC_BRIDGE}/brif/* > /dev/null 2>&1 || ip link delete ${LXC_BRIDGE}
+     fi
+ 
++    if [ -f "${varrun}/ip_forward" ]; then
++        cat "${varrun}/ip_forward" > /proc/sys/net/ipv4/ip_forward
++        rm -f "${varrun}/ip_forward"
++    fi
+     rm -f "${varrun}"/network_up
+ }
+ 

@@ -1,0 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: seilent <github@seilent.net>
+Date: Sun, 8 Nov 2026 18:00:00 +0900
+Subject: [PATCH] dbus: only root and blockie may call id.waydro.Container
+
+---
+ dbus/id.waydro.Container.conf | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/dbus/id.waydro.Container.conf b/dbus/id.waydro.Container.conf
+index e94b9e8..932bfcb 100644
+--- a/dbus/id.waydro.Container.conf
++++ b/dbus/id.waydro.Container.conf
+@@ -4,9 +4,12 @@
+ <busconfig>
+     <policy user="root">
+         <allow own="id.waydro.Container"/>
++        <allow send_destination="id.waydro.Container"/>
+     </policy>
+-    <policy context="default">
++    <policy user="blockie">
+         <allow send_destination="id.waydro.Container"/>
++    </policy>
++    <policy context="default">
+         <allow receive_sender="id.waydro.Container"/>
+     </policy>
+ </busconfig>

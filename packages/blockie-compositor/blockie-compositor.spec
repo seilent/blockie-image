@@ -15,8 +15,8 @@ Requires:       bash
 %description
 labwc on the KONKR Pocket Block display: GLES on the GPU link farm or pixman, no cursor
 ioctls or cursor planes on the MediaTek display driver, a glFinish before each page flip,
-undecorated maximized windows, no bindings, no tearing, no cursor image. Every blockie user
-unit loads the GPU environment and the cursor shim.
+undecorated maximized windows, power and volume keys held back from clients, no tearing, no
+cursor image. Every blockie user unit loads the GPU environment and the cursor shim.
 
 %prep
 %setup -q -c -n blockie-compositor
