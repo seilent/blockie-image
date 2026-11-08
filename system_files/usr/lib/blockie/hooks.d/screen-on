@@ -1,2 +1,5 @@
 #!/bin/sh
-exec timeout 2 wlopm --on '*'
+rc=0
+timeout 2 wlopm --on '*' || rc=1
+/usr/libexec/blockie/blockie-backlight on
+exit $rc

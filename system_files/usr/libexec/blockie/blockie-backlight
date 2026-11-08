@@ -1,0 +1,76 @@
+#!/bin/sh
+set -uf
+me=blockie-backlight
+led=${BLOCKIE_SYSFS:-/sys}/class/leds/lcd-backlight
+saved=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/blockie-backlight
+
+num() {
+    case $1 in '' | *[!0-9]*) return 1 ;; esac
+    [ "$1" -gt 0 ]
+}
+
+session() {
+    set -- $(busctl call org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager ListSessions)
+    [ $# -ge 2 ] || return 1
+    shift 2
+    paths=
+    while [ $# -ge 5 ]; do
+        if [ "$2" = "$(id -u)" ] && [ "$4" = '"seat0"' ]; then
+            p=${5#\"}
+            paths="$paths ${p%\"}"
+        fi
+        shift 5
+    done
+    set -- $paths
+    [ $# -ge 1 ] || return 1
+    echo "$1"
+    [ $# -gt 1 ] || return 0
+    for p; do
+        if [ "$(busctl get-property org.freedesktop.login1 "$p" org.freedesktop.login1.Session Active)" = "b true" ]; then
+            echo "$p"
+            return 0
+        fi
+    done
+}
+
+set_to() {
+    obj=$(timeout 1 "$0" session | tail -n 1)
+    [ -n "$obj" ] || { echo "$me: no seat0 session of uid $(id -u) in ListSessions" >&2; return 1; }
+    timeout 1 busctl call org.freedesktop.login1 "$obj" org.freedesktop.login1.Session SetBrightness ssu leds \
+        lcd-backlight "$1" > /dev/null || { echo "$me: SetBrightness $1 on $obj failed" >&2; return 1; }
+}
+
+cur=
+[ ! -r "$led/brightness" ] || read -r cur < "$led/brightness"
+case ${1:-} in
+session)
+    session
+    ;;
+off)
+    if num "$cur"; then
+        echo "$cur" > "$saved" || echo "$me: cannot write $saved" >&2
+    fi
+    set_to 0
+    ;;
+on)
+    v=
+    [ ! -f "$saved" ] || read -r v < "$saved"
+    if ! num "$v"; then
+        v=$cur
+        if ! num "$v"; then
+            max=
+            [ ! -r "$led/max_brightness" ] || read -r max < "$led/max_brightness"
+            v=102
+            if num "$max"; then
+                v=$((max * 2 / 5))
+                [ "$v" -gt 0 ] || v=$max
+            fi
+        fi
+    fi
+    set_to "$v" && rm -f "$saved"
+    ;;
+*)
+    echo "usage: $me on|off" >&2
+    exit 64
+    ;;
+esac

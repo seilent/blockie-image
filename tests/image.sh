@@ -144,6 +144,7 @@ for h in blank-on blank-off screen-on; do
   [[ -f /usr/lib/blockie/hooks.d/$h && $(stat -c %a "/usr/lib/blockie/hooks.d/$h") == 755 ]] || fail "hook $h is not a 755 file"
 done
 [[ -x /usr/libexec/blockie/blockie-poweroff ]] || fail "blockie-poweroff missing"
+[[ $(stat -c %a /usr/libexec/blockie/blockie-backlight 2> /dev/null) == 755 ]] || fail "blockie-backlight is not a 755 file"
 po=/usr/lib/systemd/user/blockie-poweroff.service
 grep -qx 'Type=oneshot' "$po" && grep -qx 'TimeoutStartSec=15s' "$po" && ! grep -q '^\[Install\]' "$po" ||
   fail "blockie-poweroff.service is not a 15 s oneshot without [Install]"

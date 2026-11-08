@@ -4,4 +4,5 @@ if [ "$(systemctl --user show -P ActiveState blockie-game.scope)" = active ]; th
     systemctl --user kill --signal=SIGSTOP blockie-game.scope || rc=1
 fi
 timeout 2 wlopm --off '*' || rc=1
+/usr/libexec/blockie/blockie-backlight off || rc=1
 exit $rc

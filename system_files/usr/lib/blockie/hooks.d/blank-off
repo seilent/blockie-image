@@ -3,4 +3,5 @@ rc=0
 timeout 2 wlopm --on '*' || rc=1
 systemctl --user kill --signal=SIGCONT blockie-game.scope 2> /dev/null ||
     [ "$(systemctl --user show -P ActiveState blockie-game.scope)" != active ] || rc=1
+/usr/libexec/blockie/blockie-backlight on
 exit $rc
