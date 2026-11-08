@@ -109,6 +109,19 @@ def shutting_down():
     return r.stdout.strip() == "stopping"
 
 
+def music():
+    try:
+        r = subprocess.run(["systemctl", "start", "--no-block", "blockie-android-music.service"],
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)
+    except subprocess.TimeoutExpired:
+        log("cannot start blockie-android-music.service (no answer in 10 s)")
+        return
+    if r.returncode == 0:
+        log("started blockie-android-music.service")
+    else:
+        log(f"cannot start blockie-android-music.service (exit {r.returncode}): {r.stderr.strip()}")
+
+
 def run(argv, **kw):
     return subprocess.Popen(argv, stdin=subprocess.DEVNULL, **kw)
 
@@ -210,6 +223,8 @@ def main():
                         log(f"screen_off_timeout not set (exit {put.returncode}), trying again")
                     put = None
                     last = now
+                    if settled:
+                        music()
             elif boot is not None:
                 if boot.poll() is not None:
                     out = boot.stdout.read().split()

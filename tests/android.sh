@@ -40,6 +40,11 @@ const cases = [
   [units, "blockie", "blockie-android-freeze@thaw.service", "start", "yes"],
   [units, "blockie", "blockie-android-freeze@freeze.service", "stop", "none"],
   [units, "blockie", "blockie-android-freeze@x.service", "start", "none"],
+  [units, "blockie", "blockie-android-music.service", "start", "yes"],
+  [units, "blockie", "blockie-android-music.service", "stop", "none"],
+  [units, "blockie", "blockie-android-music.service", "restart", "none"],
+  [units, "blockie", "blockie-android-music@x.service", "start", "none"],
+  [units, "other", "blockie-android-music.service", "start", "none"],
   [units, "blockie", "blockie-android-prep.service", "start", "none"],
   [units, "blockie", "lxc.service", "start", "none"],
   [units, "other", "waydroid-container.service", "start", "none"],
@@ -67,7 +72,7 @@ process.exit(bad ? 1 : 0);
 EOF
   local rc=$?
   [[ $rc == 0 ]] || sed 's/^/  /' "$t/polkit.out"
-  res $rc "polkit: blockie may start and stop waydroid-container and start the two freeze instances, nothing else"
+  res $rc "polkit: blockie may start and stop waydroid-container and start the two freeze instances and the music unit, nothing else"
 }
 
 if [[ ${1:-} == polkit ]]; then
@@ -84,10 +89,11 @@ else
 fi
 
 ok=0
-for f in blockie-android-prep blockie-android-lxcd blockie-android-freeze blockie-android-check blockie-android-run; do
+for f in blockie-android-prep blockie-android-lxcd blockie-android-freeze blockie-android-check blockie-android-run \
+  blockie-android-music; do
   [[ -f $lx/$f && $(stat -c %a "$lx/$f") == 755 ]] || { ok=1; echo "  $f"; }
 done
-bash -n "$lx/blockie-android-lxcd" && bash -n "$lx/blockie-android-check" &&
+bash -n "$lx/blockie-android-lxcd" && bash -n "$lx/blockie-android-check" && bash -n "$lx/blockie-android-music" &&
   sh -n "$lx/blockie-android-freeze" || ok=1
 for f in blockie-android-prep blockie-android-run; do
   python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$lx/$f" || ok=1
@@ -126,6 +132,12 @@ grep -qx 'Type=oneshot' "$f" && grep -qx 'ExecStart=/usr/libexec/blockie/blockie
   ! grep -q '^\[Install\]' "$f" || { ok=1; echo "  freeze@"; }
 [[ $(cat "$sd/blockie-android-freeze@freeze.service.d/50-blockie.conf") == $'[Unit]\nConflicts=blockie-android-freeze@thaw.service\nAfter=blockie-android-freeze@thaw.service' ]] ||
   { ok=1; echo "  freeze and thaw do not conflict"; }
+f=$sd/blockie-android-music.service
+for l in After=waydroid-container.service CollectMode=inactive-or-failed Type=oneshot TimeoutStartSec=infinity \
+  ExecStart=/usr/libexec/blockie/blockie-android-music; do
+  grep -qxF "$l" "$f" || { ok=1; echo "  music: $l"; }
+done
+! grep -q '^\[Install\]' "$f" || { ok=1; echo "  music has [Install]"; }
 au=$ud/blockie-android.service
 for l in 'UnsetEnvironment=LD_PRELOAD LD_LIBRARY_PATH VK_DRIVER_FILES' \
   Environment=XDG_DATA_HOME=/var/lib/blockie/data/android/user ExecStart=/usr/libexec/blockie/blockie-android-run \
@@ -137,11 +149,11 @@ done
   { ok=1; echo "  user unit ExecStartPre order"; }
 ! grep -q '^\[Install\]' "$au" || { ok=1; echo "  user unit has [Install]"; }
 systemd-analyze verify --man=no $sd/waydroid-container.service $sd/blockie-android-prep.service $sd/blockie-android-prep.path \
-  $sd/blockie-data.service > "$t/verify" 2>&1 || { ok=1; sed 's/^/  /' "$t/verify"; }
+  $sd/blockie-data.service $sd/blockie-android-music.service > "$t/verify" 2>&1 || { ok=1; sed 's/^/  /' "$t/verify"; }
 xdg=$t/xdg
 mkdir -p "$xdg"
 XDG_RUNTIME_DIR=$xdg systemd-analyze verify --user --man=no "$au" > "$t/verify" 2>&1 || { ok=1; sed 's/^/  /' "$t/verify"; }
-res $ok "units: prep after data and again on a stamp change, the container after prep with the generator and a bounded clean stop, the freeze instances conflict, the user unit starts and stops the container"
+res $ok "units: prep after data and again on a stamp change, the container after prep with the generator and a bounded clean stop, the freeze instances conflict, the music oneshot after the container with no [Install], the user unit starts and stops the container"
 
 ok=0
 [[ $(readlink /usr/share/waydroid-extra/images) == /var/lib/blockie/data/android/images ]] || { ok=1; echo "  images link"; }
@@ -480,6 +492,111 @@ zrun stop
 [[ $rc == 2 ]] || { ok=1; echo "  bad: rc $rc"; }
 res $ok "freeze helper: writes 1 or 0 to cgroup.freeze and schedules the cgroup.events log 2 s on without waiting, exits 0 with no payload"
 
+m=$t/music
+mkdir -p "$m/bin" "$m/guest/bin" "$m/run/lxc.d" "$m/payload"
+cat > "$m/bin/waydroid" << EOF
+#!/bin/sh
+[ "\$1" = shell ] && [ "\$2" = -- ] || exit 0
+shift 2
+echo "\$*" >> "$m/shell"
+! grep -qx 'frozen 1' "$m/payload/cgroup.events" || echo "\$*" >> "$m/frozen-call"
+if [ "\$1" = sh ] && [ "\$2" = -c ]; then
+  set -- sh -c "\$(printf '%s' "\$3" | sed 's|/mnt/pass_through|$m/guest/mnt/pass_through|g; s|/data/media|$m/guest/data/media|g')"
+fi
+PATH=$m/guest/bin:\$PATH "\$@" 2>&1 | sed 's/\$/\r/'
+EOF
+printf '#!/bin/sh\n[ "$1" != -q ] || shift\n[ -e "$1/.mounted" ]\n' > "$m/guest/bin/mountpoint"
+cat > "$m/guest/bin/mount" << EOF
+#!/bin/sh
+echo "mount \$*" >> "$m/calls"
+[ ! -e "$m/mountfail" ] || { echo 'mount: permission denied' >&2; exit 1; }
+[ "\$1" != --bind ] || : > "\$3/.mounted"
+EOF
+printf '#!/bin/sh\necho "content $*" >> "%s/calls"\n[ -e "%s/scanempty" ] || echo "Result: null"\n' "$m" "$m" > "$m/guest/bin/content"
+cat > "$m/bin/timeout" << EOF
+#!/bin/sh
+case "\$*" in
+  *scan_volume*) [ ! -e "$m/scan.rc" ] || exit \$(cat "$m/scan.rc") ;;
+esac
+exec $(command -v timeout) "\$@"
+EOF
+chmod 755 "$m/bin/"* "$m/guest/bin/"*
+mrun() {
+  rm -f "${m:?}/shell" "${m:?}/calls" "${m:?}/frozen-call"
+  PATH=$m/bin:$PATH BLOCKIE_ANDROID_PAYLOAD=$m/payload BLOCKIE_ANDROID_RUN=$m/run BLOCKIE_ANDROID_MUSIC_WAIT=2 \
+    timeout 20 "$lx/blockie-android-music" > "$m/out" 2>&1
+  rc=$?
+}
+media=/data/media/0/Music
+pass=/mnt/pass_through/0/emulated/0/Music
+scan='content call --uri content://media --method scan_volume --arg external_primary'
+ok=0
+echo "lxc.mount.entry = /var/lib/blockie/data/music data/media/0/Music none bind,ro,create=dir,optional 0 0" > "$m/run/lxc.d/music.conf"
+mrun
+[[ $rc == 0 && ! -e $m/shell ]] && grep -q 'no running Android payload' "$m/out" || { ok=1; echo "  no payload: rc $rc"; }
+printf 'populated 0\nfrozen 0\n' > "$m/payload/cgroup.events"
+mrun
+[[ $rc == 0 && ! -e $m/shell ]] || { ok=1; echo "  not populated: rc $rc"; }
+printf 'populated 1\nfrozen 0\n' > "$m/payload/cgroup.events"
+: > "$m/run/lxc.d/music.conf"
+mrun
+[[ $rc == 0 && ! -e $m/shell ]] && grep -q 'no music bind' "$m/out" || { ok=1; echo "  empty music.conf: rc $rc"; }
+res $ok "music helper: no populated payload or an empty music.conf exits 0 and runs nothing in the guest"
+
+ok=0
+echo "lxc.mount.entry = /var/lib/blockie/data/music data/media/0/Music none bind,ro,create=dir,optional 0 0" > "$m/run/lxc.d/music.conf"
+mkdir -p "$m/guest$media" "$m/guest$pass"
+: > "$m/guest$media/.mounted"
+mrun
+[[ $rc == 0 && $(cat "$m/calls" 2> /dev/null) == "mount --bind $m/guest$media $m/guest$pass"$'\n'"$scan" && -e $m/guest$pass/.mounted ]] &&
+  grep -q "bound $media onto $pass" "$m/out" && grep -q 'scanned external_primary' "$m/out" ||
+  { ok=1; echo "  normal: rc $rc $(tr '\n' '|' < "$m/calls") $(tr '\n' '|' < "$m/out")"; }
+grep -qF "mountpoint -q $pass" "$m/shell" && [[ $(tail -n 1 "$m/shell") == "$scan" ]] || { ok=1; echo "  shell: $(tr '\n' '|' < "$m/shell")"; }
+mrun
+[[ $rc == 0 && $(cat "$m/calls" 2> /dev/null) == "$scan" ]] && grep -q "already bound onto $pass" "$m/out" ||
+  { ok=1; echo "  again: rc $rc $(tr '\n' '|' < "$m/calls")"; }
+res $ok "music helper: binds $media onto the FUSE lower $pass behind a mountpoint guard, then scans external_primary; a second run does not mount again"
+
+ok=0
+echo 124 > "$m/scan.rc"
+mrun
+[[ $rc == 0 && ! -e $m/calls ]] && grep -q 'did not answer in 120 s, MediaProvider goes on scanning' "$m/out" ||
+  { ok=1; echo "  scan timeout: rc $rc $(tr '\n' '|' < "$m/out")"; }
+rm -f "${m:?}/scan.rc"
+: > "$m/scanempty"
+mrun
+[[ $rc == 1 && $(cat "$m/calls" 2> /dev/null) == "$scan" ]] && grep -q 'scan_volume external_primary failed (exit 0): no output' "$m/out" ||
+  { ok=1; echo "  scan empty: rc $rc $(tr '\n' '|' < "$m/out")"; }
+rm -f "${m:?}/scanempty"
+res $ok "music helper: a scan that times out (rc 124) is logged and rc 0, MediaProvider goes on; a scan with no output and rc 0 is rc 1"
+
+ok=0
+rm -rf "${m:?}/guest/mnt"
+printf 'populated 1\nfrozen 1\n' > "$m/payload/cgroup.events"
+(sleep 2; printf 'populated 1\nfrozen 0\n' > "$m/payload/cgroup.events"; sleep 0.5; mkdir -p "$m/guest$pass") &
+s0=$(date +%s%3N)
+mrun
+s1=$(date +%s%3N)
+wait
+[[ $rc == 0 && $(cat "$m/calls" 2> /dev/null) == "mount --bind $m/guest$media $m/guest$pass"$'\n'"$scan" ]] &&
+  grep -q 'Android is frozen, waiting for the thaw' "$m/out" && ((s1 - s0 >= 1800)) ||
+  { ok=1; echo "  frozen: rc $rc $((s1 - s0)) ms $(tr '\n' '|' < "$m/out")"; }
+[[ ! -e $m/frozen-call ]] || { ok=1; echo "  guest called while frozen: $(tr '\n' '|' < "$m/frozen-call")"; }
+res $ok "music helper: a frozen payload gets no guest call until it thaws, and the frozen time does not count against the wait"
+
+ok=0
+rm -f "${m:?}/guest$pass/.mounted"
+: > "$m/mountfail"
+mrun
+[[ $rc == 1 && $(cat "$m/calls" 2> /dev/null) == "mount --bind $m/guest$media $m/guest$pass" ]] &&
+  grep -q "cannot bind $media onto $pass: mount: permission denied" "$m/out" || { ok=1; echo "  mount fails: rc $rc $(cat "$m/out")"; }
+rm -f "${m:?}/mountfail"
+rm -rf "${m:?}/guest/mnt"
+mrun
+[[ $rc == 1 && ! -e $m/calls ]] && grep -q "did not appear in the guest within 2 s" "$m/out" &&
+  (($(wc -l < "$m/shell") >= 2)) || { ok=1; echo "  no pass_through: rc $rc $(cat "$m/out")"; }
+res $ok "music helper: a failed mount and a pass_through dir that never appears are rc 1 with the reason, and nothing is scanned"
+
 h=$t/hooks
 mkdir -p "$h/bin" "$h/run" "$h/rundir" "$h/sys/class/leds/lcd-backlight" "$h/payload"
 cat > "$h/bin/systemctl" << EOF
@@ -585,13 +702,18 @@ cat > "$r/bin/systemctl" << EOF
 #!/bin/sh
 case "\$*" in
   is-system-running) cat "$r/system" 2> /dev/null || echo running ;;
+  'start --no-block blockie-android-music.service')
+    echo "\$*" >> "$r/starts"
+    [ ! -f "$r/start.hang" ] || exec sleep 30
+    [ ! -f "$r/start.rc" ] || { echo 'Access denied' >&2; exit \$(cat "$r/start.rc"); }
+    ;;
   *) cat "$r/unit" 2> /dev/null || echo active ;;
 esac
 EOF
 chmod 755 "$r/bin/"*
 rsetup() {
   rm -rf "${r:?}/payload" "${r:?}/window" "${r:?}/boot" "${r:?}/calls" "${r:?}/setting" "${r:?}/putfail" "${r:?}/ui" \
-    "${r:?}/ui.rc" "${r:?}/unit" "${r:?}/system"
+    "${r:?}/ui.rc" "${r:?}/unit" "${r:?}/system" "${r:?}/starts" "${r:?}/start.rc" "${r:?}/start.hang"
 }
 rstart() {
   PATH=$r/bin:$PATH BLOCKIE_ROOT=$r BLOCKIE_ANDROID_PAYLOAD=$r/payload BLOCKIE_WAYDROID_LIB=$r/lib BLOCKIE_ANDROID_STEP=0.05 \
@@ -638,6 +760,11 @@ until_ '[[ $(cat "$r/setting" 2> /dev/null) == 2147483647 ]] && grep -q "screen_
   { ok=1; echo "  not set"; }
 [[ $(cat "$r/calls" 2> /dev/null) == $'get 1 screen_off_timeout\nput 1 screen_off_timeout 2147483647\nget 1 screen_off_timeout' ]] ||
   { ok=1; echo "  calls: $(tr '\n' '|' < "$r/calls")"; }
+until_ '[[ -e $r/starts ]]' || { ok=1; echo "  music unit not started"; }
+[[ $(cat "$r/starts" 2> /dev/null) == 'start --no-block blockie-android-music.service' ]] || { ok=1; echo "  starts: $(tr '\n' '|' < "$r/starts")"; }
+s1=$(grep -n 'screen_off_timeout is 2147483647' "$r/out" | cut -d: -f1)
+m1=$(grep -n 'started blockie-android-music.service' "$r/out" | cut -d: -f1)
+[[ -n $s1 && -n $m1 ]] && ((s1 < m1)) || { ok=1; echo "  music before screen_off_timeout: $(tr '\n' '|' < "$r/out")"; }
 kill -0 "$rp" 2> /dev/null || { ok=1; echo "  run ended early"; }
 t0=${EPOCHREALTIME//[!0-9]/}
 cg 0
@@ -645,17 +772,33 @@ rwait
 ms=$(((${EPOCHREALTIME//[!0-9]/} - t0) / 1000))
 [[ $rc == 1 && $(grep -c term "$r/ui") == 1 ]] && grep -q 'the Android payload ended$' "$r/out" && ((ms < 2000)) ||
   { ok=1; echo "  dead: rc $rc $ms ms"; }
-res $ok "run: after boot_completed screen_off_timeout is read, set and read back once; populated 0 ends the unit with rc 1 at once ($ms ms) and stops show-full-ui"
+res $ok "run: after boot_completed screen_off_timeout is read, set and read back once, then the music unit is started once without waiting; populated 0 ends the unit with rc 1 at once ($ms ms) and stops show-full-ui"
 
 ok=0
 rsetup
 : > "$r/window"
 echo 1 > "$r/boot"
 echo 2147483647 > "$r/setting"
+echo 1 > "$r/start.rc"
 cg 1
 rstart
 until_ 'grep -q "screen_off_timeout is 2147483647" "$r/out"' 200 || ok=1
 [[ $(cat "$r/calls" 2> /dev/null) == $'get 1 screen_off_timeout\nget 1 screen_off_timeout' ]] || { ok=1; echo "  calls: $(tr '\n' '|' < "$r/calls")"; }
+until_ 'grep -q "cannot start blockie-android-music.service (exit 1): Access denied" "$r/out"' || { ok=1; echo "  start failure not logged"; }
+sleep 0.3
+kill -0 "$rp" 2> /dev/null || { ok=1; echo "  a failed music start ended the unit"; }
+kill -TERM "$rp"
+rwait
+rsetup
+: > "$r/window"
+echo 1 > "$r/boot"
+echo 2147483647 > "$r/setting"
+: > "$r/start.hang"
+cg 1
+rstart
+until_ 'grep -q "cannot start blockie-android-music.service (no answer in 10 s)" "$r/out"' 300 ||
+  { ok=1; echo "  hung start not logged"; }
+kill -0 "$rp" 2> /dev/null || { ok=1; echo "  a hung music start ended the unit"; }
 kill -TERM "$rp"
 rwait
 rsetup
@@ -677,11 +820,14 @@ cg 1
 rstart
 until_ 'grep -q "after 3 tries, the next session tries again" "$r/out"' 300 || ok=1
 [[ $(grep -c '^put' "$r/calls" 2> /dev/null) == 3 && ! -e $r/setting ]] || { ok=1; echo "  give up: $(tr '\n' '|' < "$r/calls")"; }
+until_ '[[ -e $r/starts ]]' || { ok=1; echo "  music unit not started after the give up"; }
+sleep 0.3
+[[ $(wc -l < "$r/starts") == 1 ]] || { ok=1; echo "  starts: $(tr '\n' '|' < "$r/starts")"; }
 kill -0 "$rp" 2> /dev/null || { ok=1; echo "  a failed set ended the unit"; }
 kill -TERM "$rp"
 rwait
 [[ $rc == 0 ]] || { ok=1; echo "  term: rc $rc"; }
-res $ok "run: no put when the value is already set; a put that does not read back is tried again, at most 3 times per session, and never ends the unit"
+res $ok "run: no put when the value is already set; a put that does not read back is tried again, at most 3 times per session, and never ends the unit; the music unit still starts once, and a refused start or one with no answer in 10 s is logged and keeps the unit running"
 
 ok=0
 rsetup
@@ -691,7 +837,7 @@ cg 1 1
 rstart
 sleep 1
 kill -0 "$rp" 2> /dev/null || { ok=1; echo "  frozen ended the unit"; }
-! grep -q props "$r/ui" && [[ ! -e $r/calls ]] || { ok=1; echo "  polled while frozen"; }
+! grep -q props "$r/ui" && [[ ! -e $r/calls && ! -e $r/starts ]] || { ok=1; echo "  polled while frozen"; }
 cg 1 0
 until_ '[[ -e $r/calls ]]' || { ok=1; echo "  no poll after thaw"; }
 kill -TERM "$rp"

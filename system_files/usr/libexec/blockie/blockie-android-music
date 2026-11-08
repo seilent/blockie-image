@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+set -u
+
+me=blockie-android-music
+payload=${BLOCKIE_ANDROID_PAYLOAD:-/sys/fs/cgroup/lxc.payload.waydroid}
+run=${BLOCKIE_ANDROID_RUN:-/run/blockie-android}
+wait=${BLOCKIE_ANDROID_MUSIC_WAIT:-30}
+media=/data/media/0/Music
+pass=/mnt/pass_through/0/emulated/0/Music
+die() { echo "$me: $*" >&2; exit 1; }
+guest() {
+  local t=$1
+  shift
+  timeout "$t" waydroid shell -- "$@" < /dev/null 2>&1 | tr -d '\r'
+  return "${PIPESTATUS[0]}"
+}
+ready() { guest 10 sh -c "[ -d $pass ] && mountpoint -q $media && echo __ready" | grep -qx __ready; }
+frozen() { grep -qx 'frozen 1' "$payload/cgroup.events" 2> /dev/null; }
+thawed() {
+  ! frozen || echo "$me: Android is frozen, waiting for the thaw"
+  while frozen; do
+    end=$((end + 1))
+    sleep 1
+  done
+}
+
+if [[ ! -r $payload/cgroup.events ]] || ! grep -qx 'populated 1' "$payload/cgroup.events"; then
+  echo "$me: no running Android payload at $payload, nothing to bind"
+  exit 0
+fi
+if [[ ! -s $run/lxc.d/music.conf ]]; then
+  echo "$me: no music bind in $run/lxc.d/music.conf, nothing to bind"
+  exit 0
+fi
+
+echo "$me: waiting up to $wait s for $pass and the $media bind in the guest"
+end=$((SECONDS + wait))
+thawed
+until ready; do
+  ((SECONDS < end)) || die "$pass or the $media bind did not appear in the guest within $wait s"
+  sleep 1
+  thawed
+done
+echo "$me: the guest has $pass and the $media bind"
+
+thawed
+out=$(guest 10 sh -c "if mountpoint -q $pass; then echo __already; elif mount --bind $media $pass; then echo __bound; fi")
+if grep -qx __already <<< "$out"; then
+  echo "$me: $media is already bound onto $pass"
+elif grep -qx __bound <<< "$out"; then
+  echo "$me: bound $media onto $pass"
+else
+  die "cannot bind $media onto $pass: ${out:-no output}"
+fi
+
+thawed
+out=$(guest 120 content call --uri content://media --method scan_volume --arg external_primary)
+rc=$?
+if ((rc == 124)); then
+  echo "$me: scan_volume external_primary did not answer in 120 s, MediaProvider goes on scanning"
+elif grep -q '^Result:' <<< "$out"; then
+  echo "$me: scanned external_primary"
+else
+  die "scan_volume external_primary failed (exit $rc): ${out:-no output}"
+fi
