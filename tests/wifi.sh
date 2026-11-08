@@ -23,6 +23,7 @@ grep -qx 'ExecStart=/usr/bin/iw reg set JP' /usr/lib/systemd/system/blockie-regd
 grep -qxF "ExecStartPost=/bin/sh -c 'for i in 1 2 3 4 5 6 7 8 9 10; do iw reg get | awk \"/^global/ { g = 1; next } g && /^country / { print; exit }\" | grep -q \"^country JP:\" && exit 0; sleep 0.5; done; exit 1'" \
   /usr/lib/systemd/system/blockie-regdom.service ||
   fail "regdom does not check the country"
+[[ $(< /etc/sysconfig/regdomain) == COUNTRY=JP ]] || fail "/etc/sysconfig/regdomain is not COUNTRY=JP"
 for l in RefuseManualStop=yes IgnoreOnIsolate=yes RemainAfterExit=yes ConditionPathIsDirectory=/run/blockie TimeoutStartSec=600; do
   grep -qxF "$l" /usr/lib/systemd/system/blockie-wifi.service || fail "blockie-wifi.service lacks $l"
 done
