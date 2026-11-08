@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+me=blockie-data2
+sys=${BLOCKIE_SYS:-/sys}
+devdir=${BLOCKIE_DEV:-/dev}
+host=${BLOCKIE_SD_HOST:-11240000.mmc}
+target=${BLOCKIE_DATA2_DIR:-/var/lib/blockie/data2}
+run=${BLOCKIE_ANDROID_RUN:-/run/blockie-android}
+label=BLOCKIE_DATA2
+
+refuse() {
+  local kind=$1
+  shift
+  install -d -m 0755 "$run"
+  printf '%s %s\n' "$kind" "$*" > "$run/state.tmp" && mv -f "$run/state.tmp" "$run/state"
+  echo "$me: $*" >&2
+  exit 1
+}
+
+if mountpoint -q "$target"; then
+  echo "$me: $target is already mounted"
+  exit 0
+fi
+
+found=()
+shopt -s nullglob
+for p in "$sys"/class/block/mmcblk*p*; do
+  [[ -e $p/partition && -r $p/uevent ]] || continue
+  [[ $(sed -n 's/^PARTNAME=//p' "$p/uevent") == "$label" ]] || continue
+  [[ $(readlink -f "$p") == */"$host"/* ]] || continue
+  found+=("${p##*/}")
+done
+shopt -u nullglob
+(( ${#found[@]} != 0 )) || refuse missing "no $label partition on $host"
+(( ${#found[@]} == 1 )) || refuse failed "expected one $label partition on $host, found ${#found[@]} (${found[*]})"
+
+dev=$devdir/${found[0]}
+type=$(blkid -p -o value -s TYPE "$dev") || refuse failed "blkid cannot probe $dev"
+[[ $type == ext4 ]] || refuse failed "$dev is $type, not ext4"
+[[ $(blkid -p -o value -s LABEL "$dev") == "$label" ]] || refuse failed "$dev is not labelled $label"
+rc=0
+e2fsck -p "$dev" || rc=$?
+(( rc < 4 )) || refuse failed "e2fsck -p $dev exited $rc, not mounted"
+(( !(rc & 2) )) || echo "$me: e2fsck -p $dev fixed errors and asks for a reboot, mounting anyway"
+install -d -m 0755 "$target"
+mount -t ext4 -o rw,noatime,nodev,nosuid "$dev" "$target" || refuse failed "mount of $dev at $target failed"
+echo "$me: $dev mounted at $target"

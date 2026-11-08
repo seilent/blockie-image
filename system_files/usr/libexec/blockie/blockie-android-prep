@@ -1,0 +1,217 @@
+#!/usr/bin/python3
+import configparser
+import hashlib
+import io
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+ME = "blockie-android-prep"
+DATA2 = os.environ.get("BLOCKIE_DATA2_DIR", "/var/lib/blockie/data2")
+RUN = os.environ.get("BLOCKIE_ANDROID_RUN", "/run/blockie-android")
+WORK = os.environ.get("BLOCKIE_WAYDROID_WORK", "/var/lib/waydroid")
+PIN = os.environ.get("BLOCKIE_ANDROID_PIN", "/usr/share/blockie/android.d/lineage-20-gapps.conf")
+KL = os.environ.get("BLOCKIE_ANDROID_KL", "/usr/share/blockie/android/Vendor_4001_Product_0428.kl")
+BASE = os.environ.get("BLOCKIE_WAYDROID_BASE", "/usr/lib/waydroid/data/configs/config_base")
+PAYLOAD = os.environ.get("BLOCKIE_ANDROID_PAYLOAD", "/sys/fs/cgroup/lxc.payload.waydroid")
+EXTRA = "/usr/share/waydroid-extra/images"
+ANDROID = os.path.join(DATA2, "android")
+IMAGES = os.path.join(ANDROID, "images")
+PREPARED = os.path.join(ANDROID, "prepared")
+CFG = os.path.join(WORK, "waydroid.cfg")
+PROPERTIES = {
+    "persist.waydroid.width": "960",
+    "persist.waydroid.height": "720",
+    "persist.waydroid.uevent": "false",
+    "persist.waydroid.suspend": "false",
+}
+PINNED = {"suspend_action": "freeze", "mount_overlays": "True"}
+
+
+class Refused(Exception):
+    def __init__(self, kind, reason):
+        super().__init__(reason)
+        self.kind = kind
+        self.reason = reason
+
+
+def log(msg):
+    print(f"{ME}: {msg}", flush=True)
+
+
+def put(path, text, mode=0o644):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def state(line):
+    os.makedirs(RUN, 0o755, exist_ok=True)
+    put(os.path.join(RUN, "state"), line + "\n")
+
+
+def read(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
+
+
+def running():
+    text = read(os.path.join(PAYLOAD, "cgroup.events")) or ""
+    return "populated 1" in text.splitlines()
+
+
+def sha256(data):
+    return hashlib.sha256(data.encode()).hexdigest()
+
+
+def pin():
+    rows = []
+    with open(PIN) as f:
+        for line in f:
+            fields = line.split()
+            if not fields:
+                continue
+            if len(fields) not in (4, 5) or "-" in fields:
+                raise Refused("failed", "pin incomplete")
+            name, _url, sha, size = fields[:4]
+            if not (re.fullmatch(r"[a-z]+\.img", name) and re.fullmatch(r"[0-9a-f]{64}", sha) and size.isdigit()
+                    and all(re.fullmatch(r"[0-9a-f]{64}", z) for z in fields[4:])):
+                raise Refused("failed", f"pin line for {name} is malformed")
+            rows.append((name, sha, int(size)))
+    if sorted(r[0] for r in rows) != ["system.img", "vendor.img"]:
+        raise Refused("failed", "pin incomplete")
+    return rows
+
+
+def images(rows):
+    for name, _sha, size in rows:
+        try:
+            have = os.stat(os.path.join(IMAGES, name)).st_size
+        except FileNotFoundError:
+            raise Refused("missing", f"no images/{name}")
+        if have != size:
+            raise Refused("failed", f"images/{name} is {have} bytes, the pin says {size}")
+    want = "".join(sorted(f"{name} {size} {sha}\n" for name, sha, size in rows))
+    have = read(os.path.join(IMAGES, "stamp"))
+    if have is None:
+        raise Refused("failed", "no image stamp")
+    if have != want:
+        raise Refused("failed", "the image stamp does not match the pin")
+    return want
+
+
+def config():
+    cfg = configparser.ConfigParser()
+    old = read(CFG)
+    if old is not None:
+        cfg.read_string(old)
+    for section in ("waydroid", "properties"):
+        if section not in cfg:
+            cfg[section] = {}
+    cfg["waydroid"].update(PINNED)
+    cfg["properties"].update(PROPERTIES)
+    out = io.StringIO()
+    cfg.write(out)
+    if out.getvalue() != old:
+        os.makedirs(WORK, 0o755, exist_ok=True)
+        put(CFG, out.getvalue())
+        log(f"wrote {CFG}")
+
+
+def version():
+    r = subprocess.run(["rpm", "-q", "--qf", "%{VERSION}-%{RELEASE}", "waydroid"], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise Refused("failed", "waydroid is not installed")
+    return r.stdout.strip()
+
+
+def waydroid(*argv):
+    log("running waydroid " + " ".join(argv))
+    try:
+        r = subprocess.run(["waydroid", "--details-to-stdout", *argv], stdin=subprocess.DEVNULL, timeout=90)
+    except subprocess.TimeoutExpired:
+        raise Refused("failed", f"waydroid {argv[0]} ran past 90 s")
+    if r.returncode != 0:
+        raise Refused("failed", f"waydroid {argv[0]} exited {r.returncode}")
+
+
+def keylayout():
+    d = os.path.join(WORK, "overlay", "system", "usr", "keylayout")
+    os.makedirs(d, 0o755, exist_ok=True)
+    os.makedirs(os.path.join(WORK, "overlay", "vendor"), 0o755, exist_ok=True)
+    dest = os.path.join(d, os.path.basename(KL))
+    text = read(KL)
+    if text is None:
+        raise Refused("failed", f"no {KL}")
+    if read(dest) != text:
+        put(dest, text)
+        log(f"wrote {dest}")
+
+
+def prep():
+    if subprocess.run(["mountpoint", "-q", DATA2]).returncode != 0:
+        raise Refused("missing", f"{DATA2} is not mounted")
+    rows = pin()
+    stamp = images(rows)
+    base = read(BASE)
+    if base is None:
+        raise Refused("failed", f"no {BASE}")
+    props = "".join(f"{k}={v}\n" for k, v in sorted(PROPERTIES.items()))
+    want = (f"waydroid {version()}\nconfig_base {sha256(base)}\nproperties {sha256(props)}\n"
+            f"images {sha256(stamp)}\n")
+    config()
+    initialized = os.path.isdir(os.path.join(WORK, "rootfs"))
+    action = None
+    if not initialized:
+        action = "init"
+    elif read(PREPARED) != want:
+        action = "upgrade"
+    if action and running():
+        raise Refused("failed", "change pending, stop Android")
+    if action == "init":
+        waydroid("init")
+    elif action == "upgrade":
+        waydroid("upgrade", "--offline")
+    if action:
+        cfg = configparser.ConfigParser()
+        cfg.read_string(read(CFG) or "")
+        if cfg.get("waydroid", "images_path", fallback=None) != EXTRA:
+            raise Refused("failed", f"waydroid {action} did not take the images in {EXTRA}")
+        config()
+        put(PREPARED, want)
+        log(f"waydroid {action} done")
+    keylayout()
+    state("ok")
+    log("ok")
+    old = os.path.join(ANDROID, "images.old")
+    if os.path.isdir(old) and not running():
+        try:
+            shutil.rmtree(old)
+            log(f"removed {old}")
+        except OSError as e:
+            log(f"cannot remove {old}: {e}")
+    return 0
+
+
+def main():
+    try:
+        return prep()
+    except Refused as e:
+        state(f"{e.kind} {e.reason}")
+        log(e.reason)
+        return 1
+    except OSError as e:
+        state(f"failed {e.strerror or e}")
+        log(str(e))
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

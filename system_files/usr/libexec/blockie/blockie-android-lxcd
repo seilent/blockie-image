@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+me=blockie-android-lxcd
+proc=${BLOCKIE_PROC:-/proc}
+pad=${BLOCKIE_ANDROID_PAD:-/dev/input/by-blockie/pad}
+run=${BLOCKIE_ANDROID_RUN:-/run/blockie-android}
+out=$run/lxc.d
+payload=${BLOCKIE_ANDROID_PAYLOAD:-/sys/fs/cgroup/lxc.payload.waydroid}
+data2=${BLOCKIE_DATA2_DIR:-/var/lib/blockie/data2}
+die() { echo "$me: $*" >&2; exit 1; }
+
+mountpoint -q "$data2" || die "$data2 is not mounted"
+state=
+[[ ! -r $run/state ]] || read -r state < "$run/state"
+[[ $state == ok ]] || die "Android prep state is '${state:-none}', not ok"
+
+if [[ -d $payload ]]; then
+  if [[ -r $payload/cgroup.events ]] && grep -qx 'populated 1' "$payload/cgroup.events"; then
+    die "$payload still holds processes, lxc would start beside it"
+  fi
+  find "$payload" -depth -type d -exec rmdir {} + || die "cannot remove the stale $payload"
+  echo "$me: removed the stale $payload"
+fi
+
+major() {
+  awk -v n="$1" '/^Character devices:/ { c = 1; next } /^Block devices:/ { c = 0 } c && $2 == n { print $1; exit }' "$proc/devices"
+}
+minor() { awk -v n="$1" '$2 == n { print $1; exit }' "$proc/misc"; }
+
+put() {
+  printf '%s' "$2" > "$out/$1.tmp"
+  mv -f "$out/$1.tmp" "$out/$1"
+}
+
+install -d -m 0755 "$out"
+rules=(1:3 1:5 1:7 1:8 1:9 1:11 5:0 5:1 5:2 '136:*')
+for n in binder dma_heap; do
+  m=$(major "$n")
+  if [[ -n $m ]]; then
+    rules+=("$m:*")
+  else
+    echo "$me: no $n major in $proc/devices"
+  fi
+done
+for n in ashmem fuse uhid tun; do
+  m=$(minor "$n")
+  if [[ -n $m ]]; then
+    rules+=("10:$m")
+  else
+    echo "$me: no $n minor in $proc/misc"
+  fi
+done
+mount=
+if [[ -e $pad ]]; then
+  read -r maj min < <(stat -L -c '%t %T' "$pad")
+  rules+=("$((16#$maj)):$((16#$min))")
+  mount="lxc.mount.entry = $pad dev/input/event-pad none bind,create=file 0 0"$'\n'
+else
+  echo "$me: no pad at $pad, Android starts without it"
+fi
+
+devices=
+if [[ ${BLOCKIE_ANDROID_NODEVICES:-} == 1 ]]; then
+  echo "$me: BLOCKIE_ANDROID_NODEVICES=1, no device rules"
+else
+  devices="lxc.cgroup2.devices.deny = a"$'\n'
+  for r in "${rules[@]}"; do
+    devices+="lxc.cgroup2.devices.allow = c $r rwm"$'\n'
+  done
+fi
+put devices.conf "$devices"
+put pad.conf "$mount"
+put memory.conf $'lxc.cgroup2.memory.high = 1600M\nlxc.cgroup2.memory.max = 1900M\n'
+echo "$me: wrote $out"

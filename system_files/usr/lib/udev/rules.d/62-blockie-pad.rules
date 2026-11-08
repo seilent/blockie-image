@@ -1,0 +1,1 @@
+ACTION!="remove", SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="AYANEO Controller", ATTRS{phys}=="ayaneo-gamepad/input0", ATTRS{id/bustype}=="0019", ATTRS{id/vendor}=="4001", ATTRS{id/product}=="0428", SYMLINK+="input/by-blockie/pad"

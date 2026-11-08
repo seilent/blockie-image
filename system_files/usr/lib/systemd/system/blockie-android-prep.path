@@ -1,0 +1,14 @@
+[Unit]
+Description=Run the Android prep again when the image stamp changes
+DefaultDependencies=no
+Requires=blockie-data2.service
+After=blockie-data2.service
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Path]
+PathChanged=/var/lib/blockie/data2/android/images/stamp
+Unit=blockie-android-prep.service
+
+[Install]
+WantedBy=multi-user.target

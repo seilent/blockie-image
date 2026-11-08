@@ -1,0 +1,25 @@
+#!/bin/sh
+set -u
+me=blockie-android-freeze
+p=${BLOCKIE_ANDROID_PAYLOAD:-/sys/fs/cgroup/lxc.payload.waydroid}
+case ${1:-} in
+freeze) v=1 ;;
+thaw) v=0 ;;
+*)
+    echo "usage: $me freeze|thaw" >&2
+    exit 2
+    ;;
+esac
+if [ ! -e "$p/cgroup.freeze" ]; then
+    echo "$me: no $p, nothing to $1"
+    exit 0
+fi
+if ! echo "$v" > "$p/cgroup.freeze"; then
+    [ -e "$p/cgroup.freeze" ] || { echo "$me: $p went away, nothing to $1"; exit 0; }
+    echo "$me: cannot write $v to $p/cgroup.freeze" >&2
+    exit 1
+fi
+echo "$me: wrote $v to $p/cgroup.freeze"
+systemd-run --quiet --no-block --collect --on-active=2 /usr/bin/cat "$p/cgroup.events" ||
+    echo "$me: cannot schedule the cgroup.events log" >&2
+exit 0
