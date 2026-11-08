@@ -2,14 +2,23 @@
 set -u
 me=blockie-poweroff
 scope=blockie-game.scope
-timeout 2 wlopm --on '*' || echo "$me: wlopm --on failed" >&2
-/usr/libexec/blockie/blockie-backlight on cached
-bl=$?
+cur=
+led=${BLOCKIE_SYSFS:-/sys}/class/leds/lcd-backlight
+[ ! -r "$led/brightness" ] || read -r cur < "$led/brightness"
+bl=0
+case $cur in
+'' | *[!0-9]* | 0)
+    timeout 2 wlopm --on '*' || echo "$me: wlopm --on failed" >&2
+    /usr/libexec/blockie/blockie-backlight on cached
+    bl=$?
+    ;;
+esac
 systemctl --user kill --signal=SIGCONT "$scope" 2> /dev/null ||
     [ "$(systemctl --user show -P ActiveState "$scope")" != active ] || echo "$me: SIGCONT to $scope failed" >&2
 [ "$bl" != 2 ] || /usr/libexec/blockie/blockie-backlight on lookup
 if systemctl --user is-active --quiet "$scope"; then
     /usr/libexec/blockie/blockie-game-cmd QUIT
+    echo "$me: QUIT sent" >&2
     n=0
     while systemctl --user is-active --quiet "$scope"; do
         if [ $n -ge 25 ]; then
@@ -19,5 +28,8 @@ if systemctl --user is-active --quiet "$scope"; then
         sleep 0.2
         n=$((n + 1))
     done
+    [ $n -ge 25 ] || echo "$me: $scope inactive" >&2
 fi
+sync
+echo "$me: sync done" >&2
 exec busctl call org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager PowerOff b false

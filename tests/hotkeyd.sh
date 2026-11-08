@@ -2,6 +2,7 @@
 set -u
 
 here=$(cd "$(dirname "$0")" && pwd)
+[[ -e /run/.containerenv ]] || { echo "hotkeyd: runs only in a container, so a sleep case can never reach the host's /sys/power" >&2; exit 2; }
 bin=${HOTKEYD_BIN:-/usr/libexec/blockie/blockie-hotkeyd}
 [[ -x $bin ]] || bin=$here/../system_files/usr/libexec/blockie/blockie-hotkeyd
 tables=/usr/lib/blockie/hotkeys.d
@@ -9,6 +10,7 @@ tables=/usr/lib/blockie/hotkeys.d
 t=$(mktemp -d "${TMPDIR:-/tmp}/hotkeyd.XXXXXX")
 fails=0
 trap 'rm -rf "${t:?}"' EXIT
+export t
 
 res() {
   if [[ $1 == 0 ]]; then
@@ -42,9 +44,10 @@ run() {
   mkfifo "$t/fifo"
   BLOCKIE_HOTKEYD_INPUT=$t/fifo BLOCKIE_HOTKEYD_DRY=1 BLOCKIE_HOTKEYD_LONG_MS=300 \
     BLOCKIE_HOTKEYD_TABLES="${TABLES:-$t/usr:$t/etc}" BLOCKIE_HOTKEYD_CURRENT=$t/current \
-    timeout 20 python3 "$bin" > "$t/out" 2> "$t/err" &
+    BLOCKIE_HOTKEYD_SLEEP=$t/fbin/fake-sleep BLOCKIE_HOTKEYD_SYSFS=$t/psys \
+    timeout -k 5 20 python3 "$bin" > "$t/out" 2> "$t/err" &
   local pid=$!
-  bash -c "$script" > "$t/fifo"
+  timeout -k 5 60 bash -c "exec > '$t/fifo'; $script"
   wait "$pid"
 }
 
@@ -135,12 +138,14 @@ for h in blank-on blank-off screen-on; do
   cat > "$hk/$h" << EOF
 #!/bin/sh
 echo "start $h" >> "$t/hooks.log"
+echo "start $h \$(date +%s%3N)" >> "$t/times"
 s=0.5
 [ ! -f "$hk/$h.sleep" ] || read -r s < "$hk/$h.sleep"
 sleep "\$s"
 rc=0
 [ ! -f "$hk/$h.rc" ] || read -r rc < "$hk/$h.rc"
 echo "exit $h" >> "$t/hooks.log"
+echo "exit $h \$(date +%s%3N)" >> "$t/times"
 exit "\$rc"
 EOF
   chmod 755 "$hk/$h"
@@ -155,14 +160,18 @@ EOF
 chmod 755 "$t/fbin/systemctl"
 
 live() {
-  local script=$1
-  rm -f "$t/fifo" "$t/hooks.log"
+  local script=$1 e=() x
+  for x in ${FAST:-}; do
+    e+=("BLOCKIE_HOTKEYD_$x")
+  done
+  rm -f "$t/fifo" "$t/hooks.log" "$t/times" "$t/qn" "$t/slept"
   mkfifo "$t/fifo"
   PATH=$t/fbin:$PATH BLOCKIE_HOTKEYD_INPUT=$t/fifo BLOCKIE_HOTKEYD_HOOKS=$hk BLOCKIE_HOTKEYD_LONG_MS=300 \
     BLOCKIE_HOTKEYD_HOOK_MS=${HOOK_MS:-5000} BLOCKIE_HOTKEYD_BACKSTOP_MS=${BACKSTOP_MS:-20000} BLOCKIE_HOTKEYD_TABLES=$t/usr:$t/etc BLOCKIE_HOTKEYD_CURRENT=$t/current \
-    timeout 30 python3 "$bin" > "$t/out" 2> "$t/err" &
+    BLOCKIE_HOTKEYD_SLEEP=$t/fbin/fake-sleep BLOCKIE_HOTKEYD_SLEPT=$t/slept BLOCKIE_HOTKEYD_SYSFS=$t/psys \
+    BLOCKIE_HOTKEYD_KNOB=$t/knob env "${e[@]}" timeout -k 5 30 python3 "$bin" > "$t/out" 2> "$t/err" &
   local pid=$!
-  bash -c "$script" > "$t/fifo"
+  timeout -k 5 60 bash -c "exec > '$t/fifo'; $script"
   wait "$pid"
   touch "$t/hooks.log"
 }
@@ -217,6 +226,310 @@ logis "$woke"$'\nstart blank-on\nexit blank-on\nstart blank-on\nexit blank-on' &
 res $? "hooks run: a blank-on that always fails runs twice for one press, no loop"
 rm -f "$hk/blank-on.rc"
 
+on=class/power_supply/mtk-master-charger/online
+mkdir -p "$t/psys/${on%/*}" "$t/psys/class/power_supply/battery"
+: > "$t/queue"
+cat > "$t/fbin/fake-sleep" << EOF
+#!/bin/sh
+n=\$((\$(cat "$t/qn" 2> /dev/null || echo 0) + 1))
+echo "\$n" > "$t/qn"
+line=\$(sed -n "\${n}p" "$t/queue")
+[ -n "\$line" ] || line='0 0 refused test'
+echo "helper\${1:+ \$1}" >> "$t/hooks.log"
+echo "helper \$(date +%s%3N)" >> "$t/times"
+set -- \$line
+[ "\$1" != hang ] || exec sleep 30
+trap 'echo "helper term" >> "$t/hooks.log"; echo refused cancelled; exit 0' TERM
+[ "\$1" = 0 ] || echo \$((\$(cat "$t/slept" 2> /dev/null || echo 0) + \$1)) > "$t/slept"
+d=\$2
+shift 2
+[ "\$2" != plug ] || echo 1 > "$t/psys/$on"
+sleep "\$d" > /dev/null &
+wait \$!
+echo "\$*"
+EOF
+chmod 755 "$t/fbin/fake-sleep"
+until_n() {
+  local i=0 n
+  while :; do
+    n=$(grep -c -- "$1" "$2" 2> /dev/null)
+    ((${n:-0} >= ${3:-1})) && return 0
+    ((++i < 600)) || return 1
+    sleep 0.05
+  done
+}
+export -f until_n
+bat() {
+  echo "$1" > "$t/psys/$on"
+  echo "$2" > "$t/psys/class/power_supply/battery/capacity"
+  echo 3900000 > "$t/psys/class/power_supply/battery/voltage_now"
+}
+lines() {
+  local i
+  for ((i = 0; i < $1; i++)); do
+    printf '%s\n' "$2"
+  done
+}
+ev() { grep -v '^exit ' "$t/hooks.log" | paste -sd ' '; }
+calls() { grep -c '^helper\( first\)\?$' "$t/hooks.log"; }
+tms() { grep "^$1 [0-9]*$" "$t/times" | awk '{print $NF}'; }
+gaps() { tms helper | awk 'NR > 1 {printf "%d ", $1 - p} {p = $1}'; }
+gap() { [[ -n $1 && -n $2 ]] && echo $(($1 - $2)) || echo -1; }
+fast='SETTLE_MS=300 RESLEEP_MS=300 WAKE_MS=1500 LOST_MS=1000 RETRY_MS=300 RETRY_SLOW_MS=2000 SLEEP_KILL_MS=1000 VBUS_MS=300'
+for h in blank-on blank-off screen-on; do
+  echo 0.1 > "$hk/$h.sleep"
+done
+printf 'nobody-here 1 1\n' > "$t/current"
+up="sleep 0.4; $tap"
+offs='^systemctl --user start --no-block blockie-poweroff.service$'
+
+bat 0 50
+: > "$t/queue"
+FAST=$fast live "$up; until_n 'refused test' $t/err"
+g=$(gap "$(tms helper | head -n 1)" "$(tms 'exit blank-on' | head -n 1)")
+[[ $(ev) == "start blank-off start blank-on helper first" ]] && ((g >= 280)) &&
+  grep -q 'sleep first: capacity 50 voltage_now 3900000 online 0$' "$t/err" &&
+  grep -q 'refused test: capacity 50 voltage_now 3900000 online 0, suspend_stats success' "$t/err"
+res $? "sleep: a tap runs blank-on and one helper call with first $g ms after it, entry and result logged with capacity, voltage and online"
+
+echo '5 0 slept power 5' > "$t/queue"
+FAST=$fast live "$up; until_n '^start blank-off$' $t/hooks.log 2; sleep 0.3"
+g=$(gap "$(tms 'start blank-off' | sed -n 2p)" "$(tms helper | head -n 1)")
+[[ $(ev) == "start blank-off start blank-on helper first start blank-off" ]] && ((g >= 950)) &&
+  grep -q 'no key event in 1000 ms: wake' "$t/err"
+res $? "sleep: slept power with no key event wakes after the lost event wait ($g ms after the helper start)"
+
+echo '5 0 slept power 5' > "$t/queue"
+FAST=$fast live "$up; until_n 'slept power' $t/err; $tap; sleep 2; $tap; until_n '^start blank-on$' $t/hooks.log 2; sleep 0.2"
+[[ $(ev) == "start blank-off start blank-on helper first start blank-off start blank-on"* ]]
+res $? "sleep: a power tap inside the wake window wakes once, a tap after it blanks again"
+
+echo '5 0 slept power 5' > "$t/queue"
+FAST=$fast live "$up; until_n 'slept power' $t/err; $tap; $tap; until_n '^start blank-off$' $t/hooks.log 2; sleep 1"
+[[ $(ev) == "start blank-off start blank-on helper first start blank-off" ]]
+res $? "sleep: two taps queued after a power wake give one blank-off and no blank-on"
+
+lines 6 '1 0 slept rtc 1' > "$t/queue"
+FAST=$fast live "$up; until_n '^helper' $t/hooks.log 6; sleep 0.2"
+read -ra gs <<< "$(gaps)"
+((${#gs[@]} == 5 && gs[0] < 1000 && gs[1] < 1000 && gs[2] < 1000 && gs[3] < 1000 && gs[4] >= 1150)) &&
+  grep -q 'resleep in 1200 ms' "$t/err"
+res $? "sleep: an rtc wake sleeps again after the resleep wait, which grows x4 after 5 wakes in 60 s (gaps ${gs[*]})"
+
+lines 6 '720 0 slept rtc 720' > "$t/queue"
+FAST=$fast live "$up; until_n '^helper' $t/hooks.log 6; sleep 0.2"
+read -ra gs <<< "$(gaps)"
+((${#gs[@]} == 5 && gs[0] < 1000 && gs[1] < 1000 && gs[2] < 1000 && gs[3] < 1000 && gs[4] < 1000)) &&
+  ! grep -q 'resleep in 1200' "$t/err"
+res $? "sleep: 6 rtc wakes 12 min apart in boot time keep the resleep wait (gaps ${gs[*]})"
+
+lines 7 '0 0 busy step=suspend errno=-16 grew=fail' > "$t/queue"
+FAST=$fast live "$up; until_n '^helper' $t/hooks.log 7; sleep 0.1"
+read -ra gs <<< "$(gaps)"
+((${#gs[@]} == 6 && gs[0] < 1000 && gs[4] < 1000 && gs[5] >= 1900)) && grep -q 'retry 6 in 2000 ms' "$t/err"
+res $? "sleep: busy retries 5 times at the short wait, then at the slow one (gaps ${gs[*]})"
+
+echo '0 0 refused deadman' > "$t/queue"
+FAST=$fast live "$up; until_n 'refused deadman' $t/err; sleep 1"
+[[ $(calls) == 1 ]]
+res $? "sleep: refused is not retried until the next tap"
+
+: > "$t/queue"
+FAST="$fast SETTLE_MS=1500" live "$up; until_n '^exit blank-on$' $t/hooks.log; echo power down; sleep 2.2; echo power up; sleep 0.5"
+[[ $(ev) == "start blank-off start blank-on" ]]
+res $? "sleep: a power down during the settle wait holds it off, no helper call while the key is down"
+
+echo '5 0 slept power 5' > "$t/queue"
+FAST=$fast live "$up; until_n 'slept power' $t/err; echo power down; until_n '$offs' $t/hooks.log; echo power up; sleep 0.5"
+[[ $(ev) == "start blank-off start blank-on helper first start screen-on systemctl --user start --no-block blockie-poweroff.service" ]]
+res $? "sleep: a hold from asleep starts blockie-poweroff.service at 3000 ms after screen-on, no blank-off, no helper call while lit-frozen"
+
+: > "$t/queue"
+FAST=$fast live "sleep 0.4; echo power down; sleep 2; date +%s%3N > $t/rel; echo power up; until_n '^helper' $t/hooks.log; sleep 0.2"
+g=$(gap "$(tms helper | head -n 1)" "$(cat "$t/rel" 2> /dev/null)")
+[[ $(ev) == "start blank-off start blank-on helper first" ]] && ((g >= 280))
+res $? "sleep: a hold released at 2 s stays blanked and sleeps one settle wait after the release ($g ms)"
+
+bat 1 50
+FAST=$fast live "$up; sleep 1.5; date +%s%3N > $t/rel; echo 0 > $t/psys/$on; until_n '^helper' $t/hooks.log; sleep 0.2"
+g=$(gap "$(tms helper | head -n 1)" "$(cat "$t/rel" 2> /dev/null)")
+[[ $(calls) == 1 ]] && ((g >= 0)) && grep -q 'on usb power: blanked awake' "$t/err"
+res $? "sleep: on usb power the tap only blanks, the sleep starts once online reads 0"
+
+bat 1 50
+: > "$t/knob"
+FAST=$fast live "$up; until_n '^helper' $t/hooks.log; sleep 0.2"
+[[ $(calls) == 1 ]]
+res $? "sleep: the knob lets it sleep on usb power"
+
+bat 0 50
+rm -f "$t/knob"
+echo '5 0 slept plug 5' > "$t/queue"
+FAST=$fast live "$up; until_n 'slept plug' $t/err; sleep 1.5"
+r1=$(calls)
+grep -q 'on usb power: blanked awake' "$t/err" || r1=x
+bat 0 50
+: > "$t/knob"
+FAST=$fast live "$up; until_n 'slept plug' $t/err; until_n '^helper' $t/hooks.log 2; sleep 0.2"
+r2=$(calls)
+rm -f "$t/knob"
+[[ $r1 == 1 && $r2 -ge 2 ]]
+res $? "sleep: a plug wake stays blanked awake on usb power, with the knob it sleeps again (calls $r1, $r2)"
+
+bat 0 50
+printf '%s\n' '5 0 slept power 5' '5 0 slept rtc 5' > "$t/queue"
+FAST=$fast live "$up; until_n 'slept power' $t/err; echo volup down; echo volup up; until_n '^helper' $t/hooks.log 2; sleep 0.2"
+[[ $(ev) == "start blank-off start blank-on helper first helper"* && $(ev) != *"helper first"*"blank-off"* ]] &&
+  grep -q 'only a volume up event: back to sleep' "$t/err"
+res $? "sleep: a power wake with only a volume up event sleeps again"
+
+echo '0 3 slept rtc 1' > "$t/queue"
+FAST=$fast live "$up; until_n '^helper' $t/hooks.log; sleep 0.2; $tap; until_n '^helper term$' $t/hooks.log; until_n '^start blank-off$' $t/hooks.log 2; sleep 0.2"
+[[ $(ev) == "start blank-off start blank-on helper first"*"start blank-off"* ]] && grep -qx 'helper term' "$t/hooks.log" &&
+  grep -q 'SIGTERM to blockie-sleep' "$t/err"
+res $? "sleep: a tap while the helper runs sends it SIGTERM and wakes"
+
+echo hang > "$t/queue"
+FAST=$fast live "$up; until_n '^helper' $t/hooks.log 2; sleep 0.2"
+[[ $(calls) == 2 ]] && grep -q 'still running after 1000 ms: killed' "$t/err" && grep -q 'retry 1 in 300 ms' "$t/err"
+res $? "sleep: a helper that never exits is killed at the limit and retried"
+
+ok=0
+poff="start screen-on systemctl --user start --no-block blockie-poweroff.service"
+bat 0 3
+echo '5 0 slept rtc 5' > "$t/queue"
+FAST=$fast live "$up; until_n '$offs' $t/hooks.log; sleep 0.3"
+[[ $(ev) == "start blank-off start blank-on helper first $poff" ]] && grep -q 'capacity 3 on battery: powering off' "$t/err" ||
+  { ok=1; echo "  rtc at 3 %: $(ev)"; }
+bat 0 4
+FAST=$fast live "$up; until_n '^helper' $t/hooks.log 2; sleep 0.3"
+[[ $(calls) -ge 2 && $(ev) != *screen-on* ]] || { ok=1; echo "  rtc at 4 %: $(ev)"; }
+bat 0 3
+echo '5 0 slept power 5' > "$t/queue"
+FAST=$fast live "$up; until_n '^start blank-off$' $t/hooks.log 2; sleep 0.3"
+[[ $(ev) == "start blank-off start blank-on helper first start blank-off" ]] || { ok=1; echo "  power at 3 %: $(ev)"; }
+bat 1 3
+: > "$t/knob"
+echo '5 0 slept rtc 5' > "$t/queue"
+FAST=$fast live "$up; until_n '^helper' $t/hooks.log 2; sleep 0.3"
+rm -f "$t/knob"
+[[ $(calls) -ge 2 && $(ev) != *screen-on* ]] || { ok=1; echo "  usb at 3 %: $(ev)"; }
+bat 0 3
+lines 6 '0 0 busy step=suspend errno=-16 grew=fail' > "$t/queue"
+FAST=$fast live "$up; until_n '^helper' $t/hooks.log 6; until_n '$offs' $t/hooks.log; sleep 0.3"
+[[ $(calls) == 6 && $(ev) == *" $poff" ]] || { ok=1; echo "  busy at 3 %: $(ev)"; }
+res $ok "sleep: at 3 % on battery an rtc wake or a slow retry tick powers off through screen-on; 4 %, a power wake or usb power do not"
+
+bat 0 50
+echo '0 0 slept rtc 1' > "$t/queue"
+FAST="$fast RESLEEP_MS=3000" live "$up; until_n 'slept rtc' $t/err; $tap; $tap; until_n '^start blank-off$' $t/hooks.log 2; sleep 0.5"
+[[ $(ev) == "start blank-off start blank-on helper first start blank-off"* && $(grep -c '^start blank-on$' "$t/hooks.log") == 1 ]]
+res $? "sleep: a slept line with no clock jump still counts as a resume, so taps after it only wake"
+
+lines 31 '15 0 slept rtc 15' > "$t/queue"
+FAST="$fast RESLEEP_MS=20" live "$up; until_n '^helper' $t/hooks.log 30; sleep 0.6"
+[[ $(calls) == 30 ]] && grep -q '30 wakes in 10 min: blanked awake' "$t/err"
+res $? "sleep: 30 wakes in 10 min of boot time hold it blanked awake"
+
+: > "$t/queue"
+FAST=$fast live "until_n '^exit blank-off$' $t/hooks.log; echo 30 > $t/slept; $tap; until_n '^start blank-off$' $t/hooks.log 2; sleep 0.5"
+[[ $(ev) == "start blank-off start blank-off" ]] && grep -q 'resume: ' "$t/err"
+res $? "sleep: a sleep seen while awake runs blank-off again and the tap after it does not blank"
+
+for h in blank-on blank-off screen-on; do
+  rm -f "$hk/$h.sleep"
+done
+
+BLOCKIE_HOTKEYD_DRY=1 BLOCKIE_HOTKEYD_LONG_MS=300 BLOCKIE_HOTKEYD_CURRENT=$t/none BLOCKIE_HOTKEYD_SYSFS=$t/psys \
+  BLOCKIE_HOTKEYD_INPUT=/dev/null BLOCKIE_HOTKEYD_SLEEP=$t/fbin/fake-sleep timeout -k 5 60 python3 - "$bin" > "$t/drain.out" 2>&1 << 'EOF'
+import contextlib
+import importlib.machinery
+import importlib.util
+import io
+import sys
+import time
+
+loader = importlib.machinery.SourceFileLoader("hotkeyd", sys.argv[1])
+spec = importlib.util.spec_from_loader("hotkeyd", loader)
+m = importlib.util.module_from_spec(spec)
+loader.exec_module(m)
+GLib = m.GLib
+
+
+class Ev:
+    def __init__(self, code, value):
+        self.type, self.code, self.value = 1, code, value
+
+
+class Dev:
+    def __init__(self, batches, held):
+        self.q = [[Ev(*e) for e in b] for b in batches]
+        self.held = set(held)
+        self.calls = []
+
+    def read(self):
+        if not self.q:
+            raise BlockingIOError
+        return iter(self.q.pop(0))
+
+    def active_keys(self):
+        self.calls.append((len(self.q), sorted(self.held)))
+        return list(self.held)
+
+    def grab(self):
+        pass
+
+    def ungrab(self):
+        pass
+
+
+def case(name, batches, held, before=False, run_ms=0):
+    print(f"case {name}: batches {batches}, EVIOCGKEY held {sorted(held)}", file=sys.stderr, flush=True)
+    loop = GLib.MainLoop()
+    d = m.Hotkeyd(loop)
+    dev = Dev(batches, held)
+    d.devices = {"/dev/input/event0": (dev, {116: "power", 115: "volup"}, 0)}
+    d.wanted = d.applied = "blanked"
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        if before:
+            d.handle("power", 1)
+            time.sleep(0.01)
+        d.resume()
+        if run_ms:
+            GLib.timeout_add(run_ms, loop.quit)
+            loop.run()
+    k = d.keys["power"]
+    seen = (f"{name}: printed {out.getvalue().splitlines()}, EVIOCGKEY calls (events still queued, held)"
+            f" {dev.calls}, events left {len(dev.q)}, wanted {d.wanted}, applied {d.applied}, power down {k.down},"
+            f" hold timer {bool(k.timer)}")
+    print(seen, file=sys.stderr, flush=True)
+    return d, dev, out.getvalue().splitlines(), seen
+
+
+bad = []
+d, dev, out, seen = case("queued tap", [[(116, 1)], [(116, 0)]], [])
+if out.count("action power tap blank") != 1 or d.wanted != "awake" or dev.calls[:1] != [(0, [])]:
+    bad.append(seen)
+d, dev, out, seen = case("queued down, held", [[(116, 1)]], [116], run_ms=3800)
+if "action power hold blank on" not in out or "action power hold=3000 unit blockie-poweroff.service" not in out \
+        or "action power tap blank" in out or dev.calls[:1] != [(0, [116])] or not d.keys["power"].down:
+    bad.append(seen)
+d, dev, out, seen = case("down after the resume, up by EVIOCGKEY", [[(116, 1)]], [])
+if out.count("action power tap blank") != 1 or d.wanted != "awake" or d.keys["power"].down:
+    bad.append(seen)
+d, dev, out, seen = case("down before the resume, up by EVIOCGKEY", [], [], before=True)
+if any(o.startswith("action power") for o in out) or d.keys["power"].down or d.keys["power"].timer \
+        or d.wanted != "blanked":
+    bad.append(seen)
+for b in bad:
+    print(f"FAILED {b}", file=sys.stderr)
+sys.exit(1 if bad else 0)
+EOF
+r=$?
+((r == 0)) || sed 's/^/  /' "$t/drain.out"
+res $r "resume: queued key events are drained before EVIOCGKEY, a down read after the resume and up is a release, an older one is cleared"
+
 S=$t/sys
 sysnode() {
   local d=$S/devices/$1
@@ -232,7 +545,7 @@ sysnode virtual/input/input7 0019 4001 0428 ""
 sysnode virtual/input/input8 0019 4001 0428 ayaneo-gamepad/input0
 sysnode platform/odm/odm:gpio_keys/input/input0 0019 0001 0001 gpio-keys/input0
 mkdir -p "$S/devices/virtual/input/input9/event9"
-BLOCKIE_HOTKEYD_SYSFS=$S python3 - "$bin" "$S" > "$t/phys.out" 2>&1 << 'EOF'
+BLOCKIE_HOTKEYD_SYSFS=$S timeout -k 5 60 python3 - "$bin" "$S" > "$t/phys.out" 2>&1 << 'EOF'
 import importlib.machinery
 import importlib.util
 import sys

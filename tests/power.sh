@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 set -u
 
+[[ -e /run/.containerenv ]] || { echo "power: runs only in a container, so blockie-sleep can never reach the host's /sys/power" >&2; exit 2; }
 hooks=/usr/lib/blockie/hooks.d
 off=/usr/libexec/blockie/blockie-poweroff
+sl=/usr/libexec/blockie/blockie-sleep
 t=$(mktemp -d "${TMPDIR:-/tmp}/power.XXXXXX")
 fails=0
 trap 'exec 4>&-; rm -rf "${t:?}"' EXIT
@@ -48,6 +50,8 @@ case "\$*" in
     [ "\$rc" != 0 ] || { [ "\$3" = --signal=SIGSTOP ] && : > "$s/stopped" || rm -f "$s/stopped"; }
     exit "\$rc"
     ;;
+  is-system-running) cat "$s/sysrun" 2> /dev/null || echo running ;;
+  '--user show -P ActiveState blockie-poweroff.service') cat "$s/po.state" 2> /dev/null || echo inactive ;;
   *) echo "systemctl \$*" >> "$t/log" ;;
 esac
 EOF
@@ -81,13 +85,17 @@ case "\$*" in
     [ ! -f "$s/sb.hang" ] || exec sleep 30
     echo "\$v" > "$led/brightness"
     ;;
+  'get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager BlockInhibited')
+    echo "s \"\$(cat "$s/inhibit" 2> /dev/null)\""
+    ;;
   *)
     echo "busctl \$*" >> "$t/log"
     echo "\$5" >> "$s/calls"
     ;;
 esac
 EOF
-chmod 755 "$t/bin/wlopm" "$t/bin/systemctl" "$t/bin/busctl"
+printf '#!/bin/sh\necho sync >> "%s"\n' "$t/log" > "$t/bin/sync"
+chmod 755 "$t/bin/wlopm" "$t/bin/systemctl" "$t/bin/busctl" "$t/bin/sync"
 
 state() {
   rm -f "${s:?}"/* "$t/log"
@@ -99,7 +107,7 @@ state() {
 }
 run() {
   local t0=${EPOCHREALTIME//[!0-9]/}
-  BLOCKIE_SYSFS=$t/sys XDG_RUNTIME_DIR=$t/run PATH=$t/bin:$PATH timeout 20 "$@" > "$t/out" 2> "$t/err"
+  BLOCKIE_SYSFS=$t/sys XDG_RUNTIME_DIR=$t/run PATH=$t/bin:$PATH timeout -k 2 20 "$@" > "$t/out" 2> "$t/err"
   rc=$?
   ms=$(((${EPOCHREALTIME//[!0-9]/} - t0) / 1000))
   touch "$t/log"
@@ -119,8 +127,10 @@ ok=0
 for h in blank-on blank-off screen-on; do
   [[ -x $hooks/$h && $(head -n 1 "$hooks/$h") == '#!/bin/sh' ]] && sh -n "$hooks/$h" || { ok=1; echo "  $h"; }
 done
-[[ -x $off && $(head -n 1 "$off") == '#!/bin/sh' ]] && sh -n "$off" || { ok=1; echo "  $off"; }
-res $ok "the display hooks and blockie-poweroff are executable sh scripts"
+for f in "$off" "$sl"; do
+  [[ -x $f && $(head -n 1 "$f") == '#!/bin/sh' ]] && sh -n "$f" || { ok=1; echo "  $f"; }
+done
+res $ok "the display hooks, blockie-poweroff and blockie-sleep are executable sh scripts"
 
 state 1 running
 run "$hooks/blank-on"
@@ -314,47 +324,212 @@ res $ok "the session object comes from ListSessions at run time (the uid's seat0
 
 mkfifo -m 600 "$t/run/blockie-game.cmd"
 exec 4<> "$t/run/blockie-game.cmd"
-state 0 running
+po=blockie-poweroff
+dark() { state "$@"; echo 0 > "$led/brightness"; }
+dark 0 running
 run "$off"
 line=
 read -r -t 0.5 line <&4
-[[ $rc == 0 && -z $line && ! -s $t/err ]] && logis $'wlopm --on *\n'"$cont_line"$'\n'"$bl102"$'\n'"$off_line" && ((ms < 5000))
-res $? "blockie-poweroff with no game: wlopm --on, SIGCONT (its failure not logged), no QUIT, then PowerOff at once ($ms ms)"
+[[ $rc == 0 && -z $line && $(< "$t/err") == "$po: sync done" ]] &&
+  logis $'wlopm --on *\n'"$cont_line"$'\n'"$bl102"$'\nsync\n'"$off_line" && ((ms < 5000))
+res $? "blockie-poweroff with no game on a dark screen: wlopm --on, SIGCONT (its failure not logged), no QUIT, sync, then PowerOff at once ($ms ms)"
 
 ok=0
 for c in 1:0:5000 11:2000:5000 -1:5000:15000; do
   IFS=: read -r n lo hi <<< "$c"
+  dark "$n" stopped
+  run "$off"
+  line=
+  read -r -t 1 line <&4
+  [[ $rc == 0 && $line == QUIT ]] && logis $'wlopm --on *\n'"$cont_line"$'\n'"$bl102"$'\nsync\n'"$off_line" &&
+    ((ms >= lo && ms < hi)) || { ok=1; echo "  active $n: rc $rc line '$line' $ms ms"; }
+  stopped && { ok=1; echo "  active $n: still stopped"; }
+  if [[ $n == -1 ]]; then
+    want="$po: QUIT sent"$'\n'"$po: blockie-game.scope still active after 5 s, powering off anyway"$'\n'"$po: sync done"
+  else
+    want="$po: QUIT sent"$'\n'"$po: blockie-game.scope inactive"$'\n'"$po: sync done"
+  fi
+  [[ $(< "$t/err") == "$want" ]] || { ok=1; echo "  active $n: stderr $(tr '\n' '|' < "$t/err")"; }
+done
+res $ok "blockie-poweroff on a dark screen: wlopm --on, SIGCONT, QUIT, sync, then PowerOff when the scope ends at once, after 2 s or never (5 s), inside 15 s, each step on stderr"
+
+ok=0
+for n in 2 -1; do
   state "$n" stopped
   run "$off"
   line=
   read -r -t 1 line <&4
-  [[ $rc == 0 && $line == QUIT ]] && logis $'wlopm --on *\n'"$cont_line"$'\n'"$bl102"$'\n'"$off_line" &&
-    ((ms >= lo && ms < hi)) || { ok=1; echo "  active $n: rc $rc line '$line' $ms ms"; }
-  stopped && { ok=1; echo "  active $n: still stopped"; }
-  if [[ $n == -1 ]]; then
-    grep -q 'still active after 5 s, powering off anyway' "$t/err" || { ok=1; echo "  active $n: no log line"; }
+  [[ $rc == 0 && $line == QUIT ]] && logis "$cont_line"$'\nsync\n'"$off_line" && ! stopped || { ok=1; echo "  lit, active $n: rc $rc line '$line'"; }
+  grep -q ListSessions "$s/calls" 2> /dev/null && { ok=1; echo "  lit, active $n: backlight lookup"; }
+  if [[ $n == 2 ]]; then
+    [[ $(< "$t/err") == "$po: QUIT sent"$'\n'"$po: blockie-game.scope inactive"$'\n'"$po: sync done" ]] || ok=1
+  else
+    [[ $(sed -n 2p "$t/err") == *'still active after 5 s'* && $(sed -n 3p "$t/err") == "$po: sync done" ]] || ok=1
   fi
 done
-res $ok "blockie-poweroff: wlopm --on, SIGCONT, QUIT, then PowerOff when the scope ends at once, after 2 s or never (5 s), inside 15 s"
+res $ok "blockie-poweroff on a lit screen skips wlopm and both backlight calls, still sends SIGCONT and QUIT, and syncs after the scope ends or the 5 s wait, before PowerOff"
 
-state 1 stopped
+dark 1 stopped
 echo 1 > "$s/kill.rc"
 run "$off"
 line=
 read -r -t 1 line <&4
-[[ $rc == 0 && $line == QUIT ]] && logis $'wlopm --on *\n'"$cont_line"$'\n'"$bl102"$'\n'"$off_line" &&
+[[ $rc == 0 && $line == QUIT ]] && logis $'wlopm --on *\n'"$cont_line"$'\n'"$bl102"$'\nsync\n'"$off_line" &&
   grep -q 'SIGCONT to blockie-game.scope failed' "$t/err"
-res $? "blockie-poweroff: a failing SIGCONT to an active scope is logged, QUIT and PowerOff still follow"
+res $? "blockie-poweroff: a failing SIGCONT to an active scope is logged, QUIT, sync and PowerOff still follow"
 
-state -1 stopped
+dark -1 stopped
 : > "$s/wlopm.hang"
 run "$off"
 line=
 read -r -t 1 line <&4
-[[ $rc == 0 && $line == QUIT ]] && logis $'wlopm --on *\n'"$cont_line"$'\n'"$bl102"$'\n'"$off_line" &&
+[[ $rc == 0 && $line == QUIT ]] && logis $'wlopm --on *\n'"$cont_line"$'\n'"$bl102"$'\nsync\n'"$off_line" &&
   grep -q 'wlopm --on failed' "$t/err" && ((ms >= 7000 && ms < 15000))
 res $? "blockie-poweroff with a hanging wlopm and a game that never ends: PowerOff still called inside 15 s ($ms ms)"
 exec 4>&-
+
+P=$t/sys/power
+wr=$t/sys/kernel/wakeup_reasons
+counters=(fail failed_freeze failed_prepare failed_suspend failed_suspend_late failed_suspend_noirq failed_resume
+  failed_resume_early failed_resume_noirq)
+bg=()
+sfix() {
+  state 0 running
+  rm -rf "${t:?}/sys/power" "${t:?}/sys/kernel" "${t:?}/sys/class/wakeup"
+  mkdir -p "$P/suspend_stats" "$wr" "$t/sys/class/wakeup/wakeup0" "$t/sys/class/wakeup/wakeup1"
+  : > "$P/state"
+  printf 7 > "$P/wakeup_count"
+  for c in success "${counters[@]}"; do
+    echo 0 > "$P/suspend_stats/$c"
+  done
+  echo suspend > "$P/suspend_stats/last_failed_step"
+  echo -16 > "$P/suspend_stats/last_failed_errno"
+  echo alarmtimer.3.auto > "$P/suspend_stats/last_failed_dev"
+  printf '%s\n' "${1-333 mtk-pmic-keys}" > "$wr/last_resume_reason"
+  echo '12.500000000 10.250000000' > "$wr/last_suspend_time"
+  echo disp_crtc0_wakelock > "$t/sys/class/wakeup/wakeup0/name"
+  echo 120 > "$t/sys/class/wakeup/wakeup0/active_time_ms"
+  echo alarmtimer.3.auto > "$t/sys/class/wakeup/wakeup1/name"
+  echo 0 > "$t/sys/class/wakeup/wakeup1/active_time_ms"
+}
+grow() {
+  rm -f "$P/suspend_stats/$1"
+  mkfifo "$P/suspend_stats/$1"
+  { printf '0\n1\n'; exec sleep 30; } > "$P/suspend_stats/$1" &
+  bg+=($!)
+}
+reap() {
+  ((${#bg[@]})) || return 0
+  kill "${bg[@]}" 2> /dev/null
+  wait "${bg[@]}" 2> /dev/null
+  bg=()
+}
+untouched() { [[ ! -s $P/state ]] && ! grep -qx sync "$t/log"; }
+
+ok=0
+sfix
+run "$sl" first
+[[ $rc == 0 && $(< "$t/out") == "slept power 10.250000000" && $(< "$P/state") == mem ]] &&
+  cmp -s <(printf '7\n') "$P/wakeup_count" && grep -qx sync "$t/log" || { ok=1; echo "  first: $(< "$t/out")"; }
+sfix
+run "$sl"
+[[ $(< "$t/out") == "slept power 10.250000000" && $(< "$P/state") == mem ]] && ! grep -qx sync "$t/log" ||
+  { ok=1; echo "  again: $(< "$t/out")"; }
+res $ok "blockie-sleep reads wakeup_count, writes the same count back, writes mem, syncs only on the first attempt"
+
+ok=0
+cases=("313 mt6397-rtc" rtc "194 type_c_port0" plug "142 wlan0" other "-1 Wakeup reason not found" other
+  "Abort: Pending Wakeup Sources: alarmtimer.3.auto" other "" other $'313 mt6397-rtc\n333 mtk-pmic-keys' power
+  $'194 type_c_port0\n313 mt6397-rtc' rtc)
+for ((i = 0; i < ${#cases[@]}; i += 2)); do
+  sfix "${cases[i]}"
+  run "$sl"
+  [[ $(< "$t/out") == "slept ${cases[i + 1]} 10.250000000" ]] || { ok=1; echo "  '${cases[i]}': $(< "$t/out")"; }
+done
+sfix
+rm -f "$wr/last_resume_reason" "$wr/last_suspend_time"
+run "$sl"
+[[ $(< "$t/out") == "slept other" && ! -s $t/err ]] || { ok=1; echo "  no reason files: $(< "$t/out")"; }
+res $ok "blockie-sleep names the wake by its irq name: power before rtc before plug, anything else other"
+
+ok=0
+sfix
+rm -f "$P/wakeup_count"
+mkfifo "$P/wakeup_count"
+run "$sl" first
+[[ $(< "$t/out") == "active disp_crtc0_wakelock" ]] && ((ms >= 3000 && ms < 6500)) && [[ ! -s $P/state ]] ||
+  { ok=1; echo "  held: $(< "$t/out") $ms ms"; }
+sfix
+rm -f "$P/wakeup_count"
+ln -s /dev/full "$P/wakeup_count"
+run "$sl"
+[[ $(< "$t/out") == events && ! -s $P/state ]] || { ok=1; echo "  events: $(< "$t/out")"; }
+res $ok "a wakeup_count read held past 3 s gives active with the active sources, a rejected count write gives events, no mem write"
+
+ok=0
+sfix
+rm -f "$P/state"
+ln -s /dev/full "$P/state"
+grow fail
+grow failed_suspend
+run "$sl"
+reap
+[[ $(< "$t/out") == "busy step=suspend errno=-16 grew=fail,failed_suspend dev=alarmtimer.3.auto" ]] ||
+  { ok=1; echo "  suspend: $(< "$t/out")"; }
+sfix
+rm -f "$P/state"
+ln -s /dev/full "$P/state"
+echo freeze > "$P/suspend_stats/last_failed_step"
+grow fail
+grow failed_freeze
+run "$sl"
+reap
+[[ $(< "$t/out") == "busy step=freeze errno=-16 grew=fail,failed_freeze" ]] || { ok=1; echo "  freeze: $(< "$t/out")"; }
+res $ok "a failed mem write gives busy with the step, errno and grown counters, the device only when a suspend callback failed"
+
+ok=0
+sfix
+echo stopping > "$s/sysrun"
+run "$sl" first
+[[ $(< "$t/out") == "refused stopping" ]] && untouched || { ok=1; echo "  stopping: $(< "$t/out")"; }
+sfix
+bash -c 'exec -a @blk-deadman sleep 30' &
+dp=$!
+for _ in $(seq 100); do
+  pgrep -f '^@blk-deadman( |$)' > /dev/null && break
+  sleep 0.05
+done
+run "$sl" first
+kill "$dp"
+wait "$dp" 2> /dev/null
+[[ $(< "$t/out") == "refused deadman" ]] && untouched || { ok=1; echo "  deadman: $(< "$t/out")"; }
+sfix
+echo activating > "$s/po.state"
+run "$sl" first
+[[ $(< "$t/out") == "refused poweroff" ]] && untouched || { ok=1; echo "  poweroff: $(< "$t/out")"; }
+sfix
+echo handle-power-key:sleep > "$s/inhibit"
+run "$sl" first
+[[ $(< "$t/out") == "refused inhibited" ]] && untouched || { ok=1; echo "  inhibited: $(< "$t/out")"; }
+sfix
+echo shutdown > "$s/inhibit"
+run "$sl"
+[[ $(< "$t/out") == "slept power 10.250000000" ]] || { ok=1; echo "  shutdown inhibitor: $(< "$t/out")"; }
+res $ok "blockie-sleep refuses while stopping, under the deadman, during blockie-poweroff and under a sleep block inhibitor, with no sync and no mem write"
+
+sfix
+rm -f "$P/wakeup_count"
+mkfifo "$P/wakeup_count"
+t0=${EPOCHREALTIME//[!0-9]/}
+BLOCKIE_SYSFS=$t/sys XDG_RUNTIME_DIR=$t/run PATH=$t/bin:$PATH timeout -k 10 20 "$sl" first > "$t/out" 2> "$t/err" &
+hp=$!
+sleep 0.5
+kill -TERM "$hp"
+wait "$hp"
+rc=$?
+ms=$(((${EPOCHREALTIME//[!0-9]/} - t0) / 1000))
+[[ $rc == 0 && $(< "$t/out") == "refused cancelled" && ! -s $P/state ]] && ((ms < 6500))
+res $? "a SIGTERM before the mem write gives refused cancelled and no mem write ($ms ms)"
 
 if (( fails )); then
   echo "power: $fails failed"

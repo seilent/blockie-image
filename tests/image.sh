@@ -145,6 +145,11 @@ for h in blank-on blank-off screen-on; do
 done
 [[ -x /usr/libexec/blockie/blockie-poweroff ]] || fail "blockie-poweroff missing"
 [[ $(stat -c %a /usr/libexec/blockie/blockie-backlight 2> /dev/null) == 755 ]] || fail "blockie-backlight is not a 755 file"
+[[ $(stat -c %a /usr/libexec/blockie/blockie-sleep 2> /dev/null) == 755 ]] || fail "blockie-sleep is not a 755 file"
+for l in 'z /sys/power/state 0664 root blockie -' 'z /sys/power/wakeup_count 0664 root blockie -' \
+  'd /run/blockie-sleep 0755 root root -'; do
+  grep -qxF "$l" /usr/lib/tmpfiles.d/blockie.conf || fail "no tmpfiles line '$l'"
+done
 po=/usr/lib/systemd/user/blockie-poweroff.service
 grep -qx 'Type=oneshot' "$po" && grep -qx 'TimeoutStartSec=15s' "$po" && ! grep -q '^\[Install\]' "$po" ||
   fail "blockie-poweroff.service is not a 15 s oneshot without [Install]"

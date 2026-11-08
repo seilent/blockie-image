@@ -1,0 +1,91 @@
+#!/bin/sh
+set -u
+sys=${BLOCKIE_SYSFS:-/sys}
+p=$sys/power
+st=$p/suspend_stats
+counters='fail failed_freeze failed_prepare failed_suspend failed_suspend_late failed_suspend_noirq failed_resume failed_resume_early failed_resume_noirq'
+
+trap 'echo refused cancelled; exit 0' TERM
+
+line() {
+    v=
+    [ ! -r "$1" ] || read -r v < "$1" 2> /dev/null
+    echo "$v"
+}
+
+stats() {
+    for c in $counters; do
+        printf '%s=%s ' "$c" "$(line "$st/$c")"
+    done
+}
+
+if [ "$(timeout 2 systemctl is-system-running 2> /dev/null)" = stopping ]; then
+    echo "refused stopping"
+    exit 0
+fi
+if pgrep -f '^@blk-deadman( |$)' > /dev/null; then
+    echo "refused deadman"
+    exit 0
+fi
+case $(timeout 2 systemctl --user show -P ActiveState blockie-poweroff.service 2> /dev/null) in
+activating | active | deactivating | reloading)
+    echo "refused poweroff"
+    exit 0
+    ;;
+esac
+inh=$(timeout 1 busctl get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager \
+    BlockInhibited 2> /dev/null)
+inh=${inh#s \"}
+case :${inh%\"}: in
+*:sleep:*)
+    echo "refused inhibited"
+    exit 0
+    ;;
+esac
+
+[ "${1:-}" != first ] || sync
+
+if ! count=$(timeout 3 head -c 16 "$p/wakeup_count"); then
+    names=
+    for d in "$sys"/class/wakeup/*/; do
+        t=$(line "$d/active_time_ms")
+        case $t in '' | *[!0-9]* | 0) continue ;; esac
+        names="$names $(line "$d/name")"
+    done
+    echo "active$names"
+    exit 0
+fi
+if ! { echo "$count" > "$p/wakeup_count"; } 2> /dev/null; then
+    echo "events"
+    exit 0
+fi
+
+before=$(stats)
+trap '' TERM
+if ! { printf mem > "$p/state"; } 2> /dev/null; then
+    grew=
+    dev=
+    for c in $counters; do
+        a=${before#*"$c="}
+        a=${a%% *}
+        b=$(line "$st/$c")
+        if [ "$b" != "$a" ]; then
+            grew=${grew:+$grew,}$c
+            case $c in failed_suspend*) dev=$(line "$st/last_failed_dev") ;; esac
+        fi
+    done
+    echo "busy step=$(line "$st/last_failed_step") errno=$(line "$st/last_failed_errno") grew=$grew${dev:+ dev=$dev}"
+    exit 0
+fi
+
+reason=other
+while read -r l; do
+    case $l in
+    *' mtk-pmic-keys') reason=power ;;
+    *' mt6397-rtc') [ "$reason" = power ] || reason=rtc ;;
+    *' type_c_port0') [ "$reason" = power ] || [ "$reason" = rtc ] || reason=plug ;;
+    esac
+done 2> /dev/null < "$sys/kernel/wakeup_reasons/last_resume_reason"
+t=$(line "$sys/kernel/wakeup_reasons/last_suspend_time")
+case $t in *' '*) t=${t##* } ;; *) t= ;; esac
+echo "slept $reason${t:+ $t}"

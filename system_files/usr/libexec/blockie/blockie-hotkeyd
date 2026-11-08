@@ -3,6 +3,7 @@ import glob
 import os
 import re
 import sys
+import time
 
 import evdev
 import gi
@@ -20,6 +21,24 @@ SYSFS = os.environ.get("BLOCKIE_HOTKEYD_SYSFS", "/sys")
 LONG_MS = int(os.environ.get("BLOCKIE_HOTKEYD_LONG_MS", "1000"))
 HOOK_MS = int(os.environ.get("BLOCKIE_HOTKEYD_HOOK_MS", "5000"))
 BACKSTOP_MS = int(os.environ.get("BLOCKIE_HOTKEYD_BACKSTOP_MS", "20000"))
+SLEEP = os.environ.get("BLOCKIE_HOTKEYD_SLEEP", "/usr/libexec/blockie/blockie-sleep")
+SLEPT = os.environ.get("BLOCKIE_HOTKEYD_SLEPT")
+KNOB = os.environ.get("BLOCKIE_HOTKEYD_KNOB", "/run/blockie-sleep/on-vbus")
+SETTLE_MS = int(os.environ.get("BLOCKIE_HOTKEYD_SETTLE_MS", "2000"))
+RESLEEP_MS = int(os.environ.get("BLOCKIE_HOTKEYD_RESLEEP_MS", "1000"))
+WAKE_MS = int(os.environ.get("BLOCKIE_HOTKEYD_WAKE_MS", "1500"))
+LOST_MS = int(os.environ.get("BLOCKIE_HOTKEYD_LOST_MS", "500"))
+RETRY_MS = int(os.environ.get("BLOCKIE_HOTKEYD_RETRY_MS", "3000"))
+RETRY_SLOW_MS = int(os.environ.get("BLOCKIE_HOTKEYD_RETRY_SLOW_MS", "60000"))
+SLEEP_KILL_MS = int(os.environ.get("BLOCKIE_HOTKEYD_SLEEP_KILL_MS", "60000"))
+VBUS_MS = int(os.environ.get("BLOCKIE_HOTKEYD_VBUS_MS", "5000"))
+RESLEEP_MAX_MS = 30000
+STORM_MS = 600000
+RESUME_S = 0.05
+LOW_CAPACITY = 3
+REASONS = ("power", "rtc", "plug", "other")
+ONLINE = "class/power_supply/mtk-master-charger/online"
+BATTERY = "class/power_supply/battery"
 HOLD_MAX_MS = 60000
 REPEAT_DELAY_MS = 400
 REPEAT_MS = 100
@@ -52,6 +71,32 @@ HOLD = re.compile(r"hold(?:=([1-9][0-9]{0,4}))?")
 
 def log(msg):
     print(f"{ME}: {msg}", file=sys.stderr, flush=True)
+
+
+def sysfs(rel):
+    try:
+        with open(os.path.join(SYSFS, rel)) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def slept_extra():
+    if not SLEPT:
+        return 0.0
+    try:
+        with open(SLEPT) as f:
+            return float(f.read().strip() or 0)
+    except (OSError, ValueError):
+        return 0.0
+
+
+def boottime():
+    return time.clock_gettime(time.CLOCK_BOOTTIME) + slept_extra()
+
+
+def asleep():
+    return time.clock_gettime(time.CLOCK_BOOTTIME) - time.clock_gettime(time.CLOCK_MONOTONIC) + slept_extra()
 
 
 def valid(action, args):
@@ -152,6 +197,8 @@ def current():
 class Key:
     def __init__(self):
         self.down = False
+        self.down_at = 0.0
+        self.wake = False
         self.consumed = False
         self.table = {}
         self.timer = 0
@@ -177,6 +224,24 @@ class Hotkeyd:
         self.grabbed = False
         self.extra = {}
         self.nograb = {}
+        self.helper = None
+        self.helper_kill = 0
+        self.helper_at = 0.0
+        self.sleep_timer = 0
+        self.vbus_timer = 0
+        self.lost_timer = 0
+        self.storm = 0
+        self.next_ms = SETTLE_MS
+        self.first = True
+        self.fails = 0
+        self.refused = False
+        self.vbus_said = False
+        self.rs = RESLEEP_MS
+        self.wakes = []
+        self.delta = asleep()
+        self.resumed = None
+        self.seen = set()
+        self.draining = False
 
     def session_bus(self):
         if self.bus is None:
@@ -210,8 +275,17 @@ class Hotkeyd:
     def want(self, state):
         self.wanted = state
         self.retry = 1
+        self.next_ms = SETTLE_MS
+        self.first = True
+        self.fails = 0
+        self.refused = False
+        self.vbus_said = False
+        if state != "blanked" and self.helper is not None:
+            log("SIGTERM to blockie-sleep")
+            self.helper.send_signal(15)
         self.set_grab(state == "blanked")
         self.apply()
+        self.consider()
 
     def apply(self):
         if self.busy:
@@ -295,13 +369,15 @@ class Hotkeyd:
                 return
             self.retry -= 1
         self.apply()
+        self.consider()
 
     def start(self, unit):
         self.run(["systemctl", "--user", "start", "--no-block", unit])
 
-    def blank(self, args):
+    def blank(self, args, wake=False):
         if self.wanted == "awake":
-            self.want("blanked")
+            if not wake:
+                self.want("blanked")
         elif self.wanted == "blanked":
             self.want("blanked" if args else "awake")
         elif not args and self.started:
@@ -375,9 +451,10 @@ class Hotkeyd:
         self.extra.clear()
         self.nograb.clear()
         log("ungrabbed")
-        self.resync()
+        if not self.draining:
+            self.resync()
 
-    def resync(self):
+    def resync(self, resumed=None):
         if DRY:
             print("resync", flush=True)
         held = {}
@@ -391,8 +468,204 @@ class Hotkeyd:
         for key, down in held.items():
             k = self.keys[key]
             if k.down and not down:
+                if resumed is not None and k.down_at >= resumed:
+                    log(f"resume: {key} is up with its down read after the resume: handled as a release")
+                    self.handle(key, 0)
+                    continue
+                if resumed is not None:
+                    log(f"resume: {key} is up with its down read before the resume: cleared")
                 k.down = False
                 self.stop_timer(k)
+
+    def battery(self):
+        return (f"capacity {sysfs(BATTERY + '/capacity') or '?'} voltage_now {sysfs(BATTERY + '/voltage_now') or '?'}"
+                f" online {sysfs(ONLINE) or '?'}")
+
+    def low(self):
+        c = sysfs(BATTERY + "/capacity")
+        return sysfs(ONLINE) == "0" and c.isdigit() and int(c) <= LOW_CAPACITY
+
+    def low_off(self):
+        log(f"capacity {sysfs(BATTERY + '/capacity')} on battery: powering off")
+        if DRY:
+            print("low", flush=True)
+        self.unit("blockie-poweroff.service")
+
+    def blocker(self):
+        if self.wanted != "blanked" or self.applied != "blanked" or self.busy:
+            return "state"
+        if any(k.down for k in self.keys.values()):
+            return "key"
+        if self.helper is not None or self.lost_timer:
+            return "helper"
+        if self.refused or self.storm:
+            return "held"
+        if sysfs(ONLINE) == "1" and not os.path.exists(KNOB):
+            return "vbus"
+        return ""
+
+    def consider(self):
+        why = self.blocker()
+        if why == "vbus":
+            if not self.vbus_said:
+                self.vbus_said = True
+                log("on usb power: blanked awake")
+                if DRY:
+                    print("vbus", flush=True)
+            if not self.vbus_timer:
+                self.vbus_timer = GLib.timeout_add(VBUS_MS, self.vbus_tick)
+        elif self.vbus_timer:
+            GLib.source_remove(self.vbus_timer)
+            self.vbus_timer = 0
+        if why:
+            if self.sleep_timer:
+                GLib.source_remove(self.sleep_timer)
+                self.sleep_timer = 0
+            return
+        if not self.sleep_timer:
+            self.sleep_timer = GLib.timeout_add(self.next_ms, self.try_sleep)
+
+    def vbus_tick(self):
+        self.vbus_timer = 0
+        self.consider()
+        return False
+
+    def try_sleep(self):
+        self.sleep_timer = 0
+        if self.blocker():
+            self.consider()
+        elif self.fails > 5 and self.low():
+            self.low_off()
+        else:
+            self.sleep_now()
+        return False
+
+    def sleep_now(self):
+        first, self.first = self.first, False
+        log(f"sleep{' first' if first else ''}: {self.battery()}")
+        if DRY:
+            print("sleep", flush=True)
+            self.refused = True
+            return
+        try:
+            p = Gio.Subprocess.new([SLEEP, "first"] if first else [SLEEP], Gio.SubprocessFlags.STDOUT_PIPE)
+        except GLib.Error as err:
+            log(f"cannot run {SLEEP}: {err.message}")
+            self.refused = True
+            return
+        self.helper = p
+        self.helper_at = time.monotonic()
+        self.helper_kill = GLib.timeout_add(SLEEP_KILL_MS, self.kill_helper, p)
+        p.communicate_utf8_async(None, None, self.slept, None)
+
+    def kill_helper(self, p):
+        self.helper_kill = 0
+        log(f"blockie-sleep still running after {SLEEP_KILL_MS} ms: killed")
+        p.force_exit()
+        return False
+
+    def slept(self, p, res, _):
+        try:
+            out = p.communicate_utf8_finish(res)[1] or ""
+        except GLib.Error as err:
+            log(f"blockie-sleep: {err.message}")
+            out = ""
+        if self.helper_kill:
+            GLib.source_remove(self.helper_kill)
+            self.helper_kill = 0
+        self.helper = None
+        words = out.split("\n", 1)[0].split()
+        if not self.sample() and words[:1] == ["slept"] and (self.resumed is None or self.resumed < self.helper_at):
+            self.resume()
+        log(f"{' '.join(words) or 'no result'}: {self.battery()},"
+            f" suspend_stats success {sysfs('power/suspend_stats/success') or '?'}")
+        if self.wanted == "blanked":
+            self.result(words)
+        self.consider()
+
+    def result(self, words):
+        kind = words[0] if words else ""
+        if kind == "slept":
+            self.fails = 0
+            reason = words[1] if len(words) > 1 and words[1] in REASONS else "other"
+            if reason == "power":
+                self.lost_timer = GLib.timeout_add(LOST_MS, self.lost)
+            elif reason != "plug" and self.low():
+                self.low_off()
+            else:
+                self.resleep()
+        elif kind == "refused":
+            self.refused = words[1:2] != ["cancelled"]
+        else:
+            self.fails += 1
+            self.next_ms = RETRY_MS if self.fails <= 5 else RETRY_SLOW_MS
+            log(f"retry {self.fails} in {self.next_ms} ms")
+
+    def lost(self):
+        self.lost_timer = 0
+        if self.wanted == "blanked" and "power" not in self.seen:
+            if "volup" in self.seen:
+                log("woke by the pmic keys with only a volume up event: back to sleep")
+                self.resleep()
+            else:
+                log(f"woke by power with no key event in {LOST_MS} ms: wake")
+                self.want("awake")
+        self.consider()
+        return False
+
+    def resleep(self):
+        now = boottime()
+        if self.wakes and now - self.wakes[-1] >= 300:
+            self.rs = RESLEEP_MS
+        self.wakes = [w for w in self.wakes if now - w < 600] + [now]
+        if len(self.wakes) >= 30:
+            log(f"{len(self.wakes)} wakes in 10 min: blanked awake for {STORM_MS} ms")
+            self.wakes = []
+            self.storm = GLib.timeout_add(STORM_MS, self.storm_end)
+            return
+        if sum(now - w < 60 for w in self.wakes) >= 5:
+            self.rs = min(self.rs * 4, RESLEEP_MAX_MS)
+        self.next_ms = self.rs
+        log(f"resleep in {self.rs} ms")
+
+    def storm_end(self):
+        self.storm = 0
+        self.consider()
+        return False
+
+    def sample(self):
+        d = asleep()
+        grew = d - self.delta > RESUME_S
+        self.delta = d
+        if grew:
+            self.resume()
+        return grew
+
+    def resume(self):
+        self.resumed = time.monotonic()
+        self.seen = set()
+        log(f"resume: {self.delta:.1f} s asleep since boot, suspend_stats success"
+            f" {sysfs('power/suspend_stats/success') or '?'}")
+        if self.wanted == "awake":
+            self.applied = "unknown"
+        self.draining = True
+        for path in list(self.devices):
+            while path in self.devices:
+                dev, m, _ = self.devices[path]
+                try:
+                    evs = list(dev.read())
+                except BlockingIOError:
+                    break
+                except OSError:
+                    self.drop(path)
+                    break
+                for ev in evs:
+                    if ev.type == 1 and ev.code in m:
+                        log(f"resume drain {path}: {m[ev.code]} {ev.value}")
+                        self.handle(m[ev.code], ev.value)
+        self.resync(self.resumed)
+        self.draining = False
+        self.apply()
 
     def call(self, name, path, iface, member):
         if DRY:
@@ -445,7 +718,7 @@ class Hotkeyd:
         elif action == "unit":
             self.unit(args[0])
         elif action == "blank":
-            self.blank(args)
+            self.blank(args, gesture == "tap" and self.keys[key].wake)
         elif action == "call":
             self.call(*args)
 
@@ -480,25 +753,29 @@ class Hotkeyd:
 
     def handle(self, key, value):
         k = self.keys[key]
+        if key == "volup" or (key == "power" and value == 1):
+            self.seen.add(key)
         if value == 1:
             k.down = True
+            k.down_at = time.monotonic()
+            k.wake = key == "power" and self.resumed is not None and k.down_at - self.resumed < WAKE_MS / 1000
             k.consumed = self.wanted == "blanked" and key != "power"
             k.stage = 0
             self.stop_timer(k)
-            if k.consumed:
-                return
-            k.table = load_table(current())
-            if (key, "press") in k.table:
-                k.consumed = True
-                self.fire(key, "press", k.table[(key, "press")])
-                k.timer = GLib.timeout_add(REPEAT_DELAY_MS, self.repeat, key, True)
-            elif (key, "hold") in k.table:
-                k.timer = GLib.timeout_add(k.table[(key, "hold")][0][0], self.held, key)
+            if not k.consumed:
+                k.table = load_table(current())
+                if (key, "press") in k.table:
+                    k.consumed = True
+                    self.fire(key, "press", k.table[(key, "press")])
+                    k.timer = GLib.timeout_add(REPEAT_DELAY_MS, self.repeat, key, True)
+                elif (key, "hold") in k.table:
+                    k.timer = GLib.timeout_add(k.table[(key, "hold")][0][0], self.held, key)
         elif value == 0 and k.down:
             k.down = False
             self.stop_timer(k)
             if not k.consumed and (key, "tap") in k.table:
                 self.fire(key, "tap", k.table[(key, "tap")])
+        self.consider()
 
     def keymap(self, name, codes):
         return {code: key for key, (names, code) in KEYS.items() if name in names and code in codes}
@@ -509,6 +786,7 @@ class Hotkeyd:
         return "/devices/virtual/" not in real or identity(name, real) in VIRTUAL
 
     def rescan(self):
+        self.sample()
         for path in sorted(glob.glob("/dev/input/event*")):
             if path in self.devices:
                 continue
@@ -545,6 +823,9 @@ class Hotkeyd:
         log(f"{path} gone")
 
     def readable(self, fd, cond, path):
+        self.sample()
+        if path not in self.devices:
+            return False
         dev, m, _ = self.devices[path]
         try:
             for ev in dev.read():
@@ -571,6 +852,7 @@ class Hotkeyd:
             line, _, rest = bytes(buf).partition(b"\n")
             buf[:] = rest
             words = line.decode(errors="replace").split()
+            self.sample()
             if len(words) == 2 and words[0] in KEYS and words[1] in ("down", "up"):
                 self.handle(words[0], 1 if words[1] == "down" else 0)
             elif words:
