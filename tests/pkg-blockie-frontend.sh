@@ -11,7 +11,7 @@ rpms=("$out"/blockie-frontend-*.rpm)
 lic=/usr/share/licenses/blockie-frontend
 fonts=/usr/share/blockie/fonts
 want=$(printf '%s\n' /usr/libexec/blockie/blockie-frontend /usr/lib/systemd/user/blockie-frontend.service "$fonts" \
-  "$fonts/selawk.ttf" "$fonts/selawkb.ttf" "$fonts/selawkl.ttf" "$fonts/selawksl.ttf" "$lic/Selawik-LICENSE.txt" "$lic/sqlite-NOTICE" "$lic" "$lic/LICENSE" "$lic/fribidi-COPYING" "$lic/harfbuzz-COPYING" \
+  "$fonts/selawk.ttf" "$fonts/selawkb.ttf" "$fonts/selawkl.ttf" "$fonts/selawksl.ttf" /usr/share/blockie/schema.d/20-frontend.json "$lic/Selawik-LICENSE.txt" "$lic/sqlite-NOTICE" "$lic" "$lic/LICENSE" "$lic/fribidi-COPYING" "$lic/harfbuzz-COPYING" \
   "$lic/libspng-LICENSE" "$lic/qrcodegen.h" "$lic/stb_truetype.h" "$lic/zlib-LICENSE" | LC_ALL=C sort)
 [[ $(rpm -qpl "${rpms[0]}" | LC_ALL=C sort) == "$want" ]] || fail "file list: $(rpm -qpl "${rpms[0]}" | tr '\n' ' ')"
 t=$(mktemp -d)
@@ -38,7 +38,7 @@ grep -Eq '^ +GNU_RELRO ' <<< "$phdr" || fail "blockie-frontend lacks GNU_RELRO"
 grep -Eq ' __[A-Za-z0-9_]+_chk(@| |$)' <<< "$syms" || fail "blockie-frontend has no fortified __*_chk call"
 grep -q 'Additional permission under GNU GPL version 3 section 7' "$t$lic/LICENSE" || fail "LICENSE lacks the additional permission"
 reqs=$(rpm -qpR "${rpms[0]}")
-want_reqs=$(printf '%s\n' 'ld-linux-aarch64.so.1()(64bit)' 'libc.so.6()(64bit)' 'libcurl.so.4()(64bit)' 'libgcc_s.so.1()(64bit)' \
+want_reqs=$(printf '%s\n' 'ld-linux-aarch64.so.1()(64bit)' 'libc.so.6()(64bit)' 'libcurl.so.4()(64bit)' 'libdbus-1.so.3()(64bit)' 'libgcc_s.so.1()(64bit)' \
   'libm.so.6()(64bit)' 'libstdc++.so.6()(64bit)' 'libwayland-client.so.0()(64bit)' 'libxkbcommon.so.0()(64bit)' 'rtld(GNU_HASH)' |
   LC_ALL=C sort)
 got_reqs=$(awk '!/^rpmlib\(/ && !/^[^(]*\([^)]+\)\(64bit\)$/' <<< "$reqs" | LC_ALL=C sort)

@@ -1,7 +1,7 @@
 FROM localhost/blockie-pkg-builder
 
 COPY SOURCE.sha256 blockie-frontend.spec /tmp/blockie-frontend/
-RUN dnf -y --setopt=install_weak_deps=False install gcc-c++ wayland-devel pkgconf-pkg-config libxkbcommon-devel libcurl-devel unzip \
+RUN dnf -y --setopt=install_weak_deps=False install gcc-c++ wayland-devel pkgconf-pkg-config libxkbcommon-devel libcurl-devel dbus-devel unzip \
  && dnf clean all \
  && install -d /srcpkg \
  && rpmspec -P /tmp/blockie-frontend/blockie-frontend.spec | sed -n 's/^Source[0-9]*:[[:space:]]*//p' > /tmp/blockie-frontend/urls \

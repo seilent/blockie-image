@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 %global _build_id_links none
-%global commit c0cf3919ffd170cf13bbdec97136cfa6d3dbf6ea
-%global shortcommit c0cf391
+%global commit b43f6144fb0a24048051fe71f17883f354395a7f
+%global shortcommit b43f614
 %global qrdir qrcodegen-720f62bd
 
 Name:           blockie-frontend
@@ -28,6 +28,7 @@ BuildRequires:  wayland-devel
 BuildRequires:  pkgconf-pkg-config
 BuildRequires:  libxkbcommon-devel
 BuildRequires:  libcurl-devel
+BuildRequires:  pkgconfig(dbus-1)
 BuildRequires:  unzip
 
 %description
@@ -74,3 +75,4 @@ BLOCKIE_FE_CACHE=$PWD/.fe-cache BLOCKIE_FE_OUT=$PWD/.fe-out BLOCKIE_FE_JOBS=%{_s
 %{_libexecdir}/blockie/blockie-frontend
 %{_userunitdir}/blockie-frontend.service
 %{_datadir}/blockie/fonts/
+%{_datadir}/blockie/schema.d/20-frontend.json
