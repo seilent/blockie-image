@@ -139,8 +139,8 @@ grep -qx 'Type=oneshot' "$f" && grep -qx 'ExecStart=/usr/libexec/blockie/blockie
 [[ $(cat "$sd/blockie-android-freeze@freeze.service.d/50-blockie.conf") == $'[Unit]\nConflicts=blockie-android-freeze@thaw.service\nAfter=blockie-android-freeze@thaw.service' ]] ||
   { ok=1; echo "  freeze and thaw do not conflict"; }
 f=$sd/blockie-android-music.service
-for l in After=waydroid-container.service CollectMode=inactive-or-failed Type=oneshot TimeoutStartSec=infinity \
-  ExecStart=/usr/libexec/blockie/blockie-android-music; do
+for l in After=waydroid-container.service PartOf=waydroid-container.service CollectMode=inactive-or-failed Type=oneshot \
+  TimeoutStartSec=infinity ExecStart=/usr/libexec/blockie/blockie-android-music; do
   grep -qxF "$l" "$f" || { ok=1; echo "  music: $l"; }
 done
 ! grep -q '^\[Install\]' "$f" || { ok=1; echo "  music has [Install]"; }
@@ -165,7 +165,7 @@ systemd-analyze verify --man=no $sd/waydroid-container.service $sd/blockie-andro
 xdg=$t/xdg
 mkdir -p "$xdg"
 XDG_RUNTIME_DIR=$xdg systemd-analyze verify --user --man=no "$au" > "$t/verify" 2>&1 || { ok=1; sed 's/^/  /' "$t/verify"; }
-res $ok "units: prep after data and again on a stamp change, the container after prep with the generator and a bounded clean stop, the freeze instances conflict, the music and pad oneshots after the container with no [Install], the pad one part of it, the user unit starts and stops the container"
+res $ok "units: prep after data and again on a stamp change, the container after prep with the generator and a bounded clean stop, the freeze instances conflict, the music and pad oneshots after the container and part of it with no [Install], the user unit starts and stops the container"
 
 ok=0
 [[ $(readlink /usr/share/waydroid-extra/images) == /var/lib/blockie/data/android/images ]] || { ok=1; echo "  images link"; }
@@ -513,43 +513,86 @@ zrun stop
 res $ok "freeze helper: writes 1 or 0 to cgroup.freeze and schedules the cgroup.events log 2 s on without waiting, exits 0 with no payload"
 
 m=$t/music
-mkdir -p "$m/bin" "$m/guest/bin" "$m/run/lxc.d" "$m/payload"
-cat > "$m/bin/waydroid" << EOF
+mkdir -p "$m/bin" "$m/guest/bin" "$m/guest/data/system/environ" "$m/run/lxc.d" "$m/payload"
+cat > "$m/bin/lxc-attach" << EOF
 #!/bin/sh
-[ "\$1" = shell ] && [ "\$2" = -- ] || exit 0
-shift 2
+a=
+while [ \$# -gt 0 ] && [ "\$1" != -- ]; do
+  a="\$a \$1"
+  shift
+done
+[ "\$1" = -- ] || exit 2
+shift
+echo "\${a# }" >> "$m/attach"
 echo "\$*" >> "$m/shell"
 ! grep -qx 'frozen 1' "$m/payload/cgroup.events" || echo "\$*" >> "$m/frozen-call"
 if [ "\$1" = sh ] && [ "\$2" = -c ]; then
-  set -- sh -c "\$(printf '%s' "\$3" | sed 's|/mnt/pass_through|$m/guest/mnt/pass_through|g; s|/data/media|$m/guest/data/media|g')"
+  set -- sh -c "\$(printf '%s' "\$3" | sed 's|/mnt/pass_through|$m/guest/mnt/pass_through|g; s|/data/media|$m/guest/data/media|g; s|/proc/self/mountinfo|$m/mountinfo|g')"
+elif [ "\$1" = /system/bin/cat ]; then
+  echo 'export NOISECLASSPATH /noise.jar' >&2
+  set -- cat "$m/guest\$2"
 fi
-PATH=$m/guest/bin:\$PATH "\$@" 2>&1 | sed 's/\$/\r/'
+{ PATH=$m/guest/bin:\$PATH "\$@"; echo \$? > "$m/attach.rc"; } | sed 's/\$/\r/'
+exit \$(cat "$m/attach.rc")
 EOF
-printf '#!/bin/sh\n[ "$1" != -q ] || shift\n[ -e "$1/.mounted" ]\n' > "$m/guest/bin/mountpoint"
+printf '#!/bin/sh\necho "waydroid $*" >> "%s/waydroid"\n' "$m" > "$m/bin/waydroid"
+printf '%s\n' 'export BOOTCLASSPATH /apex/x.jar:/system/framework/framework.jar' 'export DEX2OATBOOTCLASSPATH /apex/y.jar' \
+  'export SYSTEMSERVERCLASSPATH /system/framework/services.jar' 'export ANDROID_ASSETS /system/app' 'export BAD-CLASSPATH /bad.jar' \
+  'export EMPTYCLASSPATH' > "$m/guest/data/system/environ/classpath"
 cat > "$m/guest/bin/mount" << EOF
 #!/bin/sh
 echo "mount \$*" >> "$m/calls"
-[ ! -e "$m/mountfail" ] || { echo 'mount: permission denied' >&2; exit 1; }
-[ "\$1" != --bind ] || : > "\$3/.mounted"
+if [ -e "$m/mountfail" ]; then
+  [ ! -e "$m/stoponmount" ] || printf 'populated 0\nfrozen 0\n' > "$m/payload/cgroup.events"
+  echo 'mount: permission denied' >&2
+  exit 1
+fi
+[ "\$1" != --bind ] || echo "99 30 179:4 /music \$3 rw,relatime - ext4 /dev/block/mmcblk1p4 rw" >> "$m/mountinfo"
 EOF
-printf '#!/bin/sh\necho "content $*" >> "%s/calls"\n[ -e "%s/scanempty" ] || echo "Result: null"\n' "$m" "$m" > "$m/guest/bin/content"
+cat > "$m/guest/bin/content" << EOF
+#!/bin/sh
+echo "content \$*" >> "$m/calls"
+[ ! -e "$m/stoponscan" ] || printf 'populated 0\nfrozen 0\n' > "$m/payload/cgroup.events"
+[ -e "$m/scanempty" ] || echo "Result: null"
+EOF
 cat > "$m/bin/timeout" << EOF
 #!/bin/sh
 case "\$*" in
   *scan_volume*) [ ! -e "$m/scan.rc" ] || exit \$(cat "$m/scan.rc") ;;
 esac
+h=\$(cat "$m/hang" 2> /dev/null)
+if [ -n "\$h" ]; then
+  case "\$*" in
+    *"\$h"*)
+      rm -f "$m/hang"
+      echo "\$*" >> "$m/hung"
+      printf 'populated 1\nfrozen 1\n' > "$m/payload/cgroup.events"
+      (sleep 1; printf 'populated 1\nfrozen 0\n' > "$m/payload/cgroup.events") > /dev/null 2>&1 &
+      exit 124
+      ;;
+  esac
+fi
 exec $(command -v timeout) "\$@"
 EOF
 chmod 755 "$m/bin/"* "$m/guest/bin/"*
 mrun() {
-  rm -f "${m:?}/shell" "${m:?}/calls" "${m:?}/frozen-call"
-  PATH=$m/bin:$PATH BLOCKIE_ANDROID_PAYLOAD=$m/payload BLOCKIE_ANDROID_RUN=$m/run BLOCKIE_ANDROID_MUSIC_WAIT=2 \
+  rm -f "${m:?}/shell" "${m:?}/calls" "${m:?}/frozen-call" "${m:?}/attach" "${m:?}/waydroid" "${m:?}/hung"
+  env PATH="$m/bin:$PATH" BLOCKIE_ANDROID_PAYLOAD="$m/payload" BLOCKIE_ANDROID_RUN="$m/run" BLOCKIE_ANDROID_MUSIC_WAIT=2 "$@" \
     timeout 20 "$lx/blockie-android-music" > "$m/out" 2>&1
   rc=$?
 }
 media=/data/media/0/Music
 pass=/mnt/pass_through/0/emulated/0/Music
+minfo() {
+  printf '30 1 179:4 / %s rw,relatime - ext4 /dev/block/mmcblk1p4 rw\n' "$m/guest/data" > "$m/mountinfo"
+  [[ ${1:-} == nomedia ]] || printf '40 30 179:4 /music %s rw,relatime - ext4 /dev/block/mmcblk1p4 rw\n' "$m/guest$media" >> "$m/mountinfo"
+}
+up() { printf 'populated 1\nfrozen 0\n' > "$m/payload/cgroup.events"; }
+aenv='-P /var/lib/waydroid/lxc -n waydroid --clear-env --set-var PATH=/product/bin:/apex/com.android.runtime/bin:/apex/com.android.art/bin:/system_ext/bin:/system/bin:/system/xbin:/odm/bin:/vendor/bin:/vendor/xbin --set-var ANDROID_ROOT=/system --set-var ANDROID_DATA=/data --set-var ANDROID_STORAGE=/storage --set-var ANDROID_ART_ROOT=/apex/com.android.art --set-var ANDROID_I18N_ROOT=/apex/com.android.i18n --set-var ANDROID_TZDATA_ROOT=/apex/com.android.tzdata --set-var ANDROID_RUNTIME_ROOT=/apex/com.android.runtime'
+boot=/apex/com.android.art/javalib/core-oj.jar:/apex/com.android.art/javalib/core-libart.jar:/apex/com.android.art/javalib/core-icu4j.jar:/apex/com.android.art/javalib/okhttp.jar:/apex/com.android.art/javalib/bouncycastle.jar:/apex/com.android.art/javalib/apache-xml.jar:/system/framework/framework.jar:/system/framework/ext.jar:/system/framework/telephony-common.jar:/system/framework/voip-common.jar:/system/framework/ims-common.jar:/system/framework/framework-atb-backward-compatibility.jar:/apex/com.android.conscrypt/javalib/conscrypt.jar:/apex/com.android.media/javalib/updatable-media.jar:/apex/com.android.mediaprovider/javalib/framework-mediaprovider.jar:/apex/com.android.os.statsd/javalib/framework-statsd.jar:/apex/com.android.permission/javalib/framework-permission.jar:/apex/com.android.sdkext/javalib/framework-sdkextensions.jar:/apex/com.android.wifi/javalib/framework-wifi.jar:/apex/com.android.tethering/javalib/framework-tethering.jar
 scan='content call --uri content://media --method scan_volume --arg external_primary'
+cls=/system/bin/cat' /data/system/environ/classpath'
+full="$aenv --set-var BOOTCLASSPATH=/apex/x.jar:/system/framework/framework.jar --set-var DEX2OATBOOTCLASSPATH=/apex/y.jar --set-var SYSTEMSERVERCLASSPATH=/system/framework/services.jar"
 ok=0
 echo "lxc.mount.entry = /var/lib/blockie/data/music data/media/0/Music none bind,ro,create=dir,optional 0 0" > "$m/run/lxc.d/music.conf"
 mrun
@@ -557,7 +600,7 @@ mrun
 printf 'populated 0\nfrozen 0\n' > "$m/payload/cgroup.events"
 mrun
 [[ $rc == 0 && ! -e $m/shell ]] || { ok=1; echo "  not populated: rc $rc"; }
-printf 'populated 1\nfrozen 0\n' > "$m/payload/cgroup.events"
+up
 : > "$m/run/lxc.d/music.conf"
 mrun
 [[ $rc == 0 && ! -e $m/shell ]] && grep -q 'no music bind' "$m/out" || { ok=1; echo "  empty music.conf: rc $rc"; }
@@ -566,34 +609,55 @@ res $ok "music helper: no populated payload or an empty music.conf exits 0 and r
 ok=0
 echo "lxc.mount.entry = /var/lib/blockie/data/music data/media/0/Music none bind,ro,create=dir,optional 0 0" > "$m/run/lxc.d/music.conf"
 mkdir -p "$m/guest$media" "$m/guest$pass"
-: > "$m/guest$media/.mounted"
+minfo
 mrun
-[[ $rc == 0 && $(cat "$m/calls" 2> /dev/null) == "mount --bind $m/guest$media $m/guest$pass"$'\n'"$scan" && -e $m/guest$pass/.mounted ]] &&
-  grep -q "bound $media onto $pass" "$m/out" && grep -q 'scanned external_primary' "$m/out" ||
+[[ $rc == 0 && $(cat "$m/calls" 2> /dev/null) == "mount --bind $m/guest$media $m/guest$pass"$'\n'"$scan" ]] &&
+  grep -qF " $m/guest$pass rw" "$m/mountinfo" && grep -q "bound $media onto $pass" "$m/out" && grep -q 'scanned external_primary' "$m/out" ||
   { ok=1; echo "  normal: rc $rc $(tr '\n' '|' < "$m/calls") $(tr '\n' '|' < "$m/out")"; }
-grep -qF "mountpoint -q $pass" "$m/shell" && [[ $(tail -n 1 "$m/shell") == "$scan" ]] || { ok=1; echo "  shell: $(tr '\n' '|' < "$m/shell")"; }
+grep -qF "grep -q \"^[0-9]* [0-9]* [0-9]*:[0-9]* [^ ]* $media \" /proc/self/mountinfo" "$m/shell" &&
+  grep -qF "if grep -q \"^[0-9]* [0-9]* [0-9]*:[0-9]* [^ ]* $pass \" /proc/self/mountinfo; then" "$m/shell" && ! grep -q mountpoint "$m/shell" &&
+  [[ $(tail -n 1 "$m/shell") == "$scan" ]] || { ok=1; echo "  shell: $(tr '\n' '|' < "$m/shell")"; }
+[[ $(grep -cxF "$cls" "$m/shell") == 1 && $(tail -n 2 "$m/shell" | head -n 1) == "$cls" ]] || { ok=1; echo "  classpath read: $(tr '\n' '|' < "$m/shell")"; }
+[[ $(head -n 1 "$m/attach") == "$aenv --set-var BOOTCLASSPATH=$boot" ]] || { ok=1; echo "  first attach: $(head -n 1 "$m/attach")"; }
+[[ $(tail -n 1 "$m/attach") == "$full" ]] || { ok=1; echo "  scan attach: $(tail -n 1 "$m/attach")"; }
+[[ ! -e $m/waydroid ]] || { ok=1; echo "  waydroid called: $(tr '\n' '|' < "$m/waydroid")"; }
 mrun
 [[ $rc == 0 && $(cat "$m/calls" 2> /dev/null) == "$scan" ]] && grep -q "already bound onto $pass" "$m/out" ||
   { ok=1; echo "  again: rc $rc $(tr '\n' '|' < "$m/calls")"; }
-res $ok "music helper: binds $media onto the FUSE lower $pass behind a mountpoint guard, then scans external_primary; a second run does not mount again"
+res $ok "music helper: attaches with lxc-attach and the Android environment, never waydroid shell; finds the $media bind and its own $pass bind in mountinfo field 5; reads the classpath once with /system/bin/cat, parses only its stdout and adds the CLASSPATH and SYSTEMSERVER keys, skipping a bad name and an empty value; a second run does not mount again"
 
 ok=0
+minfo nomedia
+mrun
+[[ $rc == 1 && ! -e $m/calls ]] && grep -q "did not appear in the guest within 2 s" "$m/out" && (($(wc -l < "$m/shell") >= 2)) ||
+  { ok=1; echo "  no media line: rc $rc $(tr '\n' '|' < "$m/out")"; }
+res $ok "music helper: an existing $media with no mountinfo line is not ready, the helper keeps waiting and binds nothing"
+
+ok=0
+minfo
 echo 124 > "$m/scan.rc"
 mrun
-[[ $rc == 0 && ! -e $m/calls ]] && grep -q 'did not answer in 120 s, MediaProvider goes on scanning' "$m/out" ||
-  { ok=1; echo "  scan timeout: rc $rc $(tr '\n' '|' < "$m/out")"; }
+[[ $rc == 0 && $(cat "$m/calls" 2> /dev/null) == "mount --bind $m/guest$media $m/guest$pass" ]] &&
+  grep -q 'did not answer in 120 s, MediaProvider goes on scanning' "$m/out" || { ok=1; echo "  scan timeout: rc $rc $(tr '\n' '|' < "$m/out")"; }
 rm -f "${m:?}/scan.rc"
 : > "$m/scanempty"
 mrun
 [[ $rc == 1 && $(cat "$m/calls" 2> /dev/null) == "$scan" ]] && grep -q 'scan_volume external_primary failed (exit 0): no output' "$m/out" ||
   { ok=1; echo "  scan empty: rc $rc $(tr '\n' '|' < "$m/out")"; }
 rm -f "${m:?}/scanempty"
-res $ok "music helper: a scan that times out (rc 124) is logged and rc 0, MediaProvider goes on; a scan with no output and rc 0 is rc 1"
+mv "$m/guest/data/system/environ/classpath" "$m/classpath"
+mrun
+[[ $rc == 0 && $(tail -n 1 "$m/attach") == "$aenv --set-var BOOTCLASSPATH=$boot" ]] &&
+  grep -q 'cannot read /data/system/environ/classpath (exit 1: .*No such file.*), scanning with the base environment' "$m/out" ||
+  { ok=1; echo "  no classpath: rc $rc $(tr '\n' '|' < "$m/out")"; }
+mv "$m/classpath" "$m/guest/data/system/environ/classpath"
+res $ok "music helper: a scan that times out (rc 124) unfrozen is logged and rc 0, MediaProvider goes on; a scan with no output and rc 0 is rc 1; no guest classpath scans with the base environment and logs the stderr"
 
 ok=0
 rm -rf "${m:?}/guest/mnt"
+minfo
 printf 'populated 1\nfrozen 1\n' > "$m/payload/cgroup.events"
-(sleep 2; printf 'populated 1\nfrozen 0\n' > "$m/payload/cgroup.events"; sleep 0.5; mkdir -p "$m/guest$pass") &
+(sleep 2; up; sleep 0.5; mkdir -p "$m/guest$pass") &
 s0=$(date +%s%3N)
 mrun
 s1=$(date +%s%3N)
@@ -605,7 +669,25 @@ wait
 res $ok "music helper: a frozen payload gets no guest call until it thaws, and the frozen time does not count against the wait"
 
 ok=0
-rm -f "${m:?}/guest$pass/.mounted"
+minfo
+echo __ready > "$m/hang"
+mrun
+[[ $rc == 0 && $(wc -l < "$m/hung") == 1 && $(cat "$m/calls" 2> /dev/null) == "mount --bind $m/guest$media $m/guest$pass"$'\n'"$scan" ]] &&
+  grep -q 'Android is frozen, waiting for the thaw' "$m/out" && [[ ! -e $m/frozen-call ]] || { ok=1; echo "  ready hang: rc $rc $(tr '\n' '|' < "$m/out")"; }
+echo /system/bin/cat > "$m/hang"
+mrun
+[[ $rc == 0 && $(wc -l < "$m/hung") == 1 && $(tail -n 1 "$m/attach") == "$full" ]] && grep -q 'scanned external_primary' "$m/out" ||
+  { ok=1; echo "  classpath hang: rc $rc $(tr '\n' '|' < "$m/out")"; }
+echo scan_volume > "$m/hang"
+mrun
+[[ $rc == 0 && $(wc -l < "$m/hung") == 1 && $(cat "$m/calls" 2> /dev/null) == "$scan" ]] && grep -q 'scanned external_primary' "$m/out" &&
+  [[ ! -e $m/frozen-call ]] || { ok=1; echo "  scan hang: rc $rc $(tr '\n' '|' < "$m/out")"; }
+up
+res $ok "music helper: a guest call that times out while Android is frozen waits for the thaw and runs once more, for the ready check, the classpath read and the scan"
+
+ok=0
+rm -f "${m:?}/mountinfo"
+minfo
 : > "$m/mountfail"
 mrun
 [[ $rc == 1 && $(cat "$m/calls" 2> /dev/null) == "mount --bind $m/guest$media $m/guest$pass" ]] &&
@@ -616,6 +698,39 @@ mrun
 [[ $rc == 1 && ! -e $m/calls ]] && grep -q "did not appear in the guest within 2 s" "$m/out" &&
   (($(wc -l < "$m/shell") >= 2)) || { ok=1; echo "  no pass_through: rc $rc $(cat "$m/out")"; }
 res $ok "music helper: a failed mount and a pass_through dir that never appears are rc 1 with the reason, and nothing is scanned"
+
+ok=0
+(sleep 1.5; printf 'populated 0\nfrozen 0\n' > "$m/payload/cgroup.events") &
+s0=$(date +%s%3N)
+mrun BLOCKIE_ANDROID_MUSIC_WAIT=10
+s1=$(date +%s%3N)
+wait
+[[ $rc == 0 && ! -e $m/calls ]] && grep -qx 'blockie-android-music: Android stopped' "$m/out" && ((s1 - s0 < 5000)) ||
+  { ok=1; echo "  stopped in the wait: rc $rc $((s1 - s0)) ms $(tr '\n' '|' < "$m/out")"; }
+up
+mkdir -p "$m/guest$pass"
+minfo
+: > "$m/mountfail"
+: > "$m/stoponmount"
+mrun
+[[ $rc == 0 && $(cat "$m/calls" 2> /dev/null) == "mount --bind $m/guest$media $m/guest$pass" ]] && grep -qx 'blockie-android-music: Android stopped' "$m/out" ||
+  { ok=1; echo "  stopped in the bind: rc $rc $(tr '\n' '|' < "$m/out")"; }
+rm -f "${m:?}/mountfail" "${m:?}/stoponmount"
+up
+: > "$m/scanempty"
+: > "$m/stoponscan"
+mrun
+[[ $rc == 0 && $(tail -n 1 "$m/calls" 2> /dev/null) == "$scan" ]] && grep -qx 'blockie-android-music: Android stopped' "$m/out" ||
+  { ok=1; echo "  stopped in the scan: rc $rc $(tr '\n' '|' < "$m/out")"; }
+rm -f "${m:?}/scanempty" "${m:?}/stoponscan"
+printf 'populated 1\nfrozen 1\n' > "$m/payload/cgroup.events"
+(sleep 1; printf 'populated 0\nfrozen 0\n' > "$m/payload/cgroup.events") &
+mrun
+wait
+[[ $rc == 0 && ! -e $m/shell ]] && grep -qx 'blockie-android-music: Android stopped' "$m/out" ||
+  { ok=1; echo "  frozen then stopped: rc $rc $(tr '\n' '|' < "$m/out")"; }
+up
+res $ok "music helper: Android stopping during the wait, a failed bind or a failed scan, or while frozen, ends the helper with rc 0 and the stop message"
 
 d=$t/pad
 mkdir -p "$d/bin" "$d/guest/bin" "$d/payload"
@@ -634,7 +749,24 @@ echo "\$*" >> "$d/shell"
 if [ "\$1" = sh ] && [ "\$2" = -c ]; then
   set -- sh -c "\$(printf '%s' "\$3" | sed 's|/dev/|$d/guest/dev/|g')"
 fi
-PATH=$d/guest/bin:\$PATH "\$@" 2>&1 | sed 's/\$/\r/'
+{ PATH=$d/guest/bin:\$PATH "\$@"; echo \$? > "$d/attach.rc"; } | sed 's/\$/\r/'
+exit \$(cat "$d/attach.rc")
+EOF
+cat > "$d/bin/timeout" << EOF
+#!/bin/sh
+h=\$(cat "$d/hang" 2> /dev/null)
+if [ -n "\$h" ]; then
+  case "\$*" in
+    *"\$h"*)
+      rm -f "$d/hang"
+      echo "\$*" >> "$d/hung"
+      printf 'populated 1\nfrozen 1\n' > "$d/payload/cgroup.events"
+      (sleep 1; printf 'populated 1\nfrozen 0\n' > "$d/payload/cgroup.events") > /dev/null 2>&1 &
+      exit 124
+      ;;
+  esac
+fi
+exec $(command -v timeout) "\$@"
 EOF
 printf '#!/bin/sh\necho "waydroid $*" >> "%s/waydroid"\n' "$d" > "$d/bin/waydroid"
 cat > "$d/guest/bin/mknod" << EOF
@@ -657,7 +789,7 @@ done
 printf '#!/bin/sh\n[ "$1" = input ] && [ -e "%s/dumpsys" ] && cat "%s/dumpsys"\n' "$d" "$d" > "$d/guest/bin/dumpsys"
 chmod 755 "$d/bin/"* "$d/guest/bin/"*
 drun() {
-  rm -f "${d:?}/shell" "${d:?}/calls" "${d:?}/frozen-call" "${d:?}/attach" "${d:?}/waydroid"
+  rm -f "${d:?}/shell" "${d:?}/calls" "${d:?}/frozen-call" "${d:?}/attach" "${d:?}/waydroid" "${d:?}/hung"
   env PATH="$d/bin:$PATH" BLOCKIE_ANDROID_PAYLOAD="$d/payload" BLOCKIE_ANDROID_PAD="$d/pad" BLOCKIE_ANDROID_PAD_WAIT=2 \
     BLOCKIE_ANDROID_PAD_LIST_WAIT=2 "$@" timeout 30 "$lx/blockie-android-pad" > "$d/out" 2>&1
   rc=$?
@@ -744,7 +876,7 @@ s0=$(date +%s%3N)
 drun BLOCKIE_ANDROID_PAD_WAIT=10
 s1=$(date +%s%3N)
 wait
-[[ $rc == 0 && ! -e $d/calls ]] && grep -q 'Android stopped, nothing to make' "$d/out" && ((s1 - s0 < 5000)) ||
+[[ $rc == 0 && ! -e $d/calls ]] && grep -qx 'blockie-android-pad: Android stopped' "$d/out" && ((s1 - s0 < 5000)) ||
   { ok=1; echo "  stopped in the dir wait: rc $rc $((s1 - s0)) ms $(tr '\n' '|' < "$d/out")"; }
 printf 'populated 1\nfrozen 0\n' > "$d/payload/cgroup.events"
 mkdir -p "$g/input"
@@ -754,7 +886,7 @@ s0=$(date +%s%3N)
 drun BLOCKIE_ANDROID_PAD_LIST_WAIT=10
 s1=$(date +%s%3N)
 wait
-[[ $rc == 0 && $(sed -n 2p "$d/calls" 2> /dev/null) == "mknod -m 0660 $g/.blockie-pad c 1 7" ]] && grep -q 'Android stopped, nothing to make' "$d/out" &&
+[[ $rc == 0 && $(sed -n 2p "$d/calls" 2> /dev/null) == "mknod -m 0660 $g/.blockie-pad c 1 7" ]] && grep -qx 'blockie-android-pad: Android stopped' "$d/out" &&
   ((s1 - s0 < 5000)) || { ok=1; echo "  stopped in the list wait: rc $rc $((s1 - s0)) ms $(tr '\n' '|' < "$d/out")"; }
 echo '      Path: /dev/input/event-pad' > "$d/dumpsys"
 res $ok "pad helper: Android stopping during the /dev/input wait or the dumpsys wait ends the helper with rc 0"
@@ -772,6 +904,30 @@ wait
   { ok=1; echo "  frozen: rc $rc $((s1 - s0)) ms $(tr '\n' '|' < "$d/out")"; }
 [[ ! -e $d/frozen-call ]] || { ok=1; echo "  guest called while frozen: $(tr '\n' '|' < "$d/frozen-call")"; }
 res $ok "pad helper: a frozen payload gets no guest call until it thaws, and the frozen time does not count against the wait"
+
+ok=0
+rm -f "${g:?}/input/event-pad"
+echo mknod > "$d/hang"
+drun
+[[ $rc == 0 && $(wc -l < "$d/hung") == 1 && $(grep -c '^mknod ' "$d/calls") == 1 && -f $g/input/event-pad ]] &&
+  grep -q 'Android is frozen, waiting for the thaw' "$d/out" && grep -q 'made /dev/input/event-pad' "$d/out" && [[ ! -e $d/frozen-call ]] ||
+  { ok=1; echo "  make hang: rc $rc $(tr '\n' '|' < "$d/out")"; }
+echo 'dumpsys input' > "$d/hang"
+drun
+[[ $rc == 0 && $(wc -l < "$d/hung") == 1 ]] && grep -q 'the input service has /dev/input/event-pad' "$d/out" ||
+  { ok=1; echo "  dumpsys hang: rc $rc $(tr '\n' '|' < "$d/out")"; }
+printf 'populated 1\nfrozen 0\n' > "$d/payload/cgroup.events"
+res $ok "pad helper: a guest call that times out while Android is frozen waits for the thaw and runs once more, for the make and the dumpsys check"
+
+ok=0
+printf 'populated 1\nfrozen 1\n' > "$d/payload/cgroup.events"
+(sleep 1; printf 'populated 0\nfrozen 0\n' > "$d/payload/cgroup.events") &
+drun
+wait
+[[ $rc == 0 && ! -e $d/shell ]] && grep -qx 'blockie-android-pad: Android stopped' "$d/out" ||
+  { ok=1; echo "  frozen then stopped: rc $rc $(tr '\n' '|' < "$d/out")"; }
+printf 'populated 1\nfrozen 0\n' > "$d/payload/cgroup.events"
+res $ok "pad helper: Android stopping while frozen ends the helper with rc 0 and no guest call"
 
 h=$t/hooks
 mkdir -p "$h/bin" "$h/run" "$h/rundir" "$h/sys/class/leds/lcd-backlight" "$h/payload"

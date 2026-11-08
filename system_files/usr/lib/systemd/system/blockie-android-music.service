@@ -1,6 +1,7 @@
 [Unit]
 Description=Bind the music library into the FUSE lower filesystem of Android and scan it
 After=waydroid-container.service
+PartOf=waydroid-container.service
 CollectMode=inactive-or-failed
 
 [Service]

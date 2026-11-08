@@ -10,18 +10,40 @@ path=/product/bin:/apex/com.android.runtime/bin:/apex/com.android.art/bin:/syste
 node=/dev/input/event-pad
 tmp=/dev/.blockie-pad
 die() { echo "$me: $*" >&2; exit 1; }
-guest() {
+attach() {
   local t=$1
   shift
-  timeout "$t" lxc-attach -P /var/lib/waydroid/lxc -n waydroid --clear-env --set-var "PATH=$path" \
-    --set-var ANDROID_ROOT=/system --set-var ANDROID_DATA=/data -- "$@" < /dev/null 2>&1 | tr -d '\r'
-  return "${PIPESTATUS[0]}"
+  out=$(timeout "$t" lxc-attach -P /var/lib/waydroid/lxc -n waydroid --clear-env --set-var "PATH=$path" \
+    --set-var ANDROID_ROOT=/system --set-var ANDROID_DATA=/data -- "$@" < /dev/null 2> "$errf" |
+    tr -d '\r'; exit "${PIPESTATUS[0]}")
+  rc=$?
+  err=$(tr -d '\r' < "$errf")
 }
-ready() { guest 10 sh -c '[ -d /dev/input ] && echo __ready' | grep -qx __ready; }
-opened() { guest 10 dumpsys input | grep -F "$node" > /dev/null; }
+guest() {
+  attach "$@"
+  if ((rc == 124)) && frozen; then
+    end=$((end + $1))
+    thawed
+    attach "$@"
+  fi
+  return "$rc"
+}
+said() {
+  local s=$out${out:+${err:+ }}$err
+  s=${s//$'\n'/ }
+  echo "${s:-no output}"
+}
+ready() {
+  guest 10 sh -c '[ -d /dev/input ] && echo __ready'
+  grep -qx __ready <<< "$out"
+}
+opened() {
+  guest 10 dumpsys input
+  grep -qF "$node" <<< "$out"
+}
 live() {
   grep -qx 'populated 1' "$payload/cgroup.events" 2> /dev/null && return
-  echo "$me: Android stopped, nothing to make"
+  echo "$me: Android stopped"
   exit 0
 }
 frozen() { grep -qx 'frozen 1' "$payload/cgroup.events" 2> /dev/null; }
@@ -47,12 +69,14 @@ read -r maj min < <(stat -L -c '%t %T' "$pad")
 [[ ${maj:-} =~ ^[0-9a-f]+$ && ${min:-} =~ ^[0-9a-f]+$ ]] || die "cannot read the device number of $pad"
 maj=$((16#$maj))
 min=$((16#$min))
+errf=$(mktemp) || die "cannot make a temporary file"
+trap 'rm -f "$errf"' EXIT
 
 echo "$me: waiting up to $wait s for /dev/input in the guest"
 end=$((SECONDS + wait))
 thawed
 until ready; do
-  live
+  thawed
   ((SECONDS < end)) || die "/dev/input did not appear in the guest within $wait s"
   sleep 1
   thawed
@@ -60,20 +84,20 @@ done
 
 thawed
 want="$(printf '%x %x' "$maj" "$min") root input 660"
-out=$(guest 10 sh -c "if [ -c $node ] && [ \"\$(stat -L -c '%t %T %U %G %a' $node)\" = '$want' ]; then echo __already; elif rm -f $node $tmp && mknod -m 0660 $tmp c $maj $min && chown root:input $tmp && ln $tmp $node && rm $tmp; then echo __made; fi")
+guest 10 sh -c "if [ -c $node ] && [ \"\$(stat -L -c '%t %T %U %G %a' $node)\" = '$want' ]; then echo __already; elif rm -f $node $tmp && mknod -m 0660 $tmp c $maj $min && chown root:input $tmp && ln $tmp $node && rm $tmp; then echo __made; fi"
 if grep -qx __already <<< "$out"; then
   echo "$me: $node is already c $maj:$min root:input 0660 in the guest"
 elif grep -qx __made <<< "$out"; then
   echo "$me: made $node as c $maj:$min root:input 0660 in the guest"
 else
   live
-  die "cannot make $node in the guest: ${out:-no output}"
+  die "cannot make $node in the guest: $(said)"
 fi
 
 end=$((SECONDS + listwait))
 thawed
 until opened; do
-  live
+  thawed
   ((SECONDS < end)) || die "the input service did not list $node within $listwait s"
   sleep 1
   thawed
