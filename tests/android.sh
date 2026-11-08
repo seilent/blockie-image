@@ -45,6 +45,11 @@ const cases = [
   [units, "blockie", "blockie-android-music.service", "restart", "none"],
   [units, "blockie", "blockie-android-music@x.service", "start", "none"],
   [units, "other", "blockie-android-music.service", "start", "none"],
+  [units, "blockie", "blockie-android-pad.service", "start", "yes"],
+  [units, "blockie", "blockie-android-pad.service", "stop", "none"],
+  [units, "blockie", "blockie-android-pad.service", "restart", "none"],
+  [units, "blockie", "blockie-android-pad@x.service", "start", "none"],
+  [units, "other", "blockie-android-pad.service", "start", "none"],
   [units, "blockie", "blockie-android-prep.service", "start", "none"],
   [units, "blockie", "lxc.service", "start", "none"],
   [units, "other", "waydroid-container.service", "start", "none"],
@@ -72,7 +77,7 @@ process.exit(bad ? 1 : 0);
 EOF
   local rc=$?
   [[ $rc == 0 ]] || sed 's/^/  /' "$t/polkit.out"
-  res $rc "polkit: blockie may start and stop waydroid-container and start the two freeze instances and the music unit, nothing else"
+  res $rc "polkit: blockie may start and stop waydroid-container and start the two freeze instances, the music and the pad unit, nothing else"
 }
 
 if [[ ${1:-} == polkit ]]; then
@@ -90,10 +95,11 @@ fi
 
 ok=0
 for f in blockie-android-prep blockie-android-lxcd blockie-android-freeze blockie-android-check blockie-android-run \
-  blockie-android-music; do
+  blockie-android-music blockie-android-pad; do
   [[ -f $lx/$f && $(stat -c %a "$lx/$f") == 755 ]] || { ok=1; echo "  $f"; }
 done
 bash -n "$lx/blockie-android-lxcd" && bash -n "$lx/blockie-android-check" && bash -n "$lx/blockie-android-music" &&
+  bash -n "$lx/blockie-android-pad" &&
   sh -n "$lx/blockie-android-freeze" || ok=1
 for f in blockie-android-prep blockie-android-run; do
   python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$lx/$f" || ok=1
@@ -138,6 +144,12 @@ for l in After=waydroid-container.service CollectMode=inactive-or-failed Type=on
   grep -qxF "$l" "$f" || { ok=1; echo "  music: $l"; }
 done
 ! grep -q '^\[Install\]' "$f" || { ok=1; echo "  music has [Install]"; }
+f=$sd/blockie-android-pad.service
+for l in After=waydroid-container.service PartOf=waydroid-container.service CollectMode=inactive-or-failed Type=oneshot \
+  TimeoutStartSec=infinity ExecStart=/usr/libexec/blockie/blockie-android-pad; do
+  grep -qxF "$l" "$f" || { ok=1; echo "  pad: $l"; }
+done
+! grep -q '^\[Install\]' "$f" || { ok=1; echo "  pad has [Install]"; }
 au=$ud/blockie-android.service
 for l in 'UnsetEnvironment=LD_PRELOAD LD_LIBRARY_PATH VK_DRIVER_FILES' \
   Environment=XDG_DATA_HOME=/var/lib/blockie/data/android/user ExecStart=/usr/libexec/blockie/blockie-android-run \
@@ -149,11 +161,11 @@ done
   { ok=1; echo "  user unit ExecStartPre order"; }
 ! grep -q '^\[Install\]' "$au" || { ok=1; echo "  user unit has [Install]"; }
 systemd-analyze verify --man=no $sd/waydroid-container.service $sd/blockie-android-prep.service $sd/blockie-android-prep.path \
-  $sd/blockie-data.service $sd/blockie-android-music.service > "$t/verify" 2>&1 || { ok=1; sed 's/^/  /' "$t/verify"; }
+  $sd/blockie-data.service $sd/blockie-android-music.service $sd/blockie-android-pad.service > "$t/verify" 2>&1 || { ok=1; sed 's/^/  /' "$t/verify"; }
 xdg=$t/xdg
 mkdir -p "$xdg"
 XDG_RUNTIME_DIR=$xdg systemd-analyze verify --user --man=no "$au" > "$t/verify" 2>&1 || { ok=1; sed 's/^/  /' "$t/verify"; }
-res $ok "units: prep after data and again on a stamp change, the container after prep with the generator and a bounded clean stop, the freeze instances conflict, the music oneshot after the container with no [Install], the user unit starts and stops the container"
+res $ok "units: prep after data and again on a stamp change, the container after prep with the generator and a bounded clean stop, the freeze instances conflict, the music and pad oneshots after the container with no [Install], the pad one part of it, the user unit starts and stops the container"
 
 ok=0
 [[ $(readlink /usr/share/waydroid-extra/images) == /var/lib/blockie/data/android/images ]] || { ok=1; echo "  images link"; }
@@ -166,10 +178,12 @@ rule=/usr/lib/udev/rules.d/62-blockie-pad.rules
 ! udevadm verify --help > /dev/null 2>&1 || udevadm verify --resolve-names=never "$rule" > /dev/null 2>&1 ||
   { ok=1; echo "  udevadm verify"; }
 base=/usr/lib/waydroid/data/configs/config_base
-for f in devices pad music memory; do
+for f in devices music memory; do
   grep -qxF "lxc.include = /run/blockie-android/lxc.d/$f.conf" "$base" || { ok=1; echo "  config_base lacks $f.conf"; }
 done
-res $ok "image: the images link to data, no D-Bus activation, no /var/lib/waydroid, the pad link rule, the four includes"
+! grep -q 'pad\.conf' "$base" || { ok=1; echo "  config_base includes pad.conf"; }
+! grep -rqs 'event-pad' /usr/lib/waydroid || { ok=1; echo "  an event-pad entry in /usr/lib/waydroid"; }
+res $ok "image: the images link to data, no D-Bus activation, no /var/lib/waydroid, the pad link rule, the three includes and no pad bind"
 
 kl=/usr/share/blockie/android/Vendor_4001_Product_0428.kl
 want='key 305   BUTTON_A
@@ -416,15 +430,15 @@ $a 1:7 rwm"
 ok=0
 lrun
 [[ $rc == 0 && $(cat "$l/run/lxc.d/devices.conf") == "$want" ]] || { ok=1; echo "  devices: rc $rc"; diff <(echo "$want") "$l/run/lxc.d/devices.conf"; }
-[[ $(cat "$l/run/lxc.d/pad.conf") == "lxc.mount.entry = $l/pad dev/input/event-pad none bind,create=file 0 0" ]] || { ok=1; echo "  pad.conf"; }
+[[ ! -e $l/run/lxc.d/pad.conf ]] || { ok=1; echo "  pad.conf written"; }
 [[ $(cat "$l/run/lxc.d/memory.conf") == $'lxc.cgroup2.memory.high = 1900M\nlxc.cgroup2.memory.max = 2200M' ]] || { ok=1; echo "  memory.conf"; }
 [[ $(cat "$l/run/lxc.d/music.conf") == "lxc.mount.entry = $l/data/music data/media/0/Music none bind,ro,create=dir,optional 0 0" ]] ||
   { ok=1; echo "  music.conf"; }
-res $ok "lxcd: deny all first, then c rules with rwm for the base nodes, the binder, dma_heap and pmsg char majors, the misc minors and the pad; the pad bind; the read only music bind; memory high and max"
+res $ok "lxcd: deny all first, then c rules with rwm for the base nodes, the binder, dma_heap and pmsg char majors, the misc minors and the pad; no pad.conf; the read only music bind; memory high and max"
 
 ok=0
 lrun BLOCKIE_ANDROID_NODEVICES=1
-[[ $rc == 0 && -f $l/run/lxc.d/devices.conf && ! -s $l/run/lxc.d/devices.conf && -s $l/run/lxc.d/pad.conf && -s $l/run/lxc.d/memory.conf ]] ||
+[[ $rc == 0 && -f $l/run/lxc.d/devices.conf && ! -s $l/run/lxc.d/devices.conf && ! -e $l/run/lxc.d/pad.conf && -s $l/run/lxc.d/memory.conf ]] ||
   { ok=1; echo "  nodevices: rc $rc"; }
 rmdir "${l:?}/data/music"
 lrun
@@ -439,10 +453,16 @@ mkdir "$l/data/android/guest/data/media/0"
 rm -f "${l:?}/pad"
 sed -i '/ binder$/d' "$l/proc/devices"
 lrun
-[[ $rc == 0 && ! -s $l/run/lxc.d/pad.conf && $(tail -n 1 "$l/run/lxc.d/devices.conf") == "$a 10:200 rwm" ]] &&
-  ! grep -q '488:' "$l/run/lxc.d/devices.conf" && grep -q 'no binder major' "$l/out" || { ok=1; echo "  no pad: rc $rc"; }
+[[ $rc == 0 && ! -e $l/run/lxc.d/pad.conf && $(tail -n 1 "$l/run/lxc.d/devices.conf") == "$a 10:200 rwm" ]] &&
+  ! grep -q '488:' "$l/run/lxc.d/devices.conf" && grep -q 'no binder major' "$l/out" &&
+  grep -q 'no pad at .*, Android starts without it' "$l/out" || { ok=1; echo "  no pad: rc $rc"; }
+: > "$l/pad"
+lrun
+[[ $rc == 0 && $(tail -n 1 "$l/run/lxc.d/devices.conf") == "$a 10:200 rwm" ]] && grep -q 'no pad at .*, Android starts without it' "$l/out" ||
+  { ok=1; echo "  regular file pad: rc $rc"; }
+rm -f "${l:?}/pad"
 ln -s /dev/full "$l/pad"
-res $ok "lxcd: BLOCKIE_ANDROID_NODEVICES=1 writes devices.conf empty; no music/ or no guest /data/media/0 yet gives an empty music.conf; no pad gives an empty pad.conf and no pad rule; a missing major is logged and left out"
+res $ok "lxcd: BLOCKIE_ANDROID_NODEVICES=1 writes devices.conf empty; no music/ or no guest /data/media/0 yet gives an empty music.conf; no pad or a pad that is no char device gives no pad rule and no pad.conf; a missing major is logged and left out"
 
 ok=0
 mkdir -p "$l/payload/a/b" "$l/payload/c"
@@ -597,6 +617,162 @@ mrun
   (($(wc -l < "$m/shell") >= 2)) || { ok=1; echo "  no pass_through: rc $rc $(cat "$m/out")"; }
 res $ok "music helper: a failed mount and a pass_through dir that never appears are rc 1 with the reason, and nothing is scanned"
 
+d=$t/pad
+mkdir -p "$d/bin" "$d/guest/bin" "$d/payload"
+cat > "$d/bin/lxc-attach" << EOF
+#!/bin/sh
+a=
+while [ \$# -gt 0 ] && [ "\$1" != -- ]; do
+  a="\$a \$1"
+  shift
+done
+[ "\$1" = -- ] || exit 2
+shift
+echo "\${a# }" >> "$d/attach"
+echo "\$*" >> "$d/shell"
+! grep -qx 'frozen 1' "$d/payload/cgroup.events" || echo "\$*" >> "$d/frozen-call"
+if [ "\$1" = sh ] && [ "\$2" = -c ]; then
+  set -- sh -c "\$(printf '%s' "\$3" | sed 's|/dev/|$d/guest/dev/|g')"
+fi
+PATH=$d/guest/bin:\$PATH "\$@" 2>&1 | sed 's/\$/\r/'
+EOF
+printf '#!/bin/sh\necho "waydroid $*" >> "%s/waydroid"\n' "$d" > "$d/bin/waydroid"
+cat > "$d/guest/bin/mknod" << EOF
+#!/bin/sh
+echo "mknod \$*" >> "$d/calls"
+[ ! -e "$d/mknodfail" ] || { echo 'mknod: Operation not permitted' >&2; exit 1; }
+[ "\$1" = -m ] || exit 1
+: > "\$3"
+$(command -v chmod) "\$2" "\$3"
+EOF
+cat > "$d/guest/bin/stat" << EOF
+#!/bin/sh
+[ ! -e "$d/stat" ] || exec cat "$d/stat"
+exec $(command -v stat) "\$@"
+EOF
+printf '#!/bin/sh\necho "chown $*" >> "%s/calls"\n' "$d" > "$d/guest/bin/chown"
+for c in ln rm; do
+  printf '#!/bin/sh\necho "%s $*" >> "%s/calls"\nexec %s "$@"\n' "$c" "$d" "$(command -v "$c")" > "$d/guest/bin/$c"
+done
+printf '#!/bin/sh\n[ "$1" = input ] && [ -e "%s/dumpsys" ] && cat "%s/dumpsys"\n' "$d" "$d" > "$d/guest/bin/dumpsys"
+chmod 755 "$d/bin/"* "$d/guest/bin/"*
+drun() {
+  rm -f "${d:?}/shell" "${d:?}/calls" "${d:?}/frozen-call" "${d:?}/attach" "${d:?}/waydroid"
+  env PATH="$d/bin:$PATH" BLOCKIE_ANDROID_PAYLOAD="$d/payload" BLOCKIE_ANDROID_PAD="$d/pad" BLOCKIE_ANDROID_PAD_WAIT=2 \
+    BLOCKIE_ANDROID_PAD_LIST_WAIT=2 "$@" timeout 30 "$lx/blockie-android-pad" > "$d/out" 2>&1
+  rc=$?
+}
+g=$d/guest/dev
+attach='-P /var/lib/waydroid/lxc -n waydroid --clear-env --set-var PATH=/product/bin:/apex/com.android.runtime/bin:/apex/com.android.art/bin:/system_ext/bin:/system/bin:/system/xbin:/odm/bin:/vendor/bin:/vendor/xbin --set-var ANDROID_ROOT=/system --set-var ANDROID_DATA=/data'
+ln -s /dev/full "$d/pad"
+ok=0
+rmdir "${d:?}/payload"
+drun
+[[ $rc == 0 && ! -e $d/shell ]] && grep -q 'no running Android payload' "$d/out" || { ok=1; echo "  no payload: rc $rc"; }
+mkdir "$d/payload"
+printf 'populated 0\nfrozen 0\n' > "$d/payload/cgroup.events"
+drun
+[[ $rc == 0 && ! -e $d/shell ]] || { ok=1; echo "  not populated: rc $rc"; }
+printf 'populated 1\nfrozen 0\n' > "$d/payload/cgroup.events"
+rm -f "${d:?}/pad"
+drun
+[[ $rc == 0 && ! -e $d/shell ]] && grep -q "no pad at $d/pad, Android runs without it" "$d/out" || { ok=1; echo "  no pad: rc $rc"; }
+: > "$d/pad"
+drun
+[[ $rc == 0 && ! -e $d/shell ]] && grep -q "no pad at $d/pad, Android runs without it" "$d/out" || { ok=1; echo "  regular file pad: rc $rc"; }
+rm -f "${d:?}/pad"
+ln -s /dev/full "$d/pad"
+res $ok "pad helper: no populated payload, no host pad or a pad that is no char device exits 0 and runs nothing in the guest"
+
+ok=0
+mkdir -p "$g/input"
+echo '      Path: /dev/input/event-pad' > "$d/dumpsys"
+drun
+want="rm -f $g/input/event-pad $g/.blockie-pad
+mknod -m 0660 $g/.blockie-pad c 1 7
+chown root:input $g/.blockie-pad
+ln $g/.blockie-pad $g/input/event-pad
+rm $g/.blockie-pad"
+[[ $rc == 0 && $(cat "$d/calls" 2> /dev/null) == "$want" && -f $g/input/event-pad && ! -e $g/.blockie-pad &&
+  $(stat -c %a "$g/input/event-pad") == 660 ]] || { ok=1; echo "  make: rc $rc"; diff <(echo "$want") "$d/calls"; }
+[[ $(grep mknod "$d/shell") == *'mknod -m 0660 /dev/.blockie-pad c 1 7 && chown root:input /dev/.blockie-pad && ln /dev/.blockie-pad /dev/input/event-pad && rm /dev/.blockie-pad; then echo __made'* ]] &&
+  ! grep -q chmod "$d/shell" || { ok=1; echo "  shell: $(tr '\n' '|' < "$d/shell")"; }
+grep -q 'made /dev/input/event-pad as c 1:7 root:input 0660 in the guest' "$d/out" && grep -q 'the input service has /dev/input/event-pad' "$d/out" &&
+  [[ $(tail -n 1 "$d/shell") == 'dumpsys input' ]] || { ok=1; echo "  make out: $(tr '\n' '|' < "$d/out")"; }
+[[ $(sort -u "$d/attach") == "$attach" && ! -e $d/waydroid ]] || { ok=1; echo "  attach: $(sort -u "$d/attach" | tr '\n' '|')"; }
+res $ok "pad helper: attaches with lxc-attach and the Android PATH, never waydroid shell; makes the node with mknod -m 0660 outside /dev/input, chowns it root:input, hard links it in and removes the first name, then finds it in dumpsys input"
+
+ok=0
+rm -f "${g:?}/input/event-pad"
+ln -s /dev/full "$g/input/event-pad"
+echo '1 7 root input 660' > "$d/stat"
+drun
+[[ $rc == 0 && ! -e $d/calls ]] && grep -q 'is already c 1:7 root:input 0660 in the guest' "$d/out" && grep -q 'the input service has' "$d/out" ||
+  { ok=1; echo "  already: rc $rc $(tr '\n' '|' < "$d/out")"; }
+for s in '1 7 root input 666' '1 7 root root 660' '1 3 root input 660'; do
+  rm -f "${g:?}/input/event-pad"
+  ln -s /dev/full "$g/input/event-pad"
+  echo "$s" > "$d/stat"
+  drun
+  [[ $rc == 0 && $(sed -n 2p "$d/calls" 2> /dev/null) == "mknod -m 0660 $g/.blockie-pad c 1 7" && ! -L $g/input/event-pad ]] &&
+    grep -q 'made /dev/input/event-pad' "$d/out" || { ok=1; echo "  $s: rc $rc $(tr '\n' '|' < "$d/calls")"; }
+done
+rm -f "${d:?}/stat"
+res $ok "pad helper: a node with the pad's number, root:input and 660 is left alone; another mode, group or number is made again"
+
+ok=0
+rm -f "${d:?}/dumpsys"
+drun
+[[ $rc == 1 ]] && grep -q 'the input service did not list /dev/input/event-pad within 2 s' "$d/out" &&
+  (($(grep -cx 'dumpsys input' "$d/shell") >= 2)) || { ok=1; echo "  not listed: rc $rc $(tr '\n' '|' < "$d/out")"; }
+echo '      Path: /dev/input/event-pad' > "$d/dumpsys"
+rm -f "${g:?}/input/event-pad"
+: > "$d/mknodfail"
+drun
+[[ $rc == 1 && ! -e $g/input/event-pad ]] && grep -q 'cannot make /dev/input/event-pad in the guest: mknod: Operation not permitted' "$d/out" &&
+  ! grep -qx 'dumpsys input' "$d/shell" || { ok=1; echo "  mknod fails: rc $rc $(tr '\n' '|' < "$d/out")"; }
+rm -f "${d:?}/mknodfail"
+rm -rf "${g:?}/input"
+drun
+[[ $rc == 1 && ! -e $d/calls ]] && grep -q '/dev/input did not appear in the guest within 2 s' "$d/out" &&
+  (($(wc -l < "$d/shell") >= 2)) || { ok=1; echo "  no /dev/input: rc $rc $(tr '\n' '|' < "$d/out")"; }
+res $ok "pad helper: a node dumpsys input does not list within the list wait, a failed mknod and a /dev/input that never appears are rc 1 with the reason"
+
+ok=0
+(sleep 1.5; printf 'populated 0\nfrozen 0\n' > "$d/payload/cgroup.events") &
+s0=$(date +%s%3N)
+drun BLOCKIE_ANDROID_PAD_WAIT=10
+s1=$(date +%s%3N)
+wait
+[[ $rc == 0 && ! -e $d/calls ]] && grep -q 'Android stopped, nothing to make' "$d/out" && ((s1 - s0 < 5000)) ||
+  { ok=1; echo "  stopped in the dir wait: rc $rc $((s1 - s0)) ms $(tr '\n' '|' < "$d/out")"; }
+printf 'populated 1\nfrozen 0\n' > "$d/payload/cgroup.events"
+mkdir -p "$g/input"
+rm -f "${d:?}/dumpsys"
+(sleep 1.5; printf 'populated 0\nfrozen 0\n' > "$d/payload/cgroup.events") &
+s0=$(date +%s%3N)
+drun BLOCKIE_ANDROID_PAD_LIST_WAIT=10
+s1=$(date +%s%3N)
+wait
+[[ $rc == 0 && $(sed -n 2p "$d/calls" 2> /dev/null) == "mknod -m 0660 $g/.blockie-pad c 1 7" ]] && grep -q 'Android stopped, nothing to make' "$d/out" &&
+  ((s1 - s0 < 5000)) || { ok=1; echo "  stopped in the list wait: rc $rc $((s1 - s0)) ms $(tr '\n' '|' < "$d/out")"; }
+echo '      Path: /dev/input/event-pad' > "$d/dumpsys"
+res $ok "pad helper: Android stopping during the /dev/input wait or the dumpsys wait ends the helper with rc 0"
+
+ok=0
+rm -rf "${g:?}/input"
+printf 'populated 1\nfrozen 1\n' > "$d/payload/cgroup.events"
+(sleep 2; printf 'populated 1\nfrozen 0\n' > "$d/payload/cgroup.events"; sleep 0.5; mkdir -p "$g/input") &
+s0=$(date +%s%3N)
+drun
+s1=$(date +%s%3N)
+wait
+[[ $rc == 0 && $(sed -n 2p "$d/calls" 2> /dev/null) == "mknod -m 0660 $g/.blockie-pad c 1 7" ]] &&
+  grep -q 'Android is frozen, waiting for the thaw' "$d/out" && ((s1 - s0 >= 1800)) ||
+  { ok=1; echo "  frozen: rc $rc $((s1 - s0)) ms $(tr '\n' '|' < "$d/out")"; }
+[[ ! -e $d/frozen-call ]] || { ok=1; echo "  guest called while frozen: $(tr '\n' '|' < "$d/frozen-call")"; }
+res $ok "pad helper: a frozen payload gets no guest call until it thaws, and the frozen time does not count against the wait"
+
 h=$t/hooks
 mkdir -p "$h/bin" "$h/run" "$h/rundir" "$h/sys/class/leds/lcd-backlight" "$h/payload"
 cat > "$h/bin/systemctl" << EOF
@@ -702,9 +878,9 @@ cat > "$r/bin/systemctl" << EOF
 #!/bin/sh
 case "\$*" in
   is-system-running) cat "$r/system" 2> /dev/null || echo running ;;
-  'start --no-block blockie-android-music.service')
+  'start --no-block blockie-android-music.service' | 'start --no-block blockie-android-pad.service')
     echo "\$*" >> "$r/starts"
-    [ ! -f "$r/start.hang" ] || exec sleep 30
+    [ ! -f "$r/start.hang" ] || [ "\$3" != blockie-android-pad.service ] || exec sleep 30
     [ ! -f "$r/start.rc" ] || { echo 'Access denied' >&2; exit \$(cat "$r/start.rc"); }
     ;;
   *) cat "$r/unit" 2> /dev/null || echo active ;;
@@ -760,11 +936,13 @@ until_ '[[ $(cat "$r/setting" 2> /dev/null) == 2147483647 ]] && grep -q "screen_
   { ok=1; echo "  not set"; }
 [[ $(cat "$r/calls" 2> /dev/null) == $'get 1 screen_off_timeout\nput 1 screen_off_timeout 2147483647\nget 1 screen_off_timeout' ]] ||
   { ok=1; echo "  calls: $(tr '\n' '|' < "$r/calls")"; }
-until_ '[[ -e $r/starts ]]' || { ok=1; echo "  music unit not started"; }
-[[ $(cat "$r/starts" 2> /dev/null) == 'start --no-block blockie-android-music.service' ]] || { ok=1; echo "  starts: $(tr '\n' '|' < "$r/starts")"; }
+until_ 'grep -q "started blockie-android-music.service" "$r/out"' || { ok=1; echo "  music unit not started"; }
+[[ $(cat "$r/starts" 2> /dev/null) == $'start --no-block blockie-android-pad.service\nstart --no-block blockie-android-music.service' ]] ||
+  { ok=1; echo "  starts: $(tr '\n' '|' < "$r/starts")"; }
 s1=$(grep -n 'screen_off_timeout is 2147483647' "$r/out" | cut -d: -f1)
 m1=$(grep -n 'started blockie-android-music.service' "$r/out" | cut -d: -f1)
-[[ -n $s1 && -n $m1 ]] && ((s1 < m1)) || { ok=1; echo "  music before screen_off_timeout: $(tr '\n' '|' < "$r/out")"; }
+p1=$(grep -n 'started blockie-android-pad.service' "$r/out" | cut -d: -f1)
+[[ -n $s1 && -n $m1 && -n $p1 ]] && ((s1 < p1 && p1 < m1)) || { ok=1; echo "  pad and music before screen_off_timeout: $(tr '\n' '|' < "$r/out")"; }
 kill -0 "$rp" 2> /dev/null || { ok=1; echo "  run ended early"; }
 t0=${EPOCHREALTIME//[!0-9]/}
 cg 0
@@ -772,7 +950,7 @@ rwait
 ms=$(((${EPOCHREALTIME//[!0-9]/} - t0) / 1000))
 [[ $rc == 1 && $(grep -c term "$r/ui") == 1 ]] && grep -q 'the Android payload ended$' "$r/out" && ((ms < 2000)) ||
   { ok=1; echo "  dead: rc $rc $ms ms"; }
-res $ok "run: after boot_completed screen_off_timeout is read, set and read back once, then the music unit is started once without waiting; populated 0 ends the unit with rc 1 at once ($ms ms) and stops show-full-ui"
+res $ok "run: after boot_completed screen_off_timeout is read, set and read back once, then the pad and music units are started once each in that order without waiting; populated 0 ends the unit with rc 1 at once ($ms ms) and stops show-full-ui"
 
 ok=0
 rsetup
@@ -785,6 +963,7 @@ rstart
 until_ 'grep -q "screen_off_timeout is 2147483647" "$r/out"' 200 || ok=1
 [[ $(cat "$r/calls" 2> /dev/null) == $'get 1 screen_off_timeout\nget 1 screen_off_timeout' ]] || { ok=1; echo "  calls: $(tr '\n' '|' < "$r/calls")"; }
 until_ 'grep -q "cannot start blockie-android-music.service (exit 1): Access denied" "$r/out"' || { ok=1; echo "  start failure not logged"; }
+until_ 'grep -q "cannot start blockie-android-pad.service (exit 1): Access denied" "$r/out"' || { ok=1; echo "  pad start failure not logged"; }
 sleep 0.3
 kill -0 "$rp" 2> /dev/null || { ok=1; echo "  a failed music start ended the unit"; }
 kill -TERM "$rp"
@@ -796,9 +975,10 @@ echo 2147483647 > "$r/setting"
 : > "$r/start.hang"
 cg 1
 rstart
-until_ 'grep -q "cannot start blockie-android-music.service (no answer in 10 s)" "$r/out"' 300 ||
+until_ 'grep -q "cannot start blockie-android-pad.service (no answer in 10 s)" "$r/out"' 300 ||
   { ok=1; echo "  hung start not logged"; }
-kill -0 "$rp" 2> /dev/null || { ok=1; echo "  a hung music start ended the unit"; }
+until_ 'grep -q "started blockie-android-music.service" "$r/out"' || { ok=1; echo "  music unit not started after the hung pad start"; }
+kill -0 "$rp" 2> /dev/null || { ok=1; echo "  a hung pad start ended the unit"; }
 kill -TERM "$rp"
 rwait
 rsetup
@@ -820,14 +1000,14 @@ cg 1
 rstart
 until_ 'grep -q "after 3 tries, the next session tries again" "$r/out"' 300 || ok=1
 [[ $(grep -c '^put' "$r/calls" 2> /dev/null) == 3 && ! -e $r/setting ]] || { ok=1; echo "  give up: $(tr '\n' '|' < "$r/calls")"; }
-until_ '[[ -e $r/starts ]]' || { ok=1; echo "  music unit not started after the give up"; }
+until_ 'grep -q "started blockie-android-music.service" "$r/out"' || { ok=1; echo "  pad and music units not started after the give up"; }
 sleep 0.3
-[[ $(wc -l < "$r/starts") == 1 ]] || { ok=1; echo "  starts: $(tr '\n' '|' < "$r/starts")"; }
+[[ $(wc -l < "$r/starts") == 2 ]] || { ok=1; echo "  starts: $(tr '\n' '|' < "$r/starts")"; }
 kill -0 "$rp" 2> /dev/null || { ok=1; echo "  a failed set ended the unit"; }
 kill -TERM "$rp"
 rwait
 [[ $rc == 0 ]] || { ok=1; echo "  term: rc $rc"; }
-res $ok "run: no put when the value is already set; a put that does not read back is tried again, at most 3 times per session, and never ends the unit; the music unit still starts once, and a refused start or one with no answer in 10 s is logged and keeps the unit running"
+res $ok "run: no put when the value is already set; a put that does not read back is tried again, at most 3 times per session, and never ends the unit; the pad and music units still start once each, and a refused start or one with no answer in 10 s is logged, keeps the unit running and does not hold back the next start"
 
 ok=0
 rsetup

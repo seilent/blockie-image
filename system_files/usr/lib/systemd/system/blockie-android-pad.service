@@ -1,0 +1,10 @@
+[Unit]
+Description=Make the gamepad node in Android after boot
+After=waydroid-container.service
+PartOf=waydroid-container.service
+CollectMode=inactive-or-failed
+
+[Service]
+Type=oneshot
+TimeoutStartSec=infinity
+ExecStart=/usr/libexec/blockie/blockie-android-pad

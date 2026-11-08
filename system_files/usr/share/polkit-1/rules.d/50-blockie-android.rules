@@ -10,7 +10,7 @@ polkit.addRule(function(action, subject) {
   if (verb == "start" && (unit == "blockie-android-freeze@freeze.service" || unit == "blockie-android-freeze@thaw.service")) {
     return polkit.Result.YES;
   }
-  if (verb == "start" && unit == "blockie-android-music.service") {
+  if (verb == "start" && (unit == "blockie-android-music.service" || unit == "blockie-android-pad.service")) {
     return polkit.Result.YES;
   }
 });

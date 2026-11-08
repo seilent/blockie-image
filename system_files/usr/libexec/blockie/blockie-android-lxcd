@@ -51,11 +51,13 @@ for n in ashmem fuse uhid tun; do
     echo "$me: no $n minor in $proc/misc"
   fi
 done
-mount=
-if [[ -e $pad ]]; then
-  read -r maj min < <(stat -L -c '%t %T' "$pad")
+maj=
+min=
+if [[ -c $pad ]]; then
+  read -r maj min < <(stat -L -c '%t %T' "$pad") || true
+fi
+if [[ $maj =~ ^[0-9a-f]+$ && $min =~ ^[0-9a-f]+$ ]]; then
   rules+=("$((16#$maj)):$((16#$min))")
-  mount="lxc.mount.entry = $pad dev/input/event-pad none bind,create=file 0 0"$'\n'
 else
   echo "$me: no pad at $pad, Android starts without it"
 fi
@@ -79,7 +81,6 @@ else
   done
 fi
 put devices.conf "$devices"
-put pad.conf "$mount"
 put music.conf "$music"
 put memory.conf $'lxc.cgroup2.memory.high = 1900M\nlxc.cgroup2.memory.max = 2200M\n'
 echo "$me: wrote $out"

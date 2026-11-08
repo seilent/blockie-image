@@ -109,17 +109,17 @@ def shutting_down():
     return r.stdout.strip() == "stopping"
 
 
-def music():
+def start(unit):
     try:
-        r = subprocess.run(["systemctl", "start", "--no-block", "blockie-android-music.service"],
+        r = subprocess.run(["systemctl", "start", "--no-block", unit],
                            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)
     except subprocess.TimeoutExpired:
-        log("cannot start blockie-android-music.service (no answer in 10 s)")
+        log(f"cannot start {unit} (no answer in 10 s)")
         return
     if r.returncode == 0:
-        log("started blockie-android-music.service")
+        log(f"started {unit}")
     else:
-        log(f"cannot start blockie-android-music.service (exit {r.returncode}): {r.stderr.strip()}")
+        log(f"cannot start {unit} (exit {r.returncode}): {r.stderr.strip()}")
 
 
 def run(argv, **kw):
@@ -224,7 +224,8 @@ def main():
                     put = None
                     last = now
                     if settled:
-                        music()
+                        start("blockie-android-pad.service")
+                        start("blockie-android-music.service")
             elif boot is not None:
                 if boot.poll() is not None:
                     out = boot.stdout.read().split()
