@@ -1,0 +1,21 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: seilent <github@seilent.net>
+Date: Sat, 7 Nov 2026 00:30:00 +0900
+Subject: [PATCH] wext: drop events for a device that is not registered
+
+---
+ net/wireless/wext-core.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+--- a/net/wireless/wext-core.c
++++ b/net/wireless/wext-core.c
+@@ -470,6 +470,9 @@ void wireless_send_event(struct net_device *	dev,
+ 	struct sk_buff *compskb;
+ #endif
+ 
++	if (dev->reg_state != NETREG_REGISTERED)
++		return;
++
+ 	/*
+ 	 * Nothing in the kernel sends scan events with data, be safe.
+ 	 * This is necessary because we cannot fix up scan event data
