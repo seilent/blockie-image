@@ -1,0 +1,13 @@
+{
+  "owner": "blockie-set",
+  "keys": {
+    "system.timezone": {
+      "type": "s",
+      "default": "UTC",
+      "enum_from": "zones",
+      "backend": "timedate1",
+      "group": "system",
+      "label": "Time zone"
+    }
+  }
+}

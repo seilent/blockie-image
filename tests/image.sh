@@ -68,6 +68,17 @@ rpm -q e2fsprogs tzdata erofs-utils vulkan-tools egl-utils drm-utils strace file
   alsa-utils retroarch libretro-mgba libretro-pcsx-rearmed kmscube glmark2 > /dev/null || fail "packages missing"
 [[ $(readlink /etc/localtime) == ../usr/share/zoneinfo/Asia/Tokyo && -f /usr/share/zoneinfo/Asia/Tokyo ]] ||
   fail "/etc/localtime is not Asia/Tokyo"
+[[ -f /usr/share/zoneinfo/zone.tab ]] || fail "zone.tab missing"
+jq -e '.keys["system.timezone"] | .backend == "timedate1" and .enum_from == "zones"' \
+  /usr/share/blockie/schema.d/10-system.json > /dev/null || fail "10-system.json lacks the timedate1 system.timezone key"
+[[ $(stat -c '%a %U' /usr/share/polkit-1/rules.d/50-blockie-timezone.rules 2> /dev/null) == '644 root' ]] ||
+  fail "50-blockie-timezone.rules is not a 644 file owned by root"
+grep -q 'id="org.freedesktop.timedate1.set-timezone"' /usr/share/polkit-1/actions/org.freedesktop.timedate1.policy ||
+  fail "the timedate1 policy has no set-timezone action"
+[[ -x /usr/lib/systemd/systemd-timedated && -f /usr/lib/systemd/system/systemd-timedated.service &&
+  $(readlink /etc/systemd/system/systemd-timedated.service) != /dev/null &&
+  $(readlink /etc/systemd/system/dbus-org.freedesktop.timedate1.service) != /dev/null ]] ||
+  fail "systemd-timedated is missing or masked"
 for id in gambatte nestopia mgba pcsx_rearmed snes9x genesis_plus_gx mupen64plus_next ppsspp flycast; do
   so=/usr/lib64/libretro/${id}_libretro.so
   pkg=libretro-${id//_/-}

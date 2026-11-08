@@ -22,6 +22,12 @@ STORE = os.environ.get("BLOCKIE_SETD_STORE", "/var/lib/blockie/settings/settings
 SESSIONS = os.environ.get("BLOCKIE_SETD_SESSIONS", "/etc/blockie/sessions.d:/usr/lib/blockie/sessions.d").split(":")
 BUS = os.environ.get("BLOCKIE_SETD_BUS", "system")
 WRITERS = os.environ.get("BLOCKIE_SETD_WRITERS", "root blockie").split()
+LOCALTIME = os.environ.get("BLOCKIE_SETD_LOCALTIME", "/etc/localtime")
+ZONETAB = os.environ.get("BLOCKIE_SETD_ZONETAB", "/usr/share/zoneinfo/zone.tab")
+TIMEDATE_MS = int(os.environ.get("BLOCKIE_SETD_TIMEDATE_MS", "4000"))
+TIMEDATE = "org.freedesktop.timedate1"
+TIMEDATE_PATH = "/org/freedesktop/timedate1"
+ZONEINFO = ("../usr/share/zoneinfo/", "/usr/share/zoneinfo/")
 TYPES = {"s": str, "b": bool, "i": int, "u": int, "d": float}
 RANGES = {"i": (-2**31, 2**31 - 1), "u": (0, 2**32 - 1)}
 SESSION_NAME = re.compile(r"[a-z0-9][a-z0-9-]*")
@@ -82,6 +88,33 @@ def default_sessions():
     return sorted(n for n, ok in found.items() if ok)
 
 
+def zones():
+    found = {"UTC"}
+    try:
+        with open(ZONETAB) as f:
+            for line in f:
+                fields = line.split("\t")
+                name = fields[2].strip() if len(fields) >= 3 else ""
+                if name and not line.startswith("#"):
+                    found.add(name)
+    except OSError as err:
+        log(f"cannot read {ZONETAB}: {err}")
+    return found
+
+
+def read_zone():
+    try:
+        target = os.readlink(LOCALTIME)
+    except FileNotFoundError:
+        return "UTC"
+    except OSError:
+        return ""
+    for prefix in ZONEINFO:
+        if target.startswith(prefix):
+            return target[len(prefix):]
+    return ""
+
+
 def load_schema():
     keys = {}
     for path in sorted(glob.glob(os.path.join(glob.escape(SCHEMAS), "*.json"))):
@@ -97,6 +130,11 @@ def load_schema():
                 continue
             if not isinstance(spec, dict) or spec.get("type") not in TYPES:
                 log(f"{path}: {key} has no valid type, ignored")
+                continue
+            if "backend" in spec and (spec["backend"] != "timedate1" or spec["type"] != "s"
+                                      or spec.get("enum_from") != "zones"
+                                      or any("backend" in s for s in keys.values())):
+                log(f"{path}: {key} is not the one timedate1 key of type s with enum_from zones, ignored")
                 continue
             try:
                 spec["default"] = check(key, spec, spec.get("default"), defaults=True)
@@ -128,6 +166,8 @@ def check(key, spec, value, defaults=False):
         allowed = default_sessions()
         if value not in allowed:
             raise Refused("Invalid", f"{key} is one of the default sessions: {', '.join(allowed) or 'none'}")
+    if spec.get("enum_from") == "zones" and not defaults and value not in zones():
+        raise Refused("Invalid", f"{value} is not a zone.tab zone")
     return value
 
 
@@ -150,6 +190,9 @@ class Store:
             if spec is None:
                 log(f"{STORE}: {key} is not in the schema, dropped")
                 continue
+            if "backend" in spec:
+                log(f"{STORE}: {key} is kept by {spec['backend']}, dropped")
+                continue
             try:
                 self.values[key] = check(key, spec, value)
             except Refused as err:
@@ -159,6 +202,8 @@ class Store:
         spec = self.keys.get(key)
         if spec is None:
             raise Refused("UnknownKey", f"no key {key}")
+        if spec.get("backend") == "timedate1":
+            return read_zone()
         return self.values.get(key, spec["default"])
 
     def set(self, key, value):
@@ -200,6 +245,124 @@ class Store:
             raise
 
 
+class Timezone:
+    def __init__(self, bus, key):
+        self.bus = bus
+        self.key = key
+        self.pending = False
+        self.inv = None
+        self.timer = 0
+        self.settle_id = 0
+        self.monitor = Gio.File.new_for_path(LOCALTIME).monitor_file(Gio.FileMonitorFlags.WATCH_MOVES, None)
+        self.monitor.connect("changed", self.event)
+        self.last_sent = read_zone()
+
+    def event(self, monitor, file, other, kind):
+        if self.settle_id:
+            GLib.source_remove(self.settle_id)
+        self.settle_id = GLib.timeout_add(100, self.settle)
+
+    def settle(self):
+        self.settle_id = 0
+        self.sync()
+        return GLib.SOURCE_REMOVE
+
+    def sync(self):
+        zone = read_zone()
+        if zone != self.last_sent:
+            self.last_sent = zone
+            self.bus.emit_signal(None, PATH, IFACE, "Changed",
+                                 GLib.Variant("(sv)", (self.key, GLib.Variant("s", zone))))
+
+    def set(self, spec, value, inv, uid):
+        if self.pending:
+            raise Refused("Busy", f"{self.key} is busy, a SetTimezone is pending")
+        check(self.key, spec, value)
+        if read_zone() == value:
+            inv.return_value(None)
+            return
+        self.pending = True
+        self.inv = inv
+        self.want = value
+        self.uid = uid
+        self.resynced = False
+        self.deadline = GLib.get_monotonic_time() + 2 * TIMEDATE_MS * 1000
+        self.timer = GLib.timeout_add(TIMEDATE_MS, self.late)
+        try:
+            self.request(value, self.applied)
+        except Exception as err:
+            log(f"SetTimezone {value} failed: {err!r}")
+            self.finish("Failed", "SetTimezone failed")
+
+    def late(self):
+        self.timer = 0
+        log(f"SetTimezone {self.want}: no answer in {TIMEDATE_MS} ms")
+        self.answer("Timeout", f"timedated did not answer in {TIMEDATE_MS} ms")
+        return GLib.SOURCE_REMOVE
+
+    def request(self, zone, then):
+        left = (self.deadline - GLib.get_monotonic_time()) // 1000
+        if left <= 0:
+            self.finish("Timeout", f"timedated did not answer in {TIMEDATE_MS} ms")
+            return
+        self.bus.call(TIMEDATE, TIMEDATE_PATH, TIMEDATE, "SetTimezone", GLib.Variant("(sb)", (zone, False)), None,
+                      Gio.DBusCallFlags.NONE, left, None, self.reply, (zone, then))
+
+    def reply(self, conn, res, data):
+        zone, then = data
+        try:
+            conn.call_finish(res)
+        except GLib.Error as err:
+            if err.matches(Gio.io_error_quark(), Gio.IOErrorEnum.TIMED_OUT):
+                log(f"SetTimezone {zone}: no answer")
+                self.finish("Timeout", f"timedated did not answer in {TIMEDATE_MS} ms")
+            else:
+                name = Gio.dbus_error_get_remote_error(err) or err.message
+                log(f"SetTimezone {zone}: {name}")
+                self.finish("Failed", f"SetTimezone {zone}: {name}")
+            self.sync()
+            return
+        try:
+            self.sync()
+            then()
+        except Exception as err:
+            log(f"SetTimezone {zone} failed: {err!r}")
+            self.finish("Failed", "SetTimezone failed")
+
+    def applied(self):
+        zone = read_zone()
+        if zone == self.want:
+            log(f"{self.key} set by uid {self.uid}")
+            self.finish()
+        elif not self.resynced:
+            self.resynced = True
+            bounce = zone or ("UTC" if self.want != "UTC" else "")
+            if not bounce:
+                log(f"{self.key}: link is not a zoneinfo link after SetTimezone {self.want}")
+                self.finish("Failed", "link is not a zoneinfo link after SetTimezone")
+                return
+            self.request(bounce, lambda: self.request(self.want, self.applied))
+        else:
+            log(f"{self.key}: link is {zone} after SetTimezone {self.want}")
+            self.finish("Failed", f"link is {zone} after SetTimezone")
+
+    def answer(self, kind=None, msg=None):
+        if self.inv is None:
+            return
+        if kind:
+            self.inv.return_dbus_error(f"{ERR}.{kind}", msg)
+        else:
+            self.inv.return_value(None)
+        self.inv = None
+
+    def finish(self, kind=None, msg=None):
+        if self.timer:
+            GLib.source_remove(self.timer)
+            self.timer = 0
+        self.pending = False
+        self.answer(kind, msg)
+
+
 class Service:
     def __init__(self, bus, store):
         self.bus = bus
@@ -210,6 +373,7 @@ class Service:
                 self.writers.add(pwd.getpwnam(name).pw_uid)
             except KeyError:
                 log(f"writer {name} is not a user, skipped")
+        self.backends = {k: Timezone(bus, k) for k, s in store.keys.items() if s.get("backend") == "timedate1"}
         info = Gio.DBusNodeInfo.new_for_xml(XML).interfaces[0]
         bus.register_object(PATH, info, self.call, None, None)
 
@@ -243,6 +407,11 @@ class Service:
                 spec = self.store.keys.get(key)
                 if spec is not None and got != spec["type"]:
                     raise Refused("Invalid", f"{key} takes {spec['type']}, not {got}")
+                if key in self.backends:
+                    if spec.get("writable", True) is False:
+                        raise Refused("ReadOnly", f"{key} is read only")
+                    self.backends[key].set(spec, value, inv, uid)
+                    return
                 if self.store.set(key, value):
                     spec = self.store.keys[key]
                     log(f"{key} set by uid {uid}")
