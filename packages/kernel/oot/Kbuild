@@ -1,1 +1,2 @@
 obj-m := softdog.o hci_vhci.o
+obj-m += blockie_kbase_pidns.o
