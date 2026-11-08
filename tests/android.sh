@@ -418,7 +418,7 @@ printf '#!/bin/sh\n[ -e "%s/mounted" ]\n' "$l" > "$l/bin/mountpoint"
 chmod 755 "$l/bin/mountpoint"
 : > "$l/mounted"
 echo ok > "$l/run/state"
-printf 'Character devices:\n  1 mem\n  5 /dev/tty\n 10 misc\n 13 input\n136 pts\n488 binder\n489 dma_heap\n\nBlock devices:\n  7 loop\n490 binder\n' \
+printf 'Character devices:\n  1 mem\n  5 /dev/tty\n 10 misc\n 13 input\n136 pts\n488 binder\n489 dma_heap\n491 pmsg\n\nBlock devices:\n  7 loop\n490 binder\n492 pmsg\n' \
   > "$l/proc/devices"
 printf ' 59 ashmem\n229 fuse\n239 uhid\n200 tun\n 61 binder\n' > "$l/proc/misc"
 ln -s /dev/full "$l/pad"
@@ -442,6 +442,7 @@ $a 5:2 rwm
 $a 136:* rwm
 $a 488:* rwm
 $a 489:* rwm
+$a 491:* rwm
 $a 10:59 rwm
 $a 10:229 rwm
 $a 10:239 rwm
@@ -451,8 +452,8 @@ ok=0
 lrun
 [[ $rc == 0 && $(cat "$l/run/lxc.d/devices.conf") == "$want" ]] || { ok=1; echo "  devices: rc $rc"; diff <(echo "$want") "$l/run/lxc.d/devices.conf"; }
 [[ $(cat "$l/run/lxc.d/pad.conf") == "lxc.mount.entry = $l/pad dev/input/event-pad none bind,create=file 0 0" ]] || { ok=1; echo "  pad.conf"; }
-[[ $(cat "$l/run/lxc.d/memory.conf") == $'lxc.cgroup2.memory.high = 1600M\nlxc.cgroup2.memory.max = 1900M' ]] || { ok=1; echo "  memory.conf"; }
-res $ok "lxcd: deny all first, then c rules with rwm for the base nodes, the binder and dma_heap majors, the misc minors and the pad; the pad bind; memory high and max"
+[[ $(cat "$l/run/lxc.d/memory.conf") == $'lxc.cgroup2.memory.high = 1900M\nlxc.cgroup2.memory.max = 2200M' ]] || { ok=1; echo "  memory.conf"; }
+res $ok "lxcd: deny all first, then c rules with rwm for the base nodes, the binder, dma_heap and pmsg char majors, the misc minors and the pad; the pad bind; memory high and max"
 
 ok=0
 lrun BLOCKIE_ANDROID_NODEVICES=1

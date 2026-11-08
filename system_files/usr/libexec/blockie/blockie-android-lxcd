@@ -35,7 +35,7 @@ put() {
 
 install -d -m 0755 "$out"
 rules=(1:3 1:5 1:7 1:8 1:9 1:11 5:0 5:1 5:2 '136:*')
-for n in binder dma_heap; do
+for n in binder dma_heap pmsg; do
   m=$(major "$n")
   if [[ -n $m ]]; then
     rules+=("$m:*")
@@ -71,5 +71,5 @@ else
 fi
 put devices.conf "$devices"
 put pad.conf "$mount"
-put memory.conf $'lxc.cgroup2.memory.high = 1600M\nlxc.cgroup2.memory.max = 1900M\n'
+put memory.conf $'lxc.cgroup2.memory.high = 1900M\nlxc.cgroup2.memory.max = 2200M\n'
 echo "$me: wrote $out"
