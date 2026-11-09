@@ -118,6 +118,25 @@ cmp -s <(printf '%s\n' 'gambatte_gb_colorization = "auto"' 'gambatte_gb_internal
   'gambatte_gbc_color_correction = "always"' 'gambatte_mix_frames = "lcd_ghosting"') "$ra/core/gambatte.opt" || fail "core/gambatte.opt"
 cmp -s <(printf '%s\n' 'mgba_interframe_blending = "mix_smart"') "$ra/core/mgba.opt" || fail "core/mgba.opt"
 grep -qxF 'menu_show_load_content_animation = "false"' "$ra/blockie.cfg" || fail "the load content animation is not off"
+! grep -HE '^input_[a-z0-9_]+ = "f1[345]"|^input_[a-z0-9_]+_btn = "10"' "$ra/blockie.cfg" "$ra"/autoconfig/udev/*.cfg \
+  "$ra"/core/*.cfg || fail "a shipped RetroArch config binds f13 to f15 or joypad button 10"
+kr=/usr/lib/udev/rules.d/61-blockie-keys.rules
+[[ $(grep -c . "$kr") == 2 ]] || fail "61-blockie-keys.rules is not two lines"
+[[ $(sed -n 1p "$kr") == 'ACTION!="remove", SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="odm:gpio_keys", ENV{KEYBOARD_KEY_1}="f14", ENV{KEYBOARD_KEY_2}="f13", ENV{KEYBOARD_KEY_3}="f15", ENV{.BLOCKIE_KEYS}="1"' ]] ||
+  fail "61-blockie-keys.rules line 1 is not the gpio-keys match with indexes 1 to 3 on f14, f13, f15 and the marker"
+[[ $(sed -n 2p "$kr") == 'ENV{.BLOCKIE_KEYS}=="1", IMPORT{builtin}="keyboard"' ]] ||
+  fail "61-blockie-keys.rules line 2 is not the keyboard builtin on the marker alone"
+[[ $(grep -c 'ENV{KEYBOARD_KEY_.*IMPORT\|IMPORT.*ENV{KEYBOARD_KEY_' "$kr") == 0 ]] ||
+  fail "an IMPORT shares a line with ENV{KEYBOARD_KEY_"
+[[ $(grep -o 'KEYBOARD_KEY_[0-9a-f]*' "$kr" | sort | paste -sd ' ') == 'KEYBOARD_KEY_1 KEYBOARD_KEY_2 KEYBOARD_KEY_3' ]] ||
+  fail "61-blockie-keys.rules maps other indexes than 1 to 3 (index 0 is volume down)"
+[[ ! -e /usr/lib/blockie/hotkeys.d/emulation.conf.d/50-game.conf ]] || fail "50-game.conf is still shipped"
+for f in /usr/lib/sysctl.d/*.conf /usr/local/lib/sysctl.d/*.conf /etc/sysctl.d/*.conf /etc/sysctl.conf; do
+  [[ -f $f ]] || continue
+  while read -r v; do
+    [[ $v == 0 || $v == 16 ]] || fail "$f sets kernel.sysrq to $v"
+  done < <(sed -n 's/^[[:space:]]*-\{0,1\}kernel[./]sysrq[[:space:]]*=[[:space:]]*\([^[:space:]]*\).*/\1/p' "$f")
+done
 [[ -f /usr/lib/firmware/regulatory.db ]] || fail "regulatory.db missing"
 
 jq -e '. == {

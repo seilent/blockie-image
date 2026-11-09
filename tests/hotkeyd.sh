@@ -9,6 +9,8 @@ runner=${HOOK_BIN:-/usr/libexec/blockie/blockie-hook}
 [[ -x $runner ]] || runner=$here/../system_files/usr/libexec/blockie/blockie-hook
 tables=/usr/lib/blockie/hotkeys.d
 [[ -d $tables ]] || tables=$here/../system_files/usr/lib/blockie/hotkeys.d
+schema=/usr/share/blockie/schema.d/30-buttons.json
+[[ -f $schema ]] || schema=$here/../system_files/usr/share/blockie/schema.d/30-buttons.json
 t=$(mktemp -d "${TMPDIR:-/tmp}/hotkeyd.XXXXXX")
 fails=0
 trap 'rm -rf "${t:?}"' EXIT
@@ -82,6 +84,7 @@ run() {
   mkfifo "$t/fifo"
   BLOCKIE_HOTKEYD_INPUT=$t/fifo BLOCKIE_HOTKEYD_DRY=1 BLOCKIE_HOTKEYD_LONG_MS=300 \
     BLOCKIE_HOTKEYD_TABLES="${TABLES:-$t/usr:$t/etc}" BLOCKIE_HOTKEYD_CURRENT=$t/current \
+    BLOCKIE_HOTKEYD_BUTTONS="${MAP:-$t/nomap}" \
     BLOCKIE_HOTKEYD_SLEEP=$t/fbin/fake-sleep BLOCKIE_HOTKEYD_SYSFS=$t/psys BLOCKIE_HOTKEYD_MENU=$t/fbin/fake-menu \
     timeout -k 5 20 python3 "$bin" > "$t/out" 2> "$t/err" &
   local pid=$!
@@ -137,12 +140,68 @@ run 'echo home down; sleep 0.1; printf "x\n" > /dev/null; echo home down; echo h
 [[ $(cat "$t/out") == "action home tap switch test-b" ]]
 res $? "a second down without an up starts a new press, so its release is a tap"
 
+layout() {
+  local a b
+  declare -A x=([home.tap]=none [home.hold]=switcher [extra1.tap]=none [extra1.hold]=none [extra2.tap]=none
+    [extra2.hold]=none [extra3.tap]=game-menu [extra3.hold]=game-quit)
+  for a in "${@:2}"; do
+    x[${a%%=*}]=${a#*=}
+  done
+  {
+    echo 'version 1'
+    for b in home extra1 extra2 extra3; do
+      echo "$b tap ${x[$b.tap]}"
+      echo "$b hold ${x[$b.hold]}"
+      if [[ ${x[$b.tap]} == none && ${x[$b.hold]} == none ]]; then echo "$b free yes"; else echo "$b free no"; fi
+    done
+  } > "$1.new" && mv -f "$1.new" "$1"
+}
+
 printf 'emulation 1 1\n' > "$t/current"
-TABLES=$tables run 'echo extra3 down; sleep 0.1; echo extra3 up; echo extra3 down; sleep 0.5; echo extra3 up
-  echo home down; sleep 0.5; echo home up; echo extra1 down; sleep 0.5; echo extra1 up'
-[[ $(cat "$t/out") == $'action extra3 tap hook game-menu\naction extra3 hold hook game-quit\naction home hold switcher' ]] &&
-  ! grep -q ignored "$t/err"
-res $? "emulation: the shipped rows give logo tap game-menu and hold game-quit, home hold stays the switcher, extra1 has no row"
+both='echo home down; sleep 0.5; echo home up; echo extra3 down; sleep 0.1; echo extra3 up; echo extra3 down; sleep 0.5; echo extra3 up'
+TABLES=$tables run "$both; echo extra1 down; sleep 0.5; echo extra1 up; $both"
+[[ ! -e $tables ]] && ! grep -q ignored "$t/err" && [[ $(cat "$t/out") == $'action home hold switcher\naction extra3 tap hook game-menu\naction extra3 hold hook game-quit\naction home hold switcher\naction extra3 tap hook game-menu\naction extra3 hold hook game-quit' &&
+  $(grep -c "no $t/nomap: the built in button defaults apply" "$t/err") == 1 ]]
+r=$?
+printf 'android 1 1\n' > "$t/current"
+TABLES=$tables run "$both"
+[[ $r == 0 && $(cat "$t/out") == "action home hold switcher" ]]
+res $? "map: none, the shipped hotkeys.d absent: the built in defaults, home hold the switcher, logo tap and hold the game hooks in emulation only, extra1 nothing, logged once"
+
+printf 'emulation 1 1\n' > "$t/current"
+layout "$t/map" extra1.hold=switcher home.hold=none
+MAP=$t/map TABLES=$t/none run 'echo extra1 down; sleep 0.5; echo extra1 up; echo home down; sleep 0.5; echo home up'
+[[ $(cat "$t/out") == "action extra1 hold switcher" ]] &&
+  grep -q "$t/map: home none none, extra1 none switcher, extra2 none none, extra3 game-menu game-quit" "$t/err"
+res $? "map: the switcher moved to extra1: extra1 hold fires it, home hold nothing"
+
+layout "$t/map"
+layout "$t/map.b" home.hold=none home.tap=switcher
+MAP=$t/map TABLES=$t/none run "echo home down; sleep 0.5; echo home up; sleep 0.2; mv -f '$t/map.b' '$t/map'; echo home down; sleep 0.5; echo home up"
+[[ $(cat "$t/out") == $'action home hold switcher\naction home tap switcher' ]]
+res $? "map: a map written between two presses: the second press follows it"
+
+ok=0
+for c in short bogus; do
+  layout "$t/map" extra1.hold=switcher home.hold=$([[ $c == bogus ]] && echo next || echo none)
+  [[ $c == bogus ]] || sed -i '$d' "$t/map"
+  MAP=$t/map TABLES=$t/none run 'echo extra1 down; sleep 0.5; echo extra1 up; echo home down; sleep 0.5; echo home up
+    echo home down; sleep 0.5; echo home up'
+  [[ $(cat "$t/out") == $'action home hold switcher\naction home hold switcher' &&
+    $(grep -c "$t/map is not the 13 line button map: the built in button defaults apply" "$t/err") == 1 ]] ||
+    { ok=1; echo "  $c: $(paste -sd '|' "$t/out") $(paste -sd '|' "$t/err")"; }
+done
+res $ok "map: a short map or an unknown word: the built in defaults, one log line"
+
+mkdir -p "$t/u5" "$t/e5"
+printf '%s\n' 'home tap hook u5home' 'extra2 tap hook u5extra2' 'volup tap hook u5volup' > "$t/u5/emulation.conf"
+printf 'extra1 hold hook e5extra1\n' > "$t/e5/emulation.conf"
+layout "$t/map" extra1.hold=switcher home.hold=none
+MAP=$t/map TABLES=$t/u5:@settings:$t/e5 run 'echo home down; echo home up; echo extra2 down; echo extra2 up; echo volup down
+  echo volup up; echo extra1 down; sleep 0.5; echo extra1 up; echo home down; echo home up'
+[[ $(cat "$t/out") == $'action volup tap hook u5volup\naction extra1 hold hook e5extra1' &&
+  $(grep -c "$t/u5/emulation.conf: rows for extra2, home dropped, the button settings own them" "$t/err") == 1 ]]
+res $? "@settings: button rows above the marker are dropped with one log per file version, other rows stay, a row below it beats the map"
 
 printf 'nobody-here 1 1\n' > "$t/current"
 run 'echo power down; echo power up; echo home down; sleep 0.5; echo home up; echo volup down; echo volup up
@@ -245,6 +304,7 @@ live() {
   mkfifo "$t/fifo"
   PATH=$t/fbin:$PATH BLOCKIE_HOTKEYD_INPUT=$t/fifo BLOCKIE_HOTKEYD_HOOKS=$hk BLOCKIE_HOTKEYD_LONG_MS=300 \
     BLOCKIE_HOTKEYD_HOOK_MS=${HOOK_MS:-5000} BLOCKIE_HOTKEYD_BACKSTOP_MS=${BACKSTOP_MS:-20000} BLOCKIE_HOTKEYD_TABLES=$t/usr:$t/etc BLOCKIE_HOTKEYD_CURRENT=$t/current \
+    BLOCKIE_HOTKEYD_BUTTONS="${MAP:-$t/nomap}" \
     BLOCKIE_HOTKEYD_SLEEP=$t/fbin/fake-sleep BLOCKIE_HOTKEYD_SLEPT=$t/slept BLOCKIE_HOTKEYD_SYSFS=$t/psys \
     BLOCKIE_HOTKEYD_KNOB=$t/knob BLOCKIE_HOTKEYD_HOOK_RUNNER=${RUNNER:-$runner} DBUS_SESSION_BUS_ADDRESS=unix:path=$t/nobus \
     BLOCKIE_HOTKEYD_MENU=$t/fbin/fake-menu BLOCKIE_HOTKEYD_BACKLIGHT=$t/fbin/fake-backlight BLOCKIE_BOOT_STATE=$t/boot.state \
@@ -666,6 +726,18 @@ live "sleep 0.5; echo extra3 down; echo extra3 up; sleep 0.3; $hold; sleep 0.3; 
   echo home up; echo extra3 down; echo extra3 up; sleep 0.2; $tap; sleep 1"
 [[ $(nt) == "$woke"$'\nbeep\n'"$mo"$'\nstart blank-on\nexit blank-on' ]] && termed && grep -q 'SIGTERM to blockie-powermenu' "$t/err"
 res $? "menu: volup, home hold and extra3 rows fire nothing while it is up (extra3 fires before it), a power tap SIGTERMs the child and runs blank-on"
+
+printf '#!/bin/sh\necho game-menu >> "%s"\n' "$t/hooks.log" > "$hk/game-menu"
+chmod 755 "$hk/game-menu"
+printf 'emulation 1 1\n' > "$t/current"
+layout "$t/map" extra2.tap=game-menu
+mq '0.1 shown'
+MAP=$t/map live "sleep 0.5; echo extra2 down; echo extra2 up; sleep 0.3; $hold; sleep 0.3; echo extra2 down; echo extra2 up; sleep 0.2
+  $tap; sleep 1"
+[[ $(nt) == "$woke"$'\ngame-menu\n'"$mo"$'\nstart blank-on\nexit blank-on' ]]
+res $? "menu: a button the map binds fires before the menu and nothing while it is up"
+rm -f "$hk/game-menu"
+printf 'test-m 1 1\n' > "$t/current"
 
 echo 'home tap hook beep' >> "$t/usr/test-m.conf"
 keys='echo home down; echo home up; echo home down; sleep 0.5; echo home up; echo volup down; echo volup up; echo extra3 down; echo extra3 up'
@@ -1426,6 +1498,72 @@ ok = (m.BACKSTOP_MS, m.BOOT_BACKSTOP_MS, m.SHOWN_MS, m.MENU_KILL_MS, m.TOAST_MS,
 sys.exit(0 if ok and m.TOAST_MS >= 350 + 3500 + 250 + m.POLL_MS and m.BOOT_BACKSTOP_MS > 45000 else 1)
 EOF
 res $? "defaults: the power off backstop 35000 ms (past the 25 s limit of blockie-poweroff.service), the boot unit backstop 50000 ms (past the 45 s limit of blockie-reboot@.service), the menu shown limit 5000 ms, kill 2000 ms, toast 5100 ms (toast in 350, hold 3500, out 250 plus one poll), reboot unit poll 1000 ms"
+
+BLOCKIE_HOTKEYD_CURRENT=$t/none BLOCKIE_HOTKEYD_SYSFS=$t/psys BLOCKIE_HOTKEYD_INPUT=/dev/null \
+  timeout -k 5 60 python3 - "$bin" > "$t/codes.out" 2>&1 << 'EOF'
+import contextlib
+import importlib.machinery
+import importlib.util
+import io
+import os
+import sys
+
+loader = importlib.machinery.SourceFileLoader("hotkeyd", sys.argv[1])
+spec = importlib.util.spec_from_loader("hotkeyd", loader)
+m = importlib.util.module_from_spec(spec)
+loader.exec_module(m)
+
+
+class Dev:
+    def __init__(self, caps):
+        self.name = "odm:gpio_keys"
+        self.fd, self.w = os.pipe()
+        self.caps = caps
+
+    def capabilities(self, absinfo=True):
+        return {m.evdev.ecodes.EV_KEY: self.caps}
+
+    def close(self):
+        pass
+
+
+devs = {"/dev/input/event3": Dev([0x2F0, 0x2F1, 0x2F2, 114]), "/dev/input/event4": Dev([0x2F1]),
+        "/dev/input/event5": Dev([183, 184, 185, 114]), "/dev/input/event6": Dev([183])}
+m.glob.glob = lambda pattern: sorted(devs) if pattern == "/dev/input/event*" else []
+m.evdev.InputDevice = lambda path: devs[path]
+m.Hotkeyd.physical = lambda self, real, name: True
+gpio = {0x2F1: "home", 183: "home", 0x2F0: "extra2", 184: "extra2", 0x2F2: "extra3", 185: "extra3"}
+want = {p: {**gpio, **({114: "voldown"} if 114 in devs[p].caps else {})} for p in devs}
+with contextlib.redirect_stderr(io.StringIO()):
+    d = m.Hotkeyd(m.GLib.MainLoop())
+    d.rescan()
+got = {p: d.devices[p][1] for p in d.devices}
+print(got)
+sys.exit(0 if got == want else 1)
+EOF
+r=$?
+((r == 0)) || sed 's/^/  /' "$t/codes.out"
+res $r "codes: a node named odm:gpio_keys maps both codes of home, extra2 and extra3 whether its caps list the gpio codes, F13 to F15 or one of them; voldown, one code, only when its caps list it"
+
+timeout -k 5 60 python3 - "$bin" "$schema" > "$t/bdef.out" 2>&1 << 'EOF'
+import importlib.machinery
+import importlib.util
+import json
+import sys
+
+loader = importlib.machinery.SourceFileLoader("hotkeyd", sys.argv[1])
+spec = importlib.util.spec_from_loader("hotkeyd", loader)
+m = importlib.util.module_from_spec(spec)
+loader.exec_module(m)
+with open(sys.argv[2]) as f:
+    keys = json.load(f)["keys"]
+want = {tuple(k.split(".")[1:]): v["default"] for k, v in keys.items()}
+print(m.LAYOUT_DEFAULTS, want)
+sys.exit(0 if m.LAYOUT_DEFAULTS == want and all(v["enum"] == list(m.ACTIONS) for v in keys.values()) else 1)
+EOF
+r=$?
+((r == 0)) || sed 's/^/  /' "$t/bdef.out"
+res $r "map: the built in button defaults and words equal 30-buttons.json"
 
 if (( fails )); then
   echo "hotkeyd: $fails failed"

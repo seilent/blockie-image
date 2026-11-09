@@ -13,7 +13,9 @@ gi.require_version("Gio", "2.0")
 from gi.repository import Gio, GLib
 
 ME = "blockie-hotkeyd"
-TABLES = os.environ.get("BLOCKIE_HOTKEYD_TABLES", "/usr/lib/blockie/hotkeys.d:/etc/blockie/hotkeys.d").split(":")
+TABLES = os.environ.get("BLOCKIE_HOTKEYD_TABLES",
+                        "/usr/lib/blockie/hotkeys.d:@settings:/etc/blockie/hotkeys.d").split(":")
+LAYOUT = os.environ.get("BLOCKIE_HOTKEYD_BUTTONS", "/run/blockie-set/buttons")
 HOOKS = os.environ.get("BLOCKIE_HOTKEYD_HOOKS", "/etc/blockie/hooks.d:/usr/lib/blockie/hooks.d").split(":")
 CURRENT = os.environ.get("BLOCKIE_HOTKEYD_CURRENT", "/run/blockie-session/session-current")
 INPUT = os.environ.get("BLOCKIE_HOTKEYD_INPUT")
@@ -59,25 +61,35 @@ REPEAT_MS = 100
 RESCAN_S = 2
 SWITCHER = ("net.seilent.Blockie.Switcher", "/net/seilent/Blockie/Switcher", "net.seilent.Blockie.Switcher1", "Toggle")
 KEY_POWER, KEY_VOLUMEDOWN, KEY_VOLUMEUP, BTN_MODE = 116, 114, 115, 316
+KEY_F13, KEY_F14, KEY_F15 = 183, 184, 185
 BTN_JOYSTICK, BTN_THUMBR, BTN_TOUCH, ABS_MT_POSITION_X = 0x120, 0x13E, 0x14A, 0x35
 KEYS = {
-    "home": (("odm:gpio_keys",), 0x2F1),
-    "extra1": (("AYANEO Controller",), BTN_MODE),
-    "extra2": (("odm:gpio_keys",), 0x2F0),
-    "extra3": (("odm:gpio_keys",), 0x2F2),
-    "volup": (("mtk-pmic-keys",), KEY_VOLUMEUP),
-    "voldown": (("mtk-kpd", "odm:gpio_keys"), KEY_VOLUMEDOWN),
-    "power": (("mtk-pmic-keys",), KEY_POWER),
+    "home": (("odm:gpio_keys",), (0x2F1, KEY_F13)),
+    "extra1": (("AYANEO Controller",), (BTN_MODE,)),
+    "extra2": (("odm:gpio_keys",), (0x2F0, KEY_F14)),
+    "extra3": (("odm:gpio_keys",), (0x2F2, KEY_F15)),
+    "volup": (("mtk-pmic-keys",), (KEY_VOLUMEUP,)),
+    "voldown": (("mtk-kpd", "odm:gpio_keys"), (KEY_VOLUMEDOWN,)),
+    "power": (("mtk-pmic-keys",), (KEY_POWER,)),
 }
 VIRTUAL = {("AYANEO Controller", "0019", "4001", "0428", "ayaneo-gamepad/input0")}
 ARGS = {"switcher": (0, 0), "next": (0, 0), "back": (0, 0), "switch": (1, 1), "hook": (1, 1), "unit": (1, 1),
         "call": (4, 4), "blank": (0, 1), "menu": (0, 0), "none": (0, 0)}
 GESTURES = ("tap", "hold", "press")
 DISPLAY = {"awake": "blank-off", "blanked": "blank-on", "lit-frozen": "screen-on", "menu": "menu-on"}
-DEFAULTS = {("home", "hold"): ((LONG_MS, "hold", ("switcher",)),), ("volup", "press"): ("hook", "volume-up"),
+DEFAULTS = {("volup", "press"): ("hook", "volume-up"),
             ("voldown", "press"): ("hook", "volume-down"), ("power", "tap"): ("blank",),
             ("power", "hold"): ((1000, "hold=1000", ("menu",)),
                                 (3000, "hold=3000", ("unit", "blockie-poweroff.service")))}
+SETTINGS = "@settings"
+BUTTONS = ("home", "extra1", "extra2", "extra3")
+ACTIONS = {"none": None, "switcher": ("switcher",), "game-menu": ("hook", "game-menu"),
+           "game-quit": ("hook", "game-quit")}
+ONLY = {"game-menu": "emulation", "game-quit": "emulation"}
+LAYOUT_DEFAULTS = {("home", "tap"): "none", ("home", "hold"): "switcher", ("extra1", "tap"): "none",
+                   ("extra1", "hold"): "none", ("extra2", "tap"): "none", ("extra2", "hold"): "none",
+                   ("extra3", "tap"): "game-menu", ("extra3", "hold"): "game-quit"}
+NOTED = {}
 TARGETS = ("reboot", "android", "recovery")
 EXITS = ("cancel", "screen-off", "poweroff", "failed")
 RUNNING = ("activating", "active", "deactivating", "reloading")
@@ -132,30 +144,78 @@ def valid(action, args):
     return True
 
 
-def table_files(session):
+def note(what, version, msg):
+    if what not in NOTED or NOTED[what] != version:
+        NOTED[what] = version
+        log(msg)
+
+
+def read_layout():
+    try:
+        with open(LAYOUT) as f:
+            st = os.fstat(f.fileno())
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        note(LAYOUT, None, f"no {LAYOUT}: the built in button defaults apply")
+        return dict(LAYOUT_DEFAULTS)
+    except (OSError, UnicodeDecodeError) as err:
+        note(LAYOUT, "error", f"cannot read {LAYOUT}: {err}: the built in button defaults apply")
+        return dict(LAYOUT_DEFAULTS)
+    version = (st.st_ino, st.st_size, st.st_mtime_ns)
+    rows = [line.split() for line in lines[1:]]
+    want = [(b, g) for b in BUTTONS for g in ("tap", "hold", "free")]
+    if (lines[:1] != ["version 1"] or len(rows) != len(want)
+            or any(len(r) != 3 or (r[0], r[1]) != w or r[2] not in (("yes", "no") if w[1] == "free" else ACTIONS)
+                   for r, w in zip(rows, want))):
+        note(LAYOUT, version, f"{LAYOUT} is not the 13 line button map: the built in button defaults apply")
+        return dict(LAYOUT_DEFAULTS)
+    layout = {(r[0], r[1]): r[2] for r in rows if r[1] != "free"}
+    note(LAYOUT, version, f"{LAYOUT}: " + ", ".join(f"{b} {layout[(b, 'tap')]} {layout[(b, 'hold')]}" for b in BUTTONS))
+    return layout
+
+
+def settings_lines(session, layout):
     out = []
-    if not NAME.fullmatch(session):
-        return out
-    for d in TABLES:
-        main = os.path.join(d, f"{session}.conf")
-        out.append(main)
-        out.extend(sorted(glob.glob(os.path.join(glob.escape(main) + ".d", "*.conf"))))
+    for b in BUTTONS:
+        for g in ("tap", "hold"):
+            v = layout[(b, g)]
+            if ACTIONS[v] and ONLY.get(v, session) == session:
+                out.append(f"{b} {g} {' '.join(ACTIONS[v])}")
     return out
 
 
-def load_table(session):
+def table_files(session):
+    out = []
+    for d in TABLES:
+        if d == SETTINGS:
+            out.append(d)
+        elif NAME.fullmatch(session):
+            main = os.path.join(d, f"{session}.conf")
+            out.append(main)
+            out.extend(sorted(glob.glob(os.path.join(glob.escape(main) + ".d", "*.conf"))))
+    return out if SETTINGS in out else [SETTINGS] + out
+
+
+def load_table(session, layout=None):
     table = {}
     holds = {}
+    above = False
     for path in table_files(session):
-        try:
-            with open(path) as f:
-                lines = f.read().splitlines()
-        except FileNotFoundError:
-            continue
-        except OSError as err:
-            log(f"cannot read {path}: {err}")
-            continue
+        if path == SETTINGS:
+            lines = settings_lines(session, read_layout() if layout is None else layout)
+            above = True
+        else:
+            try:
+                with open(path) as f:
+                    st = os.fstat(f.fileno())
+                    lines = f.read().splitlines()
+            except FileNotFoundError:
+                continue
+            except OSError as err:
+                log(f"cannot read {path}: {err}")
+                continue
         mine = set()
+        dropped = set()
         for n, line in enumerate(lines, 1):
             words = line.split()
             if not words or words[0].startswith("#"):
@@ -168,6 +228,9 @@ def load_table(session):
                     or (words[2] == "menu" and words[0] != "power")):
                 log(f"{path}:{n}: ignored: {line.strip()}")
                 continue
+            if path != SETTINGS and not above and words[0] in BUTTONS:
+                dropped.add(words[0])
+                continue
             if gesture != "hold":
                 table[(words[0], gesture)] = tuple(words[2:])
                 continue
@@ -175,6 +238,9 @@ def load_table(session):
                 mine.add(words[0])
                 holds[words[0]] = {}
             holds[words[0]][ms] = (words[1], tuple(words[2:]))
+        if dropped:
+            note(path, (st.st_ino, st.st_size, st.st_mtime_ns),
+                 f"{path}: rows for {', '.join(sorted(dropped))} dropped, the button settings own them")
     for key, stages in holds.items():
         table[(key, "hold")] = tuple((ms, w, row) for ms, (w, row) in sorted(stages.items()))
     for key, gesture in sorted(table):
@@ -1169,8 +1235,9 @@ class Hotkeyd:
                 self.fire(key, "tap", k.table[(key, "tap")])
         self.consider()
 
-    def keymap(self, name, codes):
-        return {code: key for key, (names, code) in KEYS.items() if name in names and code in codes}
+    def keymap(self, name, caps):
+        return {code: key for key, (names, codes) in KEYS.items() if name in names
+                for code in codes if len(codes) > 1 or code in caps}
 
     def physical(self, real, name):
         if not real.startswith(os.path.join(SYSFS, "devices") + "/"):
