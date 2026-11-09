@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 %global _build_id_links none
-%global commit 677ae6387dd8e2d18bce5dc5b57f7d61c2bcc221
-%global shortcommit 677ae63
+%global commit 01ca1aa4e75db1730779f0cdd1f0dc1dd7227aa5
+%global shortcommit 01ca1aa
 %global qrdir qrcodegen-720f62bd
 
 Name:           blockie-frontend
