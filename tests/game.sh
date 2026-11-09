@@ -22,6 +22,24 @@ res() {
 }
 
 export FAKE=$t/fake
+export BLOCKIE_GAME_BUTTONS=$t/buttons BLOCKIE_GAME_INPUT=$t/input.cfg
+bmap() {
+  local a b
+  declare -A x=([home.tap]=none [home.hold]=switcher [extra1.tap]=none [extra1.hold]=none [extra2.tap]=none
+    [extra2.hold]=none [extra3.tap]=game-menu [extra3.hold]=game-quit)
+  for a in "$@"; do
+    x[${a%%=*}]=${a#*=}
+  done
+  {
+    echo 'version 1'
+    for b in home extra1 extra2 extra3; do
+      echo "$b tap ${x[$b.tap]}"
+      echo "$b hold ${x[$b.hold]}"
+      if [[ ${x[$b.tap]} == none && ${x[$b.hold]} == none ]]; then echo "$b free yes"; else echo "$b free no"; fi
+    done
+  } > "$BLOCKIE_GAME_BUTTONS"
+}
+bmap
 mkdir -p "$FAKE/bin" "$t/run" "$t/r\"un" "$data/roms/gba" "$data/roms/psp" "$data/roms/n64" "$data/roms/dir" \
   /usr/share/libretro/shaders/crt /var/lib/blockie/shaders
 printf 'invented rom\n' > "$data/roms/gba/test.gba"
@@ -63,7 +81,14 @@ exit 0
 EOF
 cat > "$FAKE/bin/retroarch" << 'EOF'
 #!/usr/bin/env bash
-printf '%s\n' "$*" > "$FAKE/retroarch.argv"
+main=
+a=("$@")
+for ((i = 0; i + 1 < ${#a[@]}; i++)); do
+  [[ ${a[i]} != --config ]] || main=${a[i + 1]}
+done
+printf '%s\n' "$*" | sed -E 's#--config [^ ]*/blockie-game\.[A-Za-z0-9]{6}\.main\.cfg( |$)#--config MAIN\1#' > "$FAKE/retroarch.argv"
+printf '%s\n' "$main" > "$FAKE/main.path"
+cp -- "$main" "$FAKE/main.cfg"
 printf '%s\n' "LD_LIBRARY_PATH=${LD_LIBRARY_PATH-unset}" "VK_DRIVER_FILES=${VK_DRIVER_FILES-unset}" \
   "FAKE_GPU_EXTRA=${FAKE_GPU_EXTRA-unset}" > "$FAKE/retroarch.env"
 : > "$FAKE/append.cfg"
@@ -83,18 +108,20 @@ if [[ -n ${FAKE_CMD:-} ]]; then
   read -r -t 10 line && printf '%s\n' "$line" > "$FAKE/line"
 fi
 if [[ -n ${FAKE_SLEEP:-} ]]; then
-  trap 'echo term > "$FAKE/term"; kill "$s"; exit 143' TERM
+  trap 'echo term > "$FAKE/term"; [[ -z ${FAKE_SAVE:-} ]] || cat "$FAKE_SAVE" > "$main"; kill "$s"; exit 143' TERM
   sleep 30 &
   s=$!
   echo "$$" > "$FAKE/pid"
   wait
 fi
+[[ -z ${FAKE_SAVE:-} ]] || cat "$FAKE_SAVE" > "$main"
 exit "${FAKE_RC:-0}"
 EOF
 chmod 755 "$FAKE/bin/systemd-run" "$FAKE/bin/systemctl" "$FAKE/bin/retroarch"
 
 play() {
   rm -f "$FAKE"/*.log "$FAKE/retroarch.argv" "$FAKE/retroarch.env" "$FAKE/append.cfg" "$FAKE/term" "$FAKE/pid" "$FAKE/core.opt"
+  rm -f "$FAKE/main.path" "$FAKE/main.cfg"
   rm -f "$FAKE/stdin" "$FAKE/ino" "$FAKE/line"
   PATH=$FAKE/bin:$PATH XDG_RUNTIME_DIR=${RUN-$t/run} DL1_CARDS=${CARDS:-$t/nocard} "$game" "$@" > "$t/out" 2>&1
   rc=$?
@@ -109,13 +136,18 @@ refused() {
 scope="--user --scope --quiet --unit=blockie-game --collect --slice=blockie-emulation.slice -p BindsTo=blockie-frontend.service"
 scope+=" -p After=blockie-frontend.service -p MemoryHigh=80% -p MemoryMax=90% -p TasksMax=512 -p OOMPolicy=kill"
 scope+=" -p TimeoutStopSec=5s --"
-base="--config $share/blockie.cfg"
+base="--config MAIN"
 fifo=$t/run/blockie-game.cmd
+norm() { sed -E 's#--config [^ ]*/blockie-game\.[A-Za-z0-9]{6}\.main\.cfg #--config MAIN #' "$1"; }
+mainis() {
+  [[ $(cat "$FAKE/main.cfg") == "$(grep -v '^config_save_on_exit[[:space:]]*=' "$share/blockie.cfg")"$'\nconfig_save_on_exit = "true"\ncore_options_path = "'"$share"'/retroarch-core-options.cfg"'"$1" ]]
+}
+gone() { local p; p=$(cat "$FAKE/main.path" 2> /dev/null) && [[ $p == "$t/run/blockie-game."??????".main.cfg" && ! -e $p ]]; }
 
 play ps1 "$rom"
-[[ $rc == 0 && $(cat "$FAKE/systemd-run.log") == "$scope retroarch $base -L /usr/lib64/libretro/pcsx_rearmed_libretro.so $rom" ]] &&
-  [[ ! -e $fifo ]]
-res $? "ps1: one scope in blockie-emulation.slice bound to the frontend, with the limits, RetroArch on pcsx_rearmed"
+[[ $rc == 0 && $(norm "$FAKE/systemd-run.log") == "$scope retroarch $base -L /usr/lib64/libretro/pcsx_rearmed_libretro.so $rom" ]] &&
+  [[ ! -e $fifo ]] && mainis '' && gone && [[ ! -s $t/out && ! -e $t/input.cfg ]]
+res $? "ps1: one scope in blockie-emulation.slice bound to the frontend, with the limits, RetroArch on pcsx_rearmed, --config a removed copy of blockie.cfg that saves on exit"
 
 cmdplay() {
   rm -f "$FAKE"/*.log "$FAKE/pid" "$FAKE/stdin" "$FAKE/ino" "$FAKE/line"
@@ -180,6 +212,7 @@ res $? "psp: the ppsspp core config points system_directory at the PPSSPP assets
 res $? "the ppsspp system directory holds PPSSPP/compat.ini"
 
 n64cfg=$share/core/mupen64plus_next.cfg
+here_schema=/usr/share/blockie/schema.d/30-buttons.json
 play n64 "$data/roms/n64/test.z64"
 [[ $rc == 0 ]] &&
   argv "$base --appendconfig $n64cfg -L /usr/lib64/libretro/mupen64plus_next_libretro.so $data/roms/n64/test.z64" &&
@@ -401,7 +434,9 @@ for sc in gb:pcsx_rearmed gba:snes9x; do
   [[ $rc == 0 ]] && argv "$base -L /usr/lib64/libretro/${sc#*:}_libretro.so $rom" || { ok=1; echo "  ${sc%%:*} on ${sc#*:}: options"; }
 done
 [[ -z $(find "$t/run" -name 'blockie-game.*.opt') ]] || ok=1
-res $ok "core options: a shipped <core>.opt is copied for the run as global core options and removed, none for other cores"
+play ps1 "$rom"
+[[ $rc == 0 ]] && mainis '' || { ok=1; echo "  ps1: the --config does not pin core_options_path"; }
+res $ok "core options: a shipped <core>.opt is copied for the run as global core options and removed, none for other cores, whose fallback stays pinned to $share/retroarch-core-options.cfg in the --config"
 
 defs "gb $D"
 play gb "$rom"
@@ -598,6 +633,139 @@ rc=$?
 [[ $rc == 143 && $during == 0 && ! -e $o && ! -e $app ]] && cmp -s "$FAKE/core.opt" "$share/core/gambatte.opt"
 res $? "TERM: the core options copy and the run append file are removed"
 
+inp() { printf '%s\n' "$@" > "$t/input.cfg"; }
+saved() { printf '%s\n' "$@" > "$t/saved.cfg"; }
+inis() { [[ $(cat "$t/input.cfg") == "$(printf '%s\n' "$@")" ]]; }
+
+bmap
+inp 'input_screenshot = "f14"' 'input_player1_l3_btn = "10"'
+cp "$t/input.cfg" "$t/input.before"
+play ps1 "$rom"
+[[ $rc == 0 && ! -s $t/out ]] && argv "$base -L /usr/lib64/libretro/pcsx_rearmed_libretro.so $rom" && gone &&
+  mainis $'\ninput_player1_l3_btn = "10"\ninput_screenshot = "f14"' && cmp -s "$t/input.cfg" "$t/input.before"
+res $? "binds: the input.cfg binds of free buttons go at the end of the throwaway --config, input.cfg byte equal when RetroArch saved nothing"
+
+ok=0
+inp 'input_screenshot = "f13"' 'input_rewind = "f14"' 'input_reset = "f15"' 'input_pause_toggle_btn = "10"'
+cp "$t/input.cfg" "$t/input.before"
+play gba "$rom"
+[[ $rc == 0 ]] && mainis $'\ninput_pause_toggle_btn = "10"\ninput_rewind = "f14"' && cmp -s "$t/input.cfg" "$t/input.before" &&
+  grep -q 'masked while their button has a Blockie action: .*input_reset' "$t/out" &&
+  grep -q 'masked while their button has a Blockie action: .*input_screenshot' "$t/out" || { ok=1; echo "  shipped map"; }
+bmap home.hold=none extra1.hold=switcher extra3.tap=none extra2.hold=game-quit extra3.hold=none
+play gba "$rom"
+[[ $rc == 0 ]] && mainis $'\ninput_reset = "f15"\ninput_screenshot = "f13"' && cmp -s "$t/input.cfg" "$t/input.before" ||
+  { ok=1; echo "  moved map"; }
+expect=$(python3 - "$here_schema" << 'EOF'
+import json
+import sys
+
+keys = json.load(open(sys.argv[1]))["keys"]
+free = {b: keys[f"buttons.{b}.tap"]["default"] == keys[f"buttons.{b}.hold"]["default"] == "none"
+        for b in ("home", "extra1", "extra2", "extra3")}
+lines = {"extra1": 'input_pause_toggle_btn = "10"', "extra2": 'input_rewind = "f14"', "extra3": 'input_reset = "f15"',
+         "home": 'input_screenshot = "f13"'}
+print("".join("\n" + lines[b] for b in sorted(lines, key=lambda b: lines[b]) if free[b]), end="")
+EOF
+)
+for c in none short; do
+  if [[ $c == none ]]; then rm -f "$t/buttons"; else bmap; sed -i '$d' "$t/buttons"; fi
+  play gba "$rom"
+  [[ $rc == 0 && -n $expect ]] && mainis "$expect" &&
+    grep -qE "(no $t/buttons|$t/buttons is not the 13 line button map), the built in button defaults apply" "$t/out" ||
+    { ok=1; echo "  $c map: $(paste -sd '|' "$t/out")"; }
+done
+w=$(sed -n "s/^ *w='(\(.*\))'\$/\1/p" "$game")
+[[ -n $w && $w == "$(python3 -c 'import json, sys; print("|".join(json.load(open(sys.argv[1]))["keys"]["buttons.home.tap"]["enum"]))' "$here_schema")" ]] &&
+  python3 -c 'import json, sys; k = json.load(open(sys.argv[1]))["keys"]; sys.exit(len({tuple(v["enum"]) for v in k.values()}) != 1)' "$here_schema" ||
+  { ok=1; echo "  the map words '$w' differ from 30-buttons.json's enum"; }
+bmap
+res $ok "masking: a bind on a button with a Blockie action stays in input.cfg and out of the launch; no map or a short one gives the built in defaults, which equal 30-buttons.json, and the map words equal its enum"
+
+ok=0
+inp 'input_screenshot = "f14"' 'input_rewind = "f13"'
+saved 'video_driver = "gl"' 'input_hold_fast_forward = "f14"' 'input_screenshot = "nul"' 'input_rewind = "r"' \
+  'input_player1_l3_btn = "10"' "video_shader = \"$D\"" "rgui_menu_theme_preset = \"$share/rgui/dark.cfg\"" \
+  "core_options_path = \"$t/run/blockie-game.abcdef.opt\"" 'input_exit_emulator = "f15"'
+FAKE_SAVE=$t/saved.cfg play gba "$rom"
+[[ $rc == 0 ]] && gone && inis 'input_exit_emulator = "f15"' 'input_hold_fast_forward = "f14"' 'input_player1_l3_btn = "10"' \
+  'input_rewind = "f13"' && [[ $(stat -c %a "$t/input.cfg") == 644 ]] && grep -q "$t/input.cfg: 4 binds kept" "$t/out" &&
+  [[ -z $(find "$t" -maxdepth 1 -name '.input.cfg.*') ]] || { ok=1; echo "  harvest: $(paste -sd '|' "$t/input.cfg")"; }
+cp "$t/input.cfg" "$t/input.before"
+saved 'video_driver = "gl"' 'input_hold_fast_forward = "f14"'
+FAKE_SAVE=$t/saved.cfg play gba "$rom"
+[[ $rc == 0 ]] && cmp -s "$t/input.cfg" "$t/input.before" && ! grep -q 'binds kept' "$t/out" ||
+  { ok=1; echo "  a save that changes no bind rewrote input.cfg"; }
+rm -f "$t/input.cfg"
+saved 'video_driver = "gl"' 'input_hold_fast_forward = "r"'
+FAKE_SAVE=$t/saved.cfg play gba "$rom"
+[[ $rc == 0 && ! -e $t/input.cfg ]] || { ok=1; echo "  a save with no bind made input.cfg"; }
+res $ok "harvest: a saved button code is stored, a saved other value drops an applied entry, a masked entry stays, nothing else reaches input.cfg (0644, atomic, unchanged when equal)"
+
+ok=0
+inp 'input_driver = "udev"' 'input_player1_nope = "f13"' 'input_screenshot = "f12"' '' 'input_player1_a_btn = "9"' \
+  'input_screenshot_btn = "10"' 'input_rewind = f14' 'input_reset  =  "f14"'
+cp "$t/input.cfg" "$t/input.before"
+play gba "$rom"
+[[ $rc == 0 ]] && mainis $'\ninput_screenshot_btn = "10"' && cmp -s "$t/input.cfg" "$t/input.before" &&
+  [[ $(grep -c 'is not a bind on a Blockie button, skipped' "$t/out") == 6 ]] && grep -q 'input.cfg line 5 is not' "$t/out" ||
+  { ok=1; echo "  launch: $(paste -sd '|' "$t/out")"; }
+saved 'input_screenshot_btn = "10"' 'input_player1_a_btn = "9"' 'input_driver = "udev"' 'input_player1_nope = "f13"'
+FAKE_SAVE=$t/saved.cfg play gba "$rom"
+[[ $rc == 0 ]] && inis 'input_screenshot_btn = "10"' || { ok=1; echo "  harvest: $(paste -sd '|' "$t/input.cfg")"; }
+head -c 70000 /dev/zero | tr '\0' '\n' > "$t/input.cfg"
+cp "$t/input.cfg" "$t/input.before"
+saved 'input_screenshot = "f14"'
+FAKE_SAVE=$t/saved.cfg play gba "$rom"
+[[ $rc == 0 ]] && cmp -s "$t/input.cfg" "$t/input.before" && grep -q 'not used and not written' "$t/out" ||
+  { ok=1; echo "  huge input.cfg"; }
+res $ok "grammar: lines that are not a bind key, name an unknown bind or hold another value are skipped at launch, logged, and dropped at harvest; an input.cfg over 64 KiB is neither used nor written"
+
+ok=0
+inp 'input_player1_l_x_plus_btn = "10"' 'input_screenshot = "f14"'
+play n64 "$data/roms/n64/test.z64"
+[[ $rc == 0 ]] && argv "$base --appendconfig $n64cfg -L /usr/lib64/libretro/mupen64plus_next_libretro.so $data/roms/n64/test.z64" &&
+  mainis $'\ninput_player1_l_x_plus_btn = "10"\ninput_screenshot = "f14"' &&
+  grep -qxF 'input_player1_l_x_plus_btn = "h0right"' "$FAKE/append.cfg" || { ok=1; echo "  n64 launch"; }
+saved 'input_player1_l_x_plus_btn = "h0right"' 'input_screenshot = "nul"'
+FAKE_SAVE=$t/saved.cfg play n64 "$data/roms/n64/test.z64"
+[[ $rc == 0 ]] && inis 'input_player1_l_x_plus_btn = "10"' || { ok=1; echo "  n64 harvest: $(paste -sd '|' "$t/input.cfg")"; }
+res $ok "n64: a stored stick bind sits in the --config under the appended core config, whose D-pad stick line wins; a save showing the core's value keeps it"
+
+ok=0
+for c in term truncated plain; do
+  inp 'input_screenshot = "f14"' 'input_player1_l3_btn = "10"'
+  cp "$t/input.cfg" "$t/input.before"
+  case $c in
+    term) saved 'input_hold_fast_forward = "f14"' 'input_screenshot = "nul"' ;;
+    truncated) { printf '%s\n' 'video_driver = "gl"' 'input_hold_fast_forward = "f14"'; printf 'input_player1_l3_btn = "nu'; } > "$t/saved.cfg" ;;
+  esac
+  rm -f "$FAKE"/*.log "$FAKE/term" "$FAKE/pid" "$FAKE/main.path"
+  if [[ $c == plain ]]; then unset FAKE_SAVE; else export FAKE_SAVE=$t/saved.cfg; fi
+  FAKE_SLEEP=1 PATH=$FAKE/bin:$PATH XDG_RUNTIME_DIR=$t/run DL1_CARDS=$t/nocard "$game" gba "$rom" > "$t/out" 2>&1 &
+  w=$!
+  for _ in $(seq 50); do
+    [[ -s $FAKE/pid ]] && break
+    sleep 0.1
+  done
+  kill -TERM "$w"
+  wait "$w"
+  rc=$?
+  unset FAKE_SAVE
+  [[ $rc == 143 && -e $FAKE/term ]] && gone || { ok=1; echo "  $c: rc $rc"; }
+  case $c in
+    term) inis 'input_hold_fast_forward = "f14"' 'input_player1_l3_btn = "10"' || { ok=1; echo "  term: $(paste -sd '|' "$t/input.cfg")"; } ;;
+    truncated) inis 'input_hold_fast_forward = "f14"' 'input_player1_l3_btn = "10"' 'input_screenshot = "f14"' ||
+      { ok=1; echo "  truncated: $(paste -sd '|' "$t/input.cfg")"; } ;;
+    plain) cmp -s "$t/input.cfg" "$t/input.before" || { ok=1; echo "  plain TERM changed input.cfg"; } ;;
+  esac
+done
+cfg 'input_screenshot = "f13"'
+[[ $rc == 64 ]] && ! ran || { ok=1; echo "  a game config with an input_ key was accepted"; }
+rm -f "$t/input.cfg"
+[[ -z $(find "$t/run" -name 'blockie-game.*.main.cfg') ]] || { ok=1; echo "  a throwaway --config is left"; }
+res $ok "stops: after TERM the harvest runs on what RetroArch saved, a truncated save drops nothing, no save leaves input.cfg byte equal, the throwaway is removed; a game --config still refuses input_ keys"
+
 cfgv() { sed -n "s/^$1 = \"\(.*\)\"$/\1/p" "$share/blockie.cfg"; }
 ok=0
 for kv in video_driver=gl video_context_driver=wayland input_driver=udev input_joypad_driver=udev stdin_cmd_enable=true \
@@ -620,6 +788,7 @@ cmp -s <(printf '%s\n' 'nes /usr/share/libretro/shaders/blockie/crt-gdv-mini.gls
   'gba /usr/share/libretro/shaders/blockie/lcd3x.glslp' 'ps1 /usr/share/libretro/shaders/blockie/lcd3x.glslp') \
   "$t/shader-defaults" || { ok=1; echo "  shipped shader-defaults"; }
 ! grep -q 'audio_volume' "$share/blockie.cfg" || ok=1
+! grep -q '^core_options_path' "$share/blockie.cfg" || { ok=1; echo "  blockie.cfg sets core_options_path"; }
 for l in 'menu_show_online_updater = "false"' 'menu_show_core_updater = "false"' 'core_updater_buildbot_cores_url = ""' \
   'core_updater_buildbot_assets_url = ""' 'netplay_public_announce = "false"' 'network_cmd_enable = "false"'; do
   grep -qxF "$l" "$share/blockie.cfg" || { ok=1; echo "  no '$l'"; }

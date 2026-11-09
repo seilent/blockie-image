@@ -9,6 +9,8 @@ shaders=/usr/share/libretro/shaders
 slang=/var/lib/blockie/shaders
 gpuenv=/run/blockie-gpu/gpu.env
 dl1=/usr/libexec/blockie/dl1
+buttons=${BLOCKIE_GAME_BUTTONS:-/run/blockie-set/buttons}
+input=${BLOCKIE_GAME_INPUT:-$data/retroarch/input.cfg}
 
 usage() { echo "usage: $me <system> <rompath> [--core <id>] [--config <file>] [--theme dark|light]" >&2; exit 64; }
 refuse() { echo "$me: $*" >&2; exit 64; }
@@ -19,6 +21,31 @@ declare -A default=([gb]=gambatte [gbc]=gambatte [nes]=nestopia [snes]=snes9x [g
   [ps1]=pcsx_rearmed [n64]=mupen64plus_next [psp]=ppsspp [dc]=flycast)
 ids=" gambatte nestopia snes9x genesis_plus_gx mgba pcsx_rearmed mupen64plus_next ppsspp flycast "
 bools=" video_scale_integer video_shader_enable video_smooth rewind_enable savestate_auto_save savestate_auto_load "
+pbinds="b y select start up down left right a x l r l2 r2 l3 r3 l_x_plus l_x_minus l_y_plus l_y_minus r_x_plus r_x_minus
+  r_y_plus r_y_minus gun_trigger gun_offscreen_shot gun_aux_a gun_aux_b gun_aux_c gun_start gun_select gun_dpad_up
+  gun_dpad_down gun_dpad_left gun_dpad_right turbo"
+hbinds="enable_hotkey menu_toggle exit_emulator close_content reset toggle_fast_forward hold_fast_forward
+  toggle_slowmotion hold_slowmotion rewind pause_toggle frame_advance audio_mute volume_up volume_down load_state
+  save_state state_slot_increase state_slot_decrease play_replay record_replay halt_replay save_replay_checkpoint
+  prev_replay_checkpoint next_replay_checkpoint replay_slot_increase replay_slot_decrease disk_eject_toggle disk_next
+  disk_prev shader_toggle shader_hold shader_next shader_prev cheat_toggle cheat_index_plus cheat_index_minus screenshot
+  recording_toggle streaming_toggle turbo_fire_toggle grab_mouse_toggle game_focus_toggle toggle_fullscreen
+  desktop_menu_toggle toggle_vrr_runloop runahead_toggle preempt_toggle fps_toggle toggle_statistics ai_service
+  netplay_ping_toggle netplay_host_toggle netplay_game_watch netplay_player_chat netplay_fade_chat_toggle overlay_next
+  osk_toggle"
+declare -A slot=()
+for n in $pbinds; do
+  slot[input_player1_$n]=key
+  slot[input_player1_${n}_btn]=btn
+done
+for n in $hbinds; do
+  slot[input_$n]=key
+  slot[input_${n}_btn]=btn
+done
+declare -A owner=([f13]=home [f14]=extra2 [f15]=extra3 [10]=extra1)
+declare -A free=([home]=no [extra1]=yes [extra2]=yes [extra3]=no)
+declare -A stored=() applied=() later=()
+bind() { [[ ${slot[$1]:-} == key && $2 =~ ^f1[345]$ ]] || [[ ${slot[$1]:-} == btn && $2 == 10 ]]; }
 
 (( $# >= 2 )) || usage
 system=$1
@@ -185,15 +212,97 @@ else
 fi
 [[ ! -f $share/rgui/$theme.cfg ]] || lines+=("rgui_menu_theme_preset = \"$share/rgui/$theme.cfg\"")
 
+if [[ ! -e $buttons ]]; then
+  echo "$me: no $buttons, the built in button defaults apply" >&2
+else
+  m=()
+  mapfile -t m 2> /dev/null < "$buttons"
+  good=0
+  declare -A got=()
+  if [[ ${#m[@]} == 13 && ${m[0]} == "version 1" ]]; then
+    good=1
+    i=1
+    w='(none|switcher|game-menu|game-quit)'
+    for b in home extra1 extra2 extra3; do
+      [[ ${m[i]} =~ ^$b\ tap\ $w$ && ${m[i + 1]} =~ ^$b\ hold\ $w$ && ${m[i + 2]} =~ ^$b\ free\ (yes|no)$ ]] ||
+        { good=0; break; }
+      got[$b]=${BASH_REMATCH[1]}
+      i=$((i + 3))
+    done
+  fi
+  if (( good )); then
+    for b in "${!got[@]}"; do
+      free[$b]=${got[$b]}
+    done
+  else
+    echo "$me: $buttons is not the 13 line button map, the built in button defaults apply" >&2
+  fi
+fi
+
+keep=1
+if [[ -e $input ]]; then
+  if [[ ! -f $input || ! -r $input ]] || (( $(stat -c %s -- "$input") > 65536 )); then
+    echo "$me: $input is not a readable file of at most 64 KiB, not used and not written" >&2
+    keep=0
+  else
+    n=0
+    while IFS= read -r line || [[ -n $line ]]; do
+      n=$((n + 1))
+      [[ $line =~ ^[[:space:]]*$ ]] && continue
+      if [[ $line =~ ^(input_[a-z0-9_]+)\ =\ \"([^\"]*)\"$ ]]; then
+        k=${BASH_REMATCH[1]}
+        v=${BASH_REMATCH[2]}
+        if bind "$k" "$v"; then
+          stored[$k]=$v
+          continue
+        fi
+      fi
+      echo "$me: $input line $n is not a bind on a Blockie button, skipped" >&2
+    done < "$input"
+  fi
+fi
+if [[ -f $share/core/$core.cfg ]]; then
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ ! $line =~ ^([a-z0-9_]+)[[:space:]]*= ]] || later[${BASH_REMATCH[1]}]=1
+  done < "$share/core/$core.cfg"
+fi
+masked=()
+for k in "${!stored[@]}"; do
+  if [[ ${free[${owner[${stored[$k]}]}]} != yes ]]; then
+    masked+=("$k")
+  else
+    applied[$k]=${stored[$k]}
+  fi
+done
+(( ! ${#masked[@]} )) || echo "$me: $input: masked while their button has a Blockie action: ${masked[*]}" >&2
+
 append=()
 [[ ! -f $share/core/$core.cfg ]] || append+=("$share/core/$core.cfg")
 tmp=
 opt=
 cmd=
-trap '[[ -z $tmp ]] || rm -f -- "$tmp"; [[ -z $opt ]] || rm -f -- "$opt"; [[ -z $cmd ]] || rm -f -- "$cmd"' EXIT
+main=
+sum=
+new=
+harvested=0
+trap 'for f in "$tmp" "$opt" "$cmd" "$main" "$new"; do [[ -z $f ]] || rm -f -- "$f"; done' EXIT
 trap 'exit 143' TERM
 trap 'exit 130' INT
 trap 'exit 129' HUP
+main=$(mktemp "$run/blockie-game.XXXXXX.main.cfg") || die "cannot write the main config in $run"
+pat=config_save_on_exit
+for k in "${!applied[@]}"; do
+  pat+="|$k"
+done
+(
+  grep -vE "^($pat)[[:space:]]*=" "$share/blockie.cfg"
+  (( $? < 2 )) || exit 1
+  printf '%s\n' 'config_save_on_exit = "true"' "core_options_path = \"$share/retroarch-core-options.cfg\""
+  for k in "${!applied[@]}"; do
+    printf '%s = "%s"\n' "$k" "${applied[$k]}"
+  done | LC_ALL=C sort
+) > "$main" || die "cannot write $main"
+sum=$(sha256sum < "$main") || die "cannot read $main"
 if [[ -f $share/core/$core.opt ]]; then
   opt=$(mktemp "$run/blockie-game.XXXXXX.opt") || die "cannot write the core options in $run"
   cp -- "$share/core/$core.opt" "$opt" || die "cannot write $opt"
@@ -209,12 +318,57 @@ rm -f -- "$cmd" "$run/blockie-game.quit"
 mkfifo -m 600 -- "$cmd" || die "cannot make $cmd"
 exec 3<> "$cmd" || die "cannot open $cmd"
 
-argv=(retroarch --config "$share/blockie.cfg")
+argv=(retroarch --config "$main")
 if (( ${#append[@]} )); then
   argv+=(--appendconfig "$(IFS='|'; printf '%s' "${append[*]}")")
 fi
 [[ -z $shader ]] || argv+=(--set-shader "$shader")
 argv+=(-L "$so" "$real")
+
+harvest() {
+  local now k v d line
+  (( ! harvested && keep )) || return 0
+  harvested=1
+  now=$(sha256sum < "$main") || { echo "$me: cannot read $main, $input left as it was" >&2; return 0; }
+  [[ $now != "$sum" ]] || return 0
+  local -A out=()
+  for k in "${!stored[@]}"; do
+    out[$k]=${stored[$k]}
+  done
+  while IFS= read -r line; do
+    [[ $line =~ ^(input_[a-z0-9_]+)\ =\ \"([^\"]*)\"$ ]] || continue
+    k=${BASH_REMATCH[1]}
+    v=${BASH_REMATCH[2]}
+    [[ -n ${slot[$k]:-} ]] || continue
+    if bind "$k" "$v"; then
+      out[$k]=$v
+    elif [[ -n ${out[$k]:-} && $v != "${out[$k]}" && -n ${applied[$k]:-} && -z ${later[$k]:-} ]]; then
+      unset "out[$k]"
+    fi
+  done < "$main"
+  [[ -e $input || ${#out[@]} != 0 ]] || return 0
+  d=${input%/*}
+  if ! mkdir -p -- "$d" || ! new=$(mktemp "$d/.input.cfg.XXXXXX"); then
+    echo "$me: cannot write in $d, $input left as it was" >&2
+    return 0
+  fi
+  if ! { for k in "${!out[@]}"; do printf '%s = "%s"\n' "$k" "${out[$k]}"; done | LC_ALL=C sort > "$new"; } ||
+    ! chmod 644 -- "$new" || ! sync -- "$new"; then
+    rm -f -- "$new"
+    new=
+    echo "$me: cannot write the new $input, left as it was" >&2
+    return 0
+  fi
+  if cmp -s -- "$new" "$input"; then
+    rm -f -- "$new"
+  elif mv -f -- "$new" "$input"; then
+    echo "$me: $input: ${#out[@]} binds kept" >&2
+  else
+    rm -f -- "$new"
+    echo "$me: cannot replace $input, left as it was" >&2
+  fi
+  new=
+}
 
 stop() {
   trap '' TERM INT HUP
@@ -223,6 +377,7 @@ stop() {
     systemctl --user stop blockie-game.scope 2> /dev/null
     wait "$!"
   fi
+  harvest
   exit "$1"
 }
 trap 'stop 143' TERM
@@ -235,6 +390,7 @@ systemd-run --user --scope --quiet --unit=blockie-game --collect --slice=blockie
 exec 3<&-
 wait "$!"
 rc=$?
+harvest
 case $rc in
   64 | 69 | 71 | 75) exit 70 ;;
   *) exit "$rc" ;;

@@ -48,9 +48,9 @@ d /var/lib/blockie/data/android/guest 0700 root root -
 d /var/lib/blockie/data/android/guest/data 0771 blockie blockie -
 d /var/lib/blockie/data/android/images 0755 root root -
 d /var/lib/blockie/data/android/user 0700 blockie blockie -
-$(printf 'd /var/lib/blockie/data/%s 0755 blockie blockie -\n' cache media mupen64plus_next music saves states)"
+$(printf 'd /var/lib/blockie/data/%s 0755 blockie blockie -\n' cache media mupen64plus_next music retroarch saves states)"
 [[ $(cat "$conf") == "$want" ]]
-res $? "tmpfiles: android/ and android/images root 0755, android/guest root 0700, android/guest/data blockie 0771, android/user blockie 0700; cache, media, mupen64plus_next, music, saves, states owned by blockie"
+res $? "tmpfiles: android/ and android/images root 0755, android/guest root 0700, android/guest/data blockie 0771, android/user blockie 0700; cache, media, mupen64plus_next, music, retroarch, saves, states owned by blockie"
 ! grep -qE '^d /var/lib/blockie/data/(roms|bios)([/ ]|$)|^d /var/lib/blockie/data/? ' "$conf"
 res $? "tmpfiles: no line for roms/, bios/ or the mount root"
 [[ ! -e /usr/lib/tmpfiles.d/blockie-data.conf ]] && ! grep -rqs 'blockie/data' /usr/lib/tmpfiles.d
@@ -69,7 +69,7 @@ if [[ -z ${DATA_TMPFILES:-} ]] && command -v systemd-tmpfiles > /dev/null; then
   before=$(cd "$r/var/lib/blockie/data" && find roms bios -printf '%p %u %g %m\n' | sort)
   systemd-tmpfiles --root="$r" --create "$conf" > "$top/tmpfiles.out" 2>&1
   ok=$?
-  for n in cache media mupen64plus_next music saves states; do
+  for n in cache media mupen64plus_next music retroarch saves states; do
     [[ $(stat -c '%U %G %a' "$r/var/lib/blockie/data/$n") == "blockie blockie 755" ]] || ok=1
   done
   for x in "android root root 755" "android/guest root root 700" "android/guest/data blockie blockie 771" \
@@ -77,7 +77,7 @@ if [[ -z ${DATA_TMPFILES:-} ]] && command -v systemd-tmpfiles > /dev/null; then
     [[ $(stat -c '%U %G %a' "$r/var/lib/blockie/data/${x%% *}") == "${x#* }" ]] || ok=1
   done
   [[ $(cd "$r/var/lib/blockie/data" && find roms bios -printf '%p %u %g %m\n' | sort) == "$before" ]] || ok=1
-  res $ok "tmpfiles applied: six blockie dirs, the android tree, roms/ and bios/ unchanged"
+  res $ok "tmpfiles applied: seven blockie dirs, the android tree, roms/ and bios/ unchanged"
 fi
 
 setup() {
