@@ -408,12 +408,15 @@ def gpu_stage(spec, shim):
             dest = os.path.join(OVERLAY, SHIMPATH)
             shutil.copyfile(HWC_SHIM, dest)
             os.chmod(dest, 0o644)
+            if sha256_file(dest) != shim:
+                log("the staged hwc shim does not match the pin")
+                return False
     except OSError:
         return False
     return True
 
 
-def config(gpu_action):
+def config(gpu_action, shim=None):
     cfg = configparser.ConfigParser()
     old = read(CFG)
     if old is not None:
@@ -425,6 +428,10 @@ def config(gpu_action):
     cfg["properties"].update(properties())
     if gpu_action == "mali":
         cfg["properties"].update(GPU_PROPS)
+        if shim:
+            cfg["properties"]["ro.hardware.hwcomposer"] = "blockie"
+        else:
+            cfg.remove_option("properties", "ro.hardware.hwcomposer")
     elif gpu_action == "soft":
         for key in GPU_KEYS:
             cfg.remove_option("properties", key)
@@ -549,7 +556,7 @@ def prep():
         gpu_fail_clear()
     os.makedirs(RUN, 0o755, exist_ok=True)
     put(GPU_MODE, mode + "\n")
-    config("mali" if mode == "mali" else "soft")
+    config("mali" if mode == "mali" else "soft", shim)
     if action == "init":
         waydroid("init")
     elif action == "upgrade":
@@ -559,7 +566,7 @@ def prep():
         cfg.read_string(read(CFG) or "")
         if cfg.get("waydroid", "images_path", fallback=None) != EXTRA:
             raise Refused("failed", f"waydroid {action} did not take the images in {EXTRA}")
-        config("mali" if mode == "mali" else "soft")
+        config("mali" if mode == "mali" else "soft", shim)
         put(PREPARED, want)
         log(f"waydroid {action} done")
     keylayout()

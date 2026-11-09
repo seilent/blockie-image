@@ -437,7 +437,8 @@ ln -sfn "$g/zoneinfo/Asia/Tokyo" "$g/localtime"
 echo 1.6.3-1.fc44.blockie > "$g/version"
 printf '#!/bin/sh\n[ -e "%s/mounted" ]\n' "$g" > "$g/bin/mountpoint"
 printf '#!/bin/sh\ncat "%s/version"\n' "$g" > "$g/bin/rpm"
-printf '#!/bin/sh\nf=$3\n: > "$f"\necho "mknod $*" >> "%s/mknod.calls"\n[ ! -e "%s/mknodfail" ] || exit 1\n' "$g" "$g" > "$g/bin/mknod"
+printf '#!/bin/sh\nf=$3\n: > "$f"\necho "mknod $*" >> "%s/mknod.calls"\n[ ! -e "%s/mknodfail" ] || exit 1\n[ ! -e "%s/swapshim" ] || echo swapped > "%s/hwc/hwcomposer.blockie.so"\n' \
+  "$g" "$g" "$g" "$g" > "$g/bin/mknod"
 sed "s#$p/#$g/#g" "$p/bin/waydroid" > "$g/bin/waydroid"
 chmod 755 "$g/bin/"*
 gsys=$(printf '%064d' 7)
@@ -518,7 +519,7 @@ for kv in ro.hardware.egl:mali ro.hardware.gralloc:mediatek ro.hardware.vulkan:m
   IFS=: read -r k v <<< "$kv"
   [[ $(gcfg "$k") == "$v" ]] || { ok=1; echo "  prop $k is $(gcfg "$k")"; }
 done
-[[ $(gcfg ro.hardware.hwcomposer) == - ]] || { ok=1; echo "  hwcomposer prop set"; }
+[[ $(gcfg ro.hardware.hwcomposer) == blockie ]] || { ok=1; echo "  hwcomposer prop is $(gcfg ro.hardware.hwcomposer)"; }
 [[ -f $ov/lib64/egl/libGLES_mali.so && -f $ov/lib/egl/egl.cfg ]] || { ok=1; echo "  files not staged"; }
 [[ $(stat -c '%a' "$ov/bin/hw/android.hardware.graphics.allocator@4.0-service-mediatek") == 755 &&
   $(stat -c '%a' "$ov/lib64/libged.so") == 644 && $(stat -c '%a' "$ov/lib64") == 755 ]] || { ok=1; echo "  modes"; }
@@ -534,15 +535,30 @@ done
 [[ $(sed -n 5p "$g/data/android/prepared") == "gpu $D shim $gshim" ]] || { ok=1; echo "  prepared gpu line $(sed -n 5p "$g/data/android/prepared")"; }
 grep -qxF "lib64/hw/hwcomposer.blockie.so" "$g/data/android/gpu-staged" && grep -qxF "lib/egl/egl.cfg" "$g/data/android/gpu-staged" ||
   { ok=1; echo "  gpu-staged list"; }
-res $ok "prep gpu: a matching set, armed and a matching shim stage the files, links by target, whiteouts, the blockie allocator rc (3 vintf binds, enable) and the shim, write egl, gralloc, vulkan and density props but no hwcomposer prop, never stage the stock rc, and record the gpu line and the staged list"
+res $ok "prep gpu: a matching set, armed and a matching shim stage the files, links by target, whiteouts, the blockie allocator rc (3 vintf binds, enable) and the shim, write egl, gralloc, vulkan, density and hwcomposer blockie props, never stage the stock rc, and record the gpu line and the staged list"
 
 ok=0
 rm -f "${g:?}/hwc/hwcomposer.blockie.so"
 grun
-[[ $rc == 0 && $st == ok && $(gcfg ro.hardware.egl) == mali && ! -e $ov/lib64/hw/hwcomposer.blockie.so &&
-  $(sed -n 5p "$g/data/android/prepared") == "gpu $D" ]] || { ok=1; echo "  no shim: '$st' $(sed -n 5p "$g/data/android/prepared")"; }
+[[ $rc == 0 && $st == ok && $(gcfg ro.hardware.egl) == mali && $(gcfg ro.hardware.hwcomposer) == - &&
+  ! -e $ov/lib64/hw/hwcomposer.blockie.so && $(sed -n 5p "$g/data/android/prepared") == "gpu $D" ]] ||
+  { ok=1; echo "  no shim: '$st' $(gcfg ro.hardware.hwcomposer) $(sed -n 5p "$g/data/android/prepared")"; }
+echo '0 0' > "$g/armed"
+grun
+echo '1 0' > "$g/armed"
+grun
+[[ $rc == 0 && $st == ok && $(gcfg ro.hardware.egl) == mali && $(gcfg ro.hardware.hwcomposer) == - ]] ||
+  { ok=1; echo "  no shim from soft: '$st' $(gcfg ro.hardware.egl) $(gcfg ro.hardware.hwcomposer)"; }
 printf 'blockie-hwc-shim-content\n' > "$g/hwc/hwcomposer.blockie.so"
-res $ok "prep gpu: a missing shim stays mali (the hwcomposer prop is gated on the device tear run, not shipped yet) and the prepared line drops the shim, it is not a fall back to soft"
+: > "$g/swapshim"
+grun
+[[ $rc == 0 && $st == ok && $(gcfg ro.hardware.egl) == - && $(gcfg ro.hardware.hwcomposer) == - &&
+  ! -e $ov/lib64/hw/hwcomposer.blockie.so && ! -e $ov/lib64/egl/libGLES_mali.so &&
+  $(sed -n 5p "$g/data/android/prepared") == 'gpu soft' ]] && grep -q 'the staged hwc shim does not match the pin' "$g/out" &&
+  grep -q 'gpu stage failed, soft for this start' "$g/out" || { ok=1; echo "  swapped shim: '$st' $(gcfg ro.hardware.hwcomposer) $(cat "$g/out")"; }
+rm -f "${g:?}/swapshim"
+printf 'blockie-hwc-shim-content\n' > "$g/hwc/hwcomposer.blockie.so"
+res $ok "prep gpu: a shim removed after a run with it stays mali, removes the hwcomposer prop and the staged shim, and the prepared line drops the shim, it is not a fall back to soft; mali with no shim from soft writes no hwcomposer prop; a shim swapped after the pin check and before the copy fails the staged copy's hash, unstages the set and is soft for the start"
 
 ok=0
 echo gpu-boot-two > "$g/bootid"
@@ -575,13 +591,13 @@ ok=0
 echo gpu-boot-five > "$g/bootid"
 gbuildvendor
 grun
-[[ $(gcfg ro.hardware.egl) == mali ]] || { ok=1; echo "  re-mali before removal"; }
+[[ $(gcfg ro.hardware.egl) == mali && $(gcfg ro.hardware.hwcomposer) == blockie ]] || { ok=1; echo "  re-mali before removal"; }
 echo '0 0' > "$g/armed"
 grun
 [[ $rc == 0 && $(gcfg ro.hardware.egl) == - && $(gcfg ro.sf.lcd_density) == 240 && $(gcfg ro.hardware.vulkan) == - &&
-  $(gcfg ro.vendor.blockie.vsync_period_ns) == 16666814 ]] || { ok=1; echo "  props not removed in soft"; }
+  $(gcfg ro.hardware.hwcomposer) == - && $(gcfg ro.vendor.blockie.vsync_period_ns) == 16666814 ]] || { ok=1; echo "  props not removed in soft"; }
 echo '1 0' > "$g/armed"
-res $ok "prep gpu: a switch to soft removes the hardware props (egl, gralloc, vulkan) from waydroid.cfg and keeps the density and the vsync period"
+res $ok "prep gpu: a switch to soft removes the hardware props (egl, gralloc, vulkan, hwcomposer) from waydroid.cfg and keeps the density and the vsync period"
 
 ok=0
 echo gpu-boot-six > "$g/bootid"
