@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <unistd.h>
@@ -405,6 +406,21 @@ static int load(const char* path, uint8_t* blk)
     return rc;
 }
 
+static int lock(int fd)
+{
+    for (int i = 0; i < 50; i++) {
+        if (!flock(fd, LOCK_EX | LOCK_NB))
+            return 1;
+        if (errno != EWOULDBLOCK) {
+            fprintf(stderr, "abctl: %s: flock: %s\n", dev, strerror(errno));
+            return 0;
+        }
+        usleep(100000);
+    }
+    fprintf(stderr, "abctl: misc busy\n");
+    return 0;
+}
+
 static int update(const char* cmd, const char* arg)
 {
     uint8_t* blk;
@@ -434,7 +450,7 @@ static int update(const char* cmd, const char* arg)
         fprintf(stderr, "abctl: %s: %s\n", dev, strerror(errno));
         return 1;
     }
-    if (!misc_target(fd) || read_at(fd, dev, blk, BLOCK, 0, "read"))
+    if (!misc_target(fd) || !lock(fd) || read_at(fd, dev, blk, BLOCK, 0, "read"))
         goto out;
     r = change(cmd, blk, file, arg);
     if (r == EMPTY) {

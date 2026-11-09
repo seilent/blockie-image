@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import atexit
+import fcntl
 import mmap
 import os
 import re
@@ -9,6 +10,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import zlib
 
 fails = []
@@ -529,6 +531,33 @@ def main():
                      ["fix-b", "x"]):
             rc, out, err = abctl("-d", m, *args)
             check(rc == 2 and cur() == orig[:0x800] + D + orig[0x820:], f"abctl {' '.join(args)} is a usage error")
+
+        put(D)
+        before = cur()
+        held = os.open(m, os.O_RDONLY)
+        fcntl.flock(held, fcntl.LOCK_EX)
+        try:
+            for args in (["bcb-clear"], ["default-a"], ["bcb-attempt"]):
+                t0 = time.time()
+                rc, out, err = abctl("-d", m, *args)
+                took = time.time() - t0
+                check(rc == 1 and "abctl: misc busy" in err and cur() == before and 4.5 <= took < 8,
+                      f"abctl {' '.join(args)} while another holds the misc lock: exit 1 after {took:.1f} s, "
+                      f"misc busy, nothing written")
+            rc, out, err = abctl("-d", m, "show")
+            check(rc == 0 and "message command" in out, "show reads while the lock is held: a read takes no lock")
+        finally:
+            fcntl.flock(held, fcntl.LOCK_UN)
+            os.close(held)
+        subprocess.run(["strace", "-qq", "-e", "trace=flock", "-o", trace, ABCTL, "-d", m, "bcb-clear"],
+                       capture_output=True)
+        fl = [line for line in open(trace).read().splitlines() if line.startswith("flock(")]
+        check(len(fl) == 1 and "LOCK_EX|LOCK_NB" in fl[0] and fl[0].endswith("= 0") and cur()[:512] == bytes(512)
+              and cur()[512:] == before[512:], f"bcb-clear with the lock free: one LOCK_EX|LOCK_NB flock, written {fl}")
+        subprocess.run(["strace", "-qq", "-e", "trace=flock", "-o", trace, ABCTL, "-d", m, "show"],
+                       capture_output=True)
+        check(not [line for line in open(trace).read().splitlines() if line.startswith("flock(")],
+              "show takes no flock")
 
         if a.loop:
             img = os.path.join(d, "loop.img")
