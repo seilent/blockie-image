@@ -113,6 +113,28 @@ cmp -s <(printf '%s\n' 'gambatte_gb_colorization = "auto"' 'gambatte_gb_internal
   'gambatte_gbc_color_correction = "always"' 'gambatte_mix_frames = "lcd_ghosting"') "$ra/core/gambatte.opt" || fail "core/gambatte.opt"
 cmp -s <(printf '%s\n' 'mgba_interframe_blending = "mix_smart"') "$ra/core/mgba.opt" || fail "core/mgba.opt"
 grep -qxF 'menu_show_load_content_animation = "false"' "$ra/blockie.cfg" || fail "the load content animation is not off"
+cmp -s <(printf '%s\n' 'rgui_entry_normal_color = "0xFF999999"' 'rgui_entry_hover_color = "0xFFFFFFFF"' \
+  'rgui_title_color = "0xFFFFFFFF"' 'rgui_bg_dark_color = "0xFF111111"' 'rgui_bg_light_color = "0xFF111111"' \
+  'rgui_border_dark_color = "0xFF111111"' 'rgui_border_light_color = "0xFF111111"') "$ra/rgui/dark.cfg" || fail "rgui/dark.cfg"
+cmp -s <(printf '%s\n' 'rgui_entry_normal_color = "0xFF777777"' 'rgui_entry_hover_color = "0xFF111111"' \
+  'rgui_title_color = "0xFF111111"' 'rgui_bg_dark_color = "0xFFFFFFFF"' 'rgui_bg_light_color = "0xFFFFFFFF"' \
+  'rgui_border_dark_color = "0xFFFFFFFF"' 'rgui_border_light_color = "0xFFFFFFFF"') "$ra/rgui/light.cfg" || fail "rgui/light.cfg"
+for l in 'video_font_path = "/usr/share/blockie/fonts/selawk.ttf"' 'rgui_menu_color_theme = "0"' \
+  'menu_rgui_transparency = "false"' 'rgui_border_filler_enable = "false"' 'menu_rgui_shadows = "false"' \
+  'rgui_particle_effect = "0"'; do
+  grep -qxF "$l" "$ra/blockie.cfg" || fail "blockie.cfg lacks '$l'"
+done
+[[ -f /usr/share/blockie/fonts/selawk.ttf ]] || fail "video_font_path names no file"
+cmp -s <({ printf 'menu_show_%s = "false"\n' online_updater core_updater load_content_animation load_core load_content \
+    load_disc dump_disc information configurations help restart_retroarch reboot shutdown core_manager_steam overlays \
+    latency rewind
+  printf 'quick_menu_show_%s = "false"\n' add_to_favorites add_to_playlist start_recording start_streaming \
+    set_core_association reset_core_association save_core_overrides save_game_overrides save_content_dir_overrides \
+    information download_thumbnails replay game_ai shaders
+  printf 'notification_show_%s = "false"\n' autoconfig autoconfig_fails remap_load config_override_load refresh_rate \
+    set_initial_disk; } | sort) <(grep -E '^((quick_)?menu|notification)_show_' "$ra/blockie.cfg" | sort) ||
+  fail "the menu_show, quick_menu_show and notification_show lines are not exactly the hidden set"
+! grep -q '^kiosk_mode_enable' "$ra/blockie.cfg" || fail "blockie.cfg sets kiosk_mode_enable"
 [[ -f /usr/lib/firmware/regulatory.db ]] || fail "regulatory.db missing"
 
 jq -e '. == {

@@ -52,3 +52,7 @@ handheld/shaders/color/sp101-color.slang of https://github.com/libretro/slang-sh
 hunterk and crashGG (public domain).
 system_files/usr/share/blockie/retroarch/core: the gambatte.opt and mgba.opt option values come from the settings of
 https://github.com/BruhMeh/Ayaneo-Handheld-Scripts (168d1c9), values only.
+system_files/usr/share/blockie/retroarch/rgui: dark.cfg and light.cfg use the colours of
+https://github.com/seilent/blockie-frontend ui/tokens-blockie.txt (a4b9d08): color.bg with white for dark,
+color.light.bg with color.light.ink for light, unfocused entries at alpha.mid over the background, each channel at
+the nearest step of RGUI's 4 bit menu buffer, values only.

@@ -9,7 +9,8 @@ data=/var/lib/blockie/data
 t=$(mktemp -d "${TMPDIR:-/tmp}/game.XXXXXX")
 fails=0
 cp -p "$share/shader-defaults" "$t/shader-defaults"
-trap 'cp -p "$t/shader-defaults" "$share/shader-defaults"; rm -rf "${t:?}"' EXIT
+[[ ! -d $share/rgui ]] || mv "$share/rgui" "$t/rgui" || exit 2
+trap 'cp -p "$t/shader-defaults" "$share/shader-defaults"; rm -rf "${share:?}/rgui"; [[ ! -d $t/rgui ]] || mv "$t/rgui" "$share/rgui"; rm -rf "${t:?}"' EXIT
 : > "$share/shader-defaults"
 
 res() {
