@@ -28,7 +28,7 @@ reqfd=""
 log() { echo "$me: $*" >&2; }
 
 usage() {
-  echo "usage: $me list | current | get-default | set-default <name> | switch <name> [app] | request <name> [reason] | switcher | next | back | boot | menu <from> | install <name> | ended <unit> | revive <name>" >&2
+  echo "usage: $me list | current | get-default | set-default <name> | switch <name> [app] | request <name> [reason] | switcher | next | back | boot | menu <from> | install <name> | ended <unit> | revive <name> | ready | mark-ready" >&2
   exit 2
 }
 
@@ -714,6 +714,29 @@ revive() {
   request "$t" revive
 }
 
+mark_ready() {
+  local d
+  [[ $(id -u) == 0 ]] || { log "mark-ready runs as root, start blockie-session-ready.service"; exit 2; }
+  ids || { log "no user $user"; exit 1; }
+  d=$(get_default) || { log "ready: no default session"; exit 1; }
+  load "$d" || { log "ready: $d is not a listed session"; exit 1; }
+  install -d -m 0755 "$rundir"
+  if ! within "${START_WAIT:-$t_start}" shows "$UNIT" "$APP_ID"; then
+    log "ready: $d shows no window of $APP_ID, not marked"
+    exit 1
+  fi
+  put "$rundir/ready" "$d $UNIT" || exit 1
+  log "ready: $d"
+}
+
+ready() {
+  if [[ $(id -u) == 0 ]]; then
+    mark_ready
+  else
+    exec systemctl start --no-block blockie-session-ready.service
+  fi
+}
+
 main() {
   case ${1:-} in
     list) (( $# == 1 )) || usage; list ;;
@@ -735,6 +758,8 @@ main() {
     install) (( $# == 2 )) || usage; install_action "$2" ;;
     ended) (( $# == 2 )) || usage; ended "$2" ;;
     revive) (( $# == 2 )) && [[ $2 =~ $namere ]] || usage; revive "$2" ;;
+    ready) (( $# == 1 )) || usage; ready ;;
+    mark-ready) (( $# == 1 )) || usage; mark_ready ;;
     *) usage ;;
   esac
 }

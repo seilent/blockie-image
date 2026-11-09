@@ -51,6 +51,11 @@ const cases = [
   [units, "blockie", "blockie-session-appswitch@x;y.service", "start", "none"],
   [units, "blockie", "blockie-session-switcher.service", "start", "none"],
   [units, "blockie", "blockie-session-boot.service", "start", "none"],
+  [units, "blockie", "blockie-session-ready.service", "start", "yes"],
+  [units, "blockie", "blockie-session-ready.service", "stop", "none"],
+  [units, "blockie", "blockie-session-ready.service", "restart", "none"],
+  [units, "blockie", "blockie-session-ready@x.service", "start", "none"],
+  [units, "other", "blockie-session-ready.service", "start", "none"],
   [units, "blockie", "blockie-poweroff.service", "start", "none"],
   [units, "other", "blockie-session-switch@x.service", "start", "none"],
   [units, "other", "blockie-session-appswitch@x.service", "start", "none"],
@@ -78,7 +83,7 @@ process.exit(bad ? 1 : 0);
 EOF
   local rc=$?
   [[ $rc == 0 ]] || sed 's/^/  /' "$t/polkit.out"
-  res $rc "polkit: blockie may start switch@, appswitch@ and revive@ of a session name, nothing else"
+  res $rc "polkit: blockie may start switch@, appswitch@ and revive@ of a session name and blockie-session-ready, nothing else"
 }
 
 if [[ ${1:-} == polkit ]]; then
@@ -1105,5 +1110,45 @@ bs switcher > "$t/out" 2>&1
 r=$?
 [[ $r == 0 && ! -s $t/out ]]
 res $? "a run with no pending request exits 0 with nothing logged"
+
+rm -f "${t:?}/run/ready"
+echo a > "$t/default"
+touch "$t/units/blockie-test-a.service.active" "$t/win/test.a"
+bs mark-ready > "$t/out" 2>&1
+r=$?
+[[ $r == 0 && $(cat "$t/run/ready") == "a blockie-test-a.service" && $(stat -c %a "$t/run/ready") == 644 ]]
+res $? "mark-ready as root: the default session shows its window, ready names it and its unit (0644)"
+rm -f "${t:?}/run/ready" "${t:?}/win/test.a"
+bs mark-ready > "$t/out" 2>&1
+r=$?
+[[ $r == 1 && ! -e $t/run/ready ]] && grep -q 'shows no window of test.a' "$t/out"
+res $? "mark-ready with no window of the default session within its start wait: exit 1, nothing marked"
+touch "$t/win/test.a"
+echo b > "$t/default"
+rm -f "$t/units/blockie-test-b.service.active" "$t/win/test.b"
+bs mark-ready > "$t/out" 2>&1
+r=$?
+[[ $r == 1 && ! -e $t/run/ready ]]
+res $? "mark-ready counts only the default session: a's window while b is the default marks nothing"
+echo a > "$t/default"
+: > "$t/log"
+FAKE_UID=1000 bs ready > "$t/out" 2>&1
+r=$?
+[[ $r == 0 && ! -e $t/run/ready ]] && logged "systemctl start --no-block blockie-session-ready.service"
+r1=$?
+FAKE_UID=1000 bs mark-ready > "$t/out" 2>&1
+r=$?
+[[ $r == 2 && ! -e $t/run/ready ]]
+res $((r1 || $?)) "ready as the session user starts blockie-session-ready.service; mark-ready refuses a non root caller"
+bs ready > "$t/out" 2>&1
+r=$?
+[[ $r == 0 && $(cat "$t/run/ready") == "a blockie-test-a.service" ]]
+res $? "ready as root marks at once"
+rm -f "${t:?}/run/ready" "${t:?}/default"
+ru=$sf/usr/lib/systemd/system/blockie-session-ready.service
+grep -qxF 'ExecStart=/usr/bin/blockie-session mark-ready' "$ru" && grep -qxF 'ReadWritePaths=/run/blockie-session' "$ru" &&
+  grep -qxF 'CapabilityBoundingSet=CAP_SETUID CAP_SETGID' "$ru" && grep -qxF 'NoNewPrivileges=yes' "$ru" &&
+  ! grep -q '^\[Install\]' "$ru"
+res $? "blockie-session-ready.service runs mark-ready in the switcher's sandbox, with no [Install]"
 
 done_
