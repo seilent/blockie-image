@@ -76,8 +76,8 @@ GESTURES = ("tap", "hold", "press")
 DISPLAY = {"awake": "blank-off", "blanked": "blank-on", "lit-frozen": "screen-on", "menu": "menu-on"}
 DEFAULTS = {("home", "hold"): ((LONG_MS, "hold", ("switcher",)),), ("volup", "press"): ("hook", "volume-up"),
             ("voldown", "press"): ("hook", "volume-down"), ("power", "tap"): ("blank",),
-            ("power", "hold"): ((2000, "hold=2000", ("menu",)),
-                                (4000, "hold=4000", ("unit", "blockie-poweroff.service")))}
+            ("power", "hold"): ((1000, "hold=1000", ("menu",)),
+                                (3000, "hold=3000", ("unit", "blockie-poweroff.service")))}
 TARGETS = ("reboot", "android", "recovery")
 EXITS = ("cancel", "screen-off", "poweroff", "failed")
 RUNNING = ("activating", "active", "deactivating", "reloading")
@@ -233,6 +233,7 @@ class Menu:
         self.kill = 0
         self.toast = 0
         self.late = 0
+        self.ending = False
 
 
 class Hotkeyd:
@@ -635,8 +636,9 @@ class Hotkeyd:
         return False
 
     def end_menu(self, m):
-        if m.kill:
+        if m.ending:
             return
+        m.ending = True
         if m.result not in EXITS:
             log("SIGTERM to blockie-powermenu")
             m.proc.send_signal(15)
@@ -1082,7 +1084,8 @@ class Hotkeyd:
         if self.wanted in ("blanked", "menu", "lit-frozen") and key != "power":
             return
         m = self.last
-        if fallback and m is not None and m.shown and (m is self.menu or m.at >= self.keys[key].down_at):
+        if (fallback and m is not None and m.shown
+                and ((m is self.menu and not m.ending) or m.at >= self.keys[key].down_at)):
             log(f"{key} {gesture}: blockie-powermenu showed: {' '.join(row)} skipped")
             return
         action, args = row[0], row[1:]
