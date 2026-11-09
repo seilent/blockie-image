@@ -1,0 +1,83 @@
+{
+  "owner": "blockie-set",
+  "keys": {
+    "buttons.home.tap": {
+      "type": "s",
+      "default": "none",
+      "enum": ["none", "switcher", "game-menu", "game-quit"],
+      "group": "buttons",
+      "label": "Home tap",
+      "map": true
+    },
+    "buttons.home.hold": {
+      "type": "s",
+      "default": "switcher",
+      "enum": ["none", "switcher", "game-menu", "game-quit"],
+      "group": "buttons",
+      "label": "Home hold",
+      "map": true
+    },
+    "buttons.extra1.tap": {
+      "type": "s",
+      "default": "none",
+      "enum": ["none", "switcher", "game-menu", "game-quit"],
+      "group": "buttons",
+      "label": "Top side tap",
+      "map": true
+    },
+    "buttons.extra1.hold": {
+      "type": "s",
+      "default": "none",
+      "enum": ["none", "switcher", "game-menu", "game-quit"],
+      "group": "buttons",
+      "label": "Top side hold",
+      "map": true
+    },
+    "buttons.extra2.tap": {
+      "type": "s",
+      "default": "none",
+      "enum": ["none", "switcher", "game-menu", "game-quit"],
+      "group": "buttons",
+      "label": "Left tap",
+      "map": true
+    },
+    "buttons.extra2.hold": {
+      "type": "s",
+      "default": "none",
+      "enum": ["none", "switcher", "game-menu", "game-quit"],
+      "group": "buttons",
+      "label": "Left hold",
+      "map": true
+    },
+    "buttons.extra3.tap": {
+      "type": "s",
+      "default": "game-menu",
+      "enum": ["none", "switcher", "game-menu", "game-quit"],
+      "group": "buttons",
+      "label": "Logo tap",
+      "map": true
+    },
+    "buttons.extra3.hold": {
+      "type": "s",
+      "default": "game-quit",
+      "enum": ["none", "switcher", "game-menu", "game-quit"],
+      "group": "buttons",
+      "label": "Logo hold",
+      "map": true
+    }
+  },
+  "rules": [
+    {
+      "need": ["switcher"],
+      "keys": ["buttons.home.tap", "buttons.home.hold", "buttons.extra1.tap", "buttons.extra1.hold",
+               "buttons.extra2.tap", "buttons.extra2.hold", "buttons.extra3.tap", "buttons.extra3.hold"],
+      "message": "the session switcher needs a button"
+    },
+    {
+      "need": ["game-menu", "game-quit"],
+      "keys": ["buttons.home.tap", "buttons.home.hold", "buttons.extra1.tap", "buttons.extra1.hold",
+               "buttons.extra2.tap", "buttons.extra2.hold", "buttons.extra3.tap", "buttons.extra3.hold"],
+      "message": "a game needs a button for its menu or quit"
+    }
+  ]
+}

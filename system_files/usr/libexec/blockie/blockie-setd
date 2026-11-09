@@ -25,6 +25,8 @@ WRITERS = os.environ.get("BLOCKIE_SETD_WRITERS", "root blockie").split()
 LOCALTIME = os.environ.get("BLOCKIE_SETD_LOCALTIME", "/etc/localtime")
 ZONETAB = os.environ.get("BLOCKIE_SETD_ZONETAB", "/usr/share/zoneinfo/zone.tab")
 TIMEDATE_MS = int(os.environ.get("BLOCKIE_SETD_TIMEDATE_MS", "4000"))
+EFFECTIVE = os.environ.get("BLOCKIE_SETD_EFFECTIVE", "/run/blockie-set")
+BUTTONS = ("home", "extra1", "extra2", "extra3")
 TIMEDATE = "org.freedesktop.timedate1"
 TIMEDATE_PATH = "/org/freedesktop/timedate1"
 ZONEINFO = ("../usr/share/zoneinfo/", "/usr/share/zoneinfo/")
@@ -41,6 +43,12 @@ XML = f"""
     <method name="Set">
       <arg name="key" type="s" direction="in"/>
       <arg name="value" type="v" direction="in"/>
+    </method>
+    <method name="SetMany">
+      <arg name="values" type="a{{sv}}" direction="in"/>
+    </method>
+    <method name="Reset">
+      <arg name="keys" type="as" direction="in"/>
     </method>
     <method name="List">
       <arg name="prefix" type="s" direction="in"/>
@@ -115,9 +123,19 @@ def read_zone():
     return ""
 
 
+def show(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def schema_files():
+    return sorted(glob.glob(os.path.join(glob.escape(SCHEMAS), "*.json")))
+
+
 def load_schema():
     keys = {}
-    for path in sorted(glob.glob(os.path.join(glob.escape(SCHEMAS), "*.json"))):
+    for path in schema_files():
         try:
             with open(path) as f:
                 data = json.load(f)
@@ -136,6 +154,10 @@ def load_schema():
                                       or any("backend" in s for s in keys.values())):
                 log(f"{path}: {key} is not the one timedate1 key of type s with enum_from zones, ignored")
                 continue
+            if not isinstance(spec.get("map", False), bool) or (spec.get("map") and spec["type"] == "s" and not all(
+                    isinstance(v, str) and v and not any(c.isspace() for c in v) for v in spec.get("enum", [""]))):
+                log(f"{path}: {key}: map takes true or false, a mapped s key needs an enum of words, ignored")
+                continue
             try:
                 spec["default"] = check(key, spec, spec.get("default"), defaults=True)
             except Refused as err:
@@ -143,6 +165,50 @@ def load_schema():
                 continue
             keys[key] = spec
     return keys
+
+
+def holds(rule, values):
+    return any(values[k] in rule["need"] for k in rule["keys"])
+
+
+def load_rules(keys):
+    rules = []
+    for path in schema_files():
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            continue
+        for n, rule in enumerate(data.get("rules", []), 1):
+            if not (isinstance(rule, dict) and isinstance(rule.get("message"), str)
+                    and all(isinstance(rule.get(f), list) and rule[f] for f in ("need", "keys"))
+                    and all(isinstance(k, str) for k in rule["keys"])):
+                log(f"{path}: rule {n} is not need, keys and message, dropped")
+                continue
+            unknown = [k for k in rule["keys"] if k not in keys or "backend" in keys[k]]
+            if unknown:
+                log(f"{path}: rule {n} names unknown key {', '.join(unknown)}, dropped")
+                continue
+            if not holds(rule, {k: keys[k]["default"] for k in rule["keys"]}):
+                log(f"{path}: rule {n}: the defaults break it ({rule['message']}), dropped")
+                continue
+            rules.append({f: rule[f] for f in ("need", "keys", "message")})
+    return rules
+
+
+def write_map(name, lines):
+    fd, tmp = tempfile.mkstemp(prefix=f".{name}.", dir=EFFECTIVE)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, os.path.join(EFFECTIVE, name))
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def check(key, spec, value, defaults=False):
@@ -172,8 +238,9 @@ def check(key, spec, value, defaults=False):
 
 
 class Store:
-    def __init__(self, keys):
+    def __init__(self, keys, rules=()):
         self.keys = keys
+        self.rules = list(rules)
         self.values = {}
         try:
             with open(STORE) as f:
@@ -197,6 +264,36 @@ class Store:
                 self.values[key] = check(key, spec, value)
             except Refused as err:
                 log(f"{STORE}: {key}: {err}, the default applies")
+        dropped = True
+        while dropped:
+            dropped = False
+            for rule in self.rules:
+                if holds(rule, self.effective(self.values)):
+                    continue
+                stored = [k for k in rule["keys"] if k in self.values]
+                log(f"{STORE}: {rule['message']}: {', '.join(stored) or 'nothing stored'}, the defaults apply")
+                for k in stored:
+                    del self.values[k]
+                dropped = dropped or bool(stored)
+
+    def effective(self, values):
+        return {k: values.get(k, s["default"]) for k, s in self.keys.items() if "backend" not in s}
+
+    def broken(self, values, touched):
+        now = self.effective(values)
+        for rule in self.rules:
+            if touched & set(rule["keys"]) and not holds(rule, now):
+                raise Refused("Invalid", rule["message"])
+
+    def writable(self, key):
+        spec = self.keys.get(key)
+        if spec is None:
+            raise Refused("UnknownKey", f"no key {key}")
+        if spec.get("writable", True) is False:
+            raise Refused("ReadOnly", f"{key} is read only")
+        if "backend" in spec:
+            raise Refused("ReadOnly", f"{key} takes only Set")
+        return spec
 
     def get(self, key):
         spec = self.keys.get(key)
@@ -217,9 +314,48 @@ class Store:
             return False
         values = dict(self.values)
         values[key] = value
+        self.broken(values, {key})
         self.save(values)
         self.values = values
         return True
+
+    def set_many(self, items):
+        values = dict(self.values)
+        for key, value in items.items():
+            values[key] = check(key, self.writable(key), value)
+        return self.commit(values, set(items))
+
+    def reset(self, keys):
+        values = dict(self.values)
+        for key in keys:
+            self.writable(key)
+            values.pop(key, None)
+        return self.commit(values, set(keys))
+
+    def commit(self, values, touched):
+        self.broken(values, touched)
+        before = self.effective(self.values)
+        if values != self.values:
+            self.save(values)
+            self.values = values
+        after = self.effective(values)
+        return sorted(k for k in touched if before[k] != after[k])
+
+    def publish(self):
+        now = self.effective(self.values)
+        write_map("settings", ["version 1"] + [f"{k} {show(now[k])}" for k in sorted(now) if self.keys[k].get("map")])
+        names = [f"buttons.{b}.{g}" for b in BUTTONS for g in ("tap", "hold")]
+        if not all(k in now for k in names):
+            try:
+                os.unlink(os.path.join(EFFECTIVE, "buttons"))
+            except FileNotFoundError:
+                pass
+            return
+        lines = ["version 1"]
+        for b in BUTTONS:
+            tap, hold = now[f"buttons.{b}.tap"], now[f"buttons.{b}.hold"]
+            lines += [f"{b} tap {tap}", f"{b} hold {hold}", f"{b} free {'yes' if tap == hold == 'none' else 'no'}"]
+        write_map("buttons", lines)
 
     def save(self, values):
         d = os.path.dirname(STORE)
@@ -363,6 +499,13 @@ class Timezone:
         self.answer(kind, msg)
 
 
+def try_publish(store):
+    try:
+        store.publish()
+    except OSError as err:
+        log(f"cannot write the map in {EFFECTIVE}: {err}")
+
+
 class Service:
     def __init__(self, bus, store):
         self.bus = bus
@@ -383,6 +526,20 @@ class Service:
                                Gio.DBusCallFlags.NONE, -1, None)
         return r.unpack()[0]
 
+    def writer(self, sender, what):
+        uid = self.caller_uid(sender)
+        if uid not in self.writers:
+            raise Refused("Denied", f"uid {uid} may not set {what}")
+        return uid
+
+    def changed(self, keys, touched=None):
+        for key in keys:
+            spec = self.store.keys[key]
+            self.bus.emit_signal(None, PATH, IFACE, "Changed",
+                                 GLib.Variant("(sv)", (key, GLib.Variant(spec["type"], self.store.get(key)))))
+        if any(self.store.keys[k].get("map") for k in (keys if touched is None else touched)):
+            try_publish(self.store)
+
     def call(self, conn, sender, path, iface, method, params, inv):
         try:
             if method == "Get":
@@ -397,12 +554,11 @@ class Service:
             elif method == "Schema":
                 (prefix,) = params.unpack()
                 out = {k: s for k, s in sorted(self.store.keys.items()) if k.startswith(prefix)}
-                inv.return_value(GLib.Variant("(s)", (json.dumps({"keys": out}, sort_keys=True),)))
+                rules = [r for r in self.store.rules if all(k.startswith(prefix) for k in r["keys"])]
+                inv.return_value(GLib.Variant("(s)", (json.dumps({"keys": out, "rules": rules}, sort_keys=True),)))
             elif method == "Set":
                 key, value = params.unpack()
-                uid = self.caller_uid(sender)
-                if uid not in self.writers:
-                    raise Refused("Denied", f"uid {uid} may not set {key}")
+                uid = self.writer(sender, key)
                 got = params.get_child_value(1).get_variant().get_type_string()
                 spec = self.store.keys.get(key)
                 if spec is not None and got != spec["type"]:
@@ -413,10 +569,30 @@ class Service:
                     self.backends[key].set(spec, value, inv, uid)
                     return
                 if self.store.set(key, value):
-                    spec = self.store.keys[key]
                     log(f"{key} set by uid {uid}")
-                    self.bus.emit_signal(None, PATH, IFACE, "Changed",
-                                         GLib.Variant("(sv)", (key, GLib.Variant(spec["type"], self.store.get(key)))))
+                    self.changed([key])
+                inv.return_value(None)
+            elif method == "SetMany":
+                (items,) = params.unpack()
+                uid = self.writer(sender, ", ".join(sorted(items)) or "nothing")
+                entries = params.get_child_value(0)
+                for i in range(entries.n_children()):
+                    entry = entries.get_child_value(i)
+                    key = entry.get_child_value(0).get_string()
+                    got = entry.get_child_value(1).get_variant().get_type_string()
+                    spec = self.store.keys.get(key)
+                    if spec is not None and got != spec["type"]:
+                        raise Refused("Invalid", f"{key} takes {spec['type']}, not {got}")
+                changed = self.store.set_many(items)
+                log(f"{', '.join(sorted(items)) or 'nothing'} set by uid {uid}")
+                self.changed(changed, items)
+                inv.return_value(None)
+            elif method == "Reset":
+                (names,) = params.unpack()
+                uid = self.writer(sender, ", ".join(names) or "nothing")
+                changed = self.store.reset(names)
+                log(f"{', '.join(names) or 'nothing'} reset by uid {uid}")
+                self.changed(changed, names)
                 inv.return_value(None)
             else:
                 inv.return_dbus_error(f"{ERR}.UnknownMethod", method)
@@ -432,7 +608,8 @@ class Service:
 
 def main():
     keys = load_schema()
-    store = Store(keys)
+    store = Store(keys, load_rules(keys))
+    try_publish(store)
     loop = GLib.MainLoop()
     if BUS == "system":
         bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
@@ -452,7 +629,7 @@ def main():
 
     Gio.bus_own_name_on_connection(bus, NAME, Gio.BusNameOwnerFlags.NONE, None, lost)
     GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, 15, loop.quit)
-    log(f"{len(keys)} keys from {SCHEMAS}, store {STORE}")
+    log(f"{len(keys)} keys and {len(store.rules)} rules from {SCHEMAS}, store {STORE}, map {EFFECTIVE}")
     loop.run()
     return 1 if failed else 0
 

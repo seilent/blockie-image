@@ -16,7 +16,8 @@ BUS = os.environ.get("BLOCKIE_SETD_BUS", "system")
 
 
 def usage():
-    print(f"usage: {ME} get <key> | set <key> <value> | list [prefix] | schema [prefix]", file=sys.stderr)
+    print(f"usage: {ME} get <key> | set <key> <value> | set-many <key>=<value>... | reset <key>... | list [prefix]"
+          " | schema [prefix]", file=sys.stderr)
     sys.exit(2)
 
 
@@ -80,6 +81,24 @@ def main(argv):
                 print(f"{ME}: {args[0]} takes {spec['type']}: {err}", file=sys.stderr)
                 return 1
             call(conn, "Set", GLib.Variant("(sv)", (args[0], GLib.Variant(spec["type"], value))), None)
+        elif cmd == "set-many" and args:
+            (text,) = call(conn, "Schema", GLib.Variant("(s)", ("",)), "(s)")
+            keys = json.loads(text)["keys"]
+            values = {}
+            for arg in args:
+                key, eq, raw = arg.partition("=")
+                spec = keys.get(key)
+                if not eq or spec is None:
+                    print(f"{ME}: {arg} is not <key>=<value> with a known key", file=sys.stderr)
+                    return 1
+                try:
+                    values[key] = GLib.Variant(spec["type"], parse(spec["type"], raw))
+                except ValueError as err:
+                    print(f"{ME}: {key} takes {spec['type']}: {err}", file=sys.stderr)
+                    return 1
+            call(conn, "SetMany", GLib.Variant("(a{sv})", (values,)), None)
+        elif cmd == "reset" and args:
+            call(conn, "Reset", GLib.Variant("(as)", (args,)), None)
         elif cmd == "list" and len(args) <= 1:
             (values,) = call(conn, "List", GLib.Variant("(s)", (args[0] if args else "",)), "(a{sv})")
             for k in sorted(values):

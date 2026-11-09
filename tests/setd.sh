@@ -10,6 +10,8 @@ schema=${SETD_SCHEMA:-/usr/share/blockie/schema.d}
 [[ -d $schema ]] || schema=$here/../system_files/usr/share/blockie/schema.d
 rules=${SETD_RULES:-/usr/share/polkit-1/rules.d/50-blockie-timezone.rules}
 [[ -f $rules ]] || rules=$here/../system_files/usr/share/polkit-1/rules.d/50-blockie-timezone.rules
+policy=${SETD_POLICY:-/usr/share/dbus-1/system.d/net.seilent.Blockie.Settings.conf}
+[[ -f $policy ]] || policy=$here/../system_files/usr/share/dbus-1/system.d/net.seilent.Blockie.Settings.conf
 t=$(mktemp -d "${TMPDIR:-/tmp}/setd.XXXXXX")
 fails=0
 pids=()
@@ -87,7 +89,7 @@ if [[ ${1:-} == polkit ]]; then
   done_
 fi
 
-mkdir -p "$t/schema" "$t/store" "$t/sessions" "$t/etc" "$t/td" "$t/lt"
+mkdir -p "$t/schema" "$t/store" "$t/sessions" "$t/etc" "$t/td" "$t/lt" "$t/run" "$t/x" "$t/xrun"
 cat > "$t/zone.tab" << 'EOF'
 # tzdb timezone descriptions
 #
@@ -126,11 +128,34 @@ cat > "$t/schema/20-test.json" << 'EOF'
   }
 }
 EOF
+cat > "$t/x/10-x.json" << 'EOF'
+{
+  "keys": {
+    "x.a": {"type": "s", "default": "on", "enum": ["on", "off"], "map": true},
+    "x.b": {"type": "s", "default": "off", "enum": ["on", "off"], "map": true},
+    "x.n": {"type": "u", "default": 7, "map": true},
+    "x.on": {"type": "b", "default": true, "map": true},
+    "x.off": {"type": "b", "default": false, "map": false},
+    "x.free": {"type": "s", "default": "x", "map": true},
+    "x.spaced": {"type": "s", "default": "a b", "enum": ["a b"], "map": true},
+    "x.int": {"type": "b", "default": false, "map": 1},
+    "x.zone": {"type": "s", "default": "UTC", "enum_from": "zones", "backend": "timedate1"}
+  },
+  "rules": [
+    {"need": ["on"], "keys": ["x.a", "x.b"], "message": "x needs one on"},
+    {"need": ["on"], "keys": ["x.a", "x.gone"], "message": "names a gone key"},
+    {"need": ["off"], "keys": ["x.a"], "message": "the defaults break this"},
+    {"need": "on", "keys": ["x.a"], "message": "bad shape"},
+    {"need": ["on"], "keys": ["x.zone"], "message": "names a backend key"}
+  ]
+}
+EOF
 printf 'DEFAULT=yes\n' > "$t/sessions/emulation.conf"
 printf 'DEFAULT="yes"\n' > "$t/sessions/funeos.conf"
 printf 'DEFAULT=no\n' > "$t/sessions/test-a.conf"
 export BLOCKIE_SETD_SCHEMAS=$t/schema BLOCKIE_SETD_STORE=$t/store/settings.json BLOCKIE_SETD_SESSIONS=$t/sessions
 export BLOCKIE_SETD_LOCALTIME=$t/etc/localtime BLOCKIE_SETD_ZONETAB=$t/zone.tab BLOCKIE_SETD_TIMEDATE_MS=1000
+export BLOCKIE_SETD_EFFECTIVE=$t/run
 
 python3 - "$setd" > "$t/unit.out" 2>&1 << 'EOF'
 import importlib.machinery
@@ -270,6 +295,152 @@ m.Gio, m.read_zone = gio, read
 check(order == ["monitor", "connect", "read"] and z.last_sent == "UTC" and isinstance(z.monitor, Mon),
       f"the monitor is created and kept before the seed read: {order}")
 os.unlink(os.environ["BLOCKIE_SETD_STORE"])
+
+store = os.environ["BLOCKIE_SETD_STORE"]
+run = os.environ["BLOCKIE_SETD_EFFECTIVE"]
+logs = []
+m.log = logs.append
+buttons = [f"buttons.{b}.{g}" for b in ("home", "extra1", "extra2", "extra3") for g in ("tap", "hold")]
+words = ["none", "switcher", "game-menu", "game-quit"]
+defaults = {"buttons.home.tap": "none", "buttons.home.hold": "switcher", "buttons.extra1.tap": "none",
+            "buttons.extra1.hold": "none", "buttons.extra2.tap": "none", "buttons.extra2.hold": "none",
+            "buttons.extra3.tap": "game-menu", "buttons.extra3.hold": "game-quit"}
+default_map = ["version 1", "home tap none", "home hold switcher", "home free no", "extra1 tap none",
+               "extra1 hold none", "extra1 free yes", "extra2 tap none", "extra2 hold none", "extra2 free yes",
+               "extra3 tap game-menu", "extra3 hold game-quit", "extra3 free no"]
+rules = m.load_rules(keys)
+check(all(keys[k]["type"] == "s" and keys[k]["enum"] == words and keys[k]["map"] is True
+          and keys[k]["group"] == "buttons" for k in buttons) and {k: keys[k]["default"] for k in buttons} == defaults,
+      "the 8 buttons keys load with their enum, group, map and defaults")
+check([r["message"] for r in rules] == ["the session switcher needs a button",
+                                       "a game needs a button for its menu or quit"]
+      and [r["need"] for r in rules] == [["switcher"], ["game-menu", "game-quit"]]
+      and all(r["keys"] == buttons for r in rules),
+      f"R-switch and R-game load over the 8 keys: {rules}")
+check(not [line for line in logs if "rule" in line], f"the shipped rules load with no log: {logs}")
+
+
+def stored():
+    try:
+        with open(store) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+
+
+def read(name, d=run):
+    with open(os.path.join(d, name)) as f:
+        return f.read().splitlines()
+
+
+def message(f):
+    try:
+        f()
+    except m.Refused as err:
+        return err.kind, str(err)
+    return None
+
+
+s = m.Store(keys, rules)
+s.publish()
+check(read("buttons") == default_map and oct(os.stat(os.path.join(run, "buttons")).st_mode & 0o777) == "0o644",
+      f"the buttons map holds the defaults in 13 lines, 0644: {read('buttons')}")
+check(read("settings") == ["version 1"] + [f"{k} {defaults[k]}" for k in sorted(buttons)]
+      and oct(os.stat(os.path.join(run, "settings")).st_mode & 0o777) == "0o644",
+      f"the settings map holds every map key in sorted order with its effective value: {read('settings')}")
+check(refused(lambda: s.set("buttons.home.tap", "back"), "Invalid") and stored() is None, "an unknown word is Invalid")
+saves = []
+save = s.save
+s.save = lambda values: saves.append(dict(values)) or save(values)
+check(message(lambda: s.set("buttons.home.hold", "none")) == ("Invalid", "the session switcher needs a button")
+      and stored() is None and not saves, "the Set that clears the last switcher is Invalid with R-switch's message")
+check(s.set_many({"buttons.extra1.hold": "switcher", "buttons.home.hold": "none"}) == ["buttons.extra1.hold",
+                                                                                      "buttons.home.hold"]
+      and stored() == {"buttons.extra1.hold": "switcher", "buttons.home.hold": "none"} and len(saves) == 1,
+      "the same move as one SetMany is taken in one store write and names both keys as changed")
+s.publish()
+moved = read("buttons")
+check(moved[1:7] == ["home tap none", "home hold none", "home free yes", "extra1 tap none", "extra1 hold switcher",
+                     "extra1 free no"] and moved[7:] == default_map[7:], f"the map follows the move: {moved}")
+check(message(lambda: s.reset(["buttons.extra1.hold"])) == ("Invalid", "the session switcher needs a button")
+      and stored() == {"buttons.extra1.hold": "switcher", "buttons.home.hold": "none"} and len(saves) == 1
+      and read("buttons") == moved,
+      "a partial Reset that leaves no switcher is Invalid, the store and the map unchanged")
+check(s.set("buttons.extra3.tap", "none") and s.get("buttons.extra3.tap") == "none",
+      "with extra3 hold game-quit, extra3 tap none passes")
+check(message(lambda: s.set("buttons.extra3.hold", "none")) == ("Invalid", "a game needs a button for its menu or quit")
+      and s.get("buttons.extra3.hold") == "game-quit", "then extra3 hold none is Invalid with R-game's message")
+before, n = stored(), len(saves)
+check(refused(lambda: s.set_many({"buttons.extra2.tap": "switcher", "buttons.extra2.hold": "bogus"}), "Invalid")
+      and refused(lambda: s.set_many({"buttons.extra2.tap": "switcher", "buttons.nope": "none"}), "UnknownKey")
+      and refused(lambda: s.set_many({"buttons.extra2.tap": "switcher", "test.fixed": "y"}), "ReadOnly")
+      and stored() == before and len(saves) == n, "a SetMany with one bad key changes nothing")
+check(message(lambda: s.set_many({"system.timezone": "UTC"})) == ("ReadOnly", "system.timezone takes only Set")
+      and message(lambda: s.reset(["system.timezone"])) == ("ReadOnly", "system.timezone takes only Set")
+      and refused(lambda: s.reset(["buttons.nope"]), "UnknownKey") and stored() == before,
+      "SetMany and Reset refuse a backend key with ReadOnly and an unknown key with UnknownKey")
+check(s.set_many({"buttons.extra1.hold": "switcher"}) == [] and len(saves) == n,
+      "a SetMany of the stored values changes and writes nothing")
+check(s.reset(buttons) == ["buttons.extra1.hold", "buttons.extra3.tap", "buttons.home.hold"] and stored() == {}
+      and len(saves) == n + 1, "a Reset of all 8 passes in one write and names the keys whose value changed")
+s.publish()
+check(read("buttons") == default_map, "after the full Reset the map holds the defaults again")
+check(not [f for f in os.listdir(run) if f.startswith(".")], "no temp file left in the map dir")
+
+with open(store, "w") as f:
+    json.dump({"buttons.home.hold": "none", "buttons.extra3.tap": "none", "buttons.extra2.tap": "switcher",
+               "test.mode": "b"}, f)
+logs.clear()
+s = m.Store(keys, rules)
+check(s.get("buttons.extra2.tap") == "switcher" and s.get("buttons.home.hold") == "none"
+      and s.get("buttons.extra3.tap") == "none" and not logs,
+      f"a stored layout that keeps the rules loads as stored: {logs}")
+with open(store, "w") as f:
+    json.dump({"buttons.home.hold": "none", "buttons.extra3.tap": "none", "buttons.extra1.tap": "game-quit",
+               "test.mode": "b"}, f)
+logs.clear()
+s = m.Store(keys, rules)
+check(all(s.get(k) == defaults[k] for k in buttons) and s.get("test.mode") == "b"
+      and [line for line in logs if "the session switcher needs a button" in line],
+      f"a stored layout breaking R-switch at load: the rule's keys use the defaults, logged, other keys stay: {logs}")
+with open(store, "w") as f:
+    f.write("{not json")
+logs.clear()
+s = m.Store(keys, rules)
+check(all(s.get(k) == defaults[k] for k in buttons) and [line for line in logs if "starting from the defaults" in line],
+      f"a corrupt store starts from the defaults, logged: {logs}")
+os.unlink(store)
+
+x = os.path.join(os.path.dirname(store), "..", "x")
+m.SCHEMAS = x
+logs.clear()
+xkeys = m.load_schema()
+check(set(xkeys) == {"x.a", "x.b", "x.n", "x.on", "x.off", "x.zone"}
+      and len([line for line in logs if "map takes true or false" in line]) == 3,
+      f"map must be a boolean and a mapped s key needs an enum of words: {sorted(xkeys)} {logs}")
+logs.clear()
+xrules = m.load_rules(xkeys)
+check([r["message"] for r in xrules] == ["x needs one on"], f"only the sound fixture rule stays: {xrules}")
+check([line for line in logs if "rule 2 names unknown key x.gone, dropped" in line]
+      and [line for line in logs if "rule 3: the defaults break it (the defaults break this), dropped" in line]
+      and [line for line in logs if "rule 4 is not need, keys and message, dropped" in line]
+      and [line for line in logs if "rule 5 names unknown key x.zone, dropped" in line],
+      f"a rule naming an unknown or backend key, a rule its defaults break and a malformed rule are dropped: {logs}")
+m.SCHEMAS = os.environ["BLOCKIE_SETD_SCHEMAS"]
+xrun = os.path.join(os.path.dirname(store), "..", "xrun")
+m.EFFECTIVE = xrun
+with open(os.path.join(xrun, "buttons"), "w") as f:
+    f.write("version 1\n")
+xs = m.Store(xkeys, xrules)
+xs.publish()
+check(read("settings", xrun) == ["version 1", "x.a on", "x.b off", "x.n 7", "x.on true"]
+      and not os.path.exists(os.path.join(xrun, "buttons")),
+      f"the settings map has b lowercase and u in decimal; no buttons keys, no buttons map: {read('settings', xrun)}")
+check(message(lambda: xs.set_many({"x.a": "off"})) == ("Invalid", "x needs one on")
+      and xs.set_many({"x.a": "off", "x.b": "on"}),
+      "a fixture rule refuses and passes as the shipped ones do")
+m.EFFECTIVE = run
+os.unlink(store)
 sys.exit(1 if fails else 0)
 EOF
 r=$?
@@ -281,6 +452,23 @@ if command -v node > /dev/null; then
 else
   echo "polkit: no node in the image, the host leg (tests/setd.sh polkit) evaluates the rule"
 fi
+
+python3 - "$policy" > "$t/policy.out" 2>&1 << 'EOF'
+import sys
+import xml.etree.ElementTree as ET
+
+want = ("Set", "SetMany", "Reset")
+got = {}
+for p in ET.parse(sys.argv[1]).getroot().iter("policy"):
+    for a in p.iter("allow"):
+        if a.get("send_member") in want:
+            got.setdefault(a.get("send_member"), set()).add(p.get("user") or p.get("context"))
+print(got)
+sys.exit(0 if got == {m: {"root", "blockie"} for m in want} else 1)
+EOF
+r=$?
+[[ $r == 0 ]] || sed 's/^/  /' "$t/policy.out"
+res $r "policy: Set, SetMany and Reset go to root and blockie only"
 
 if command -v dbus-daemon > /dev/null; then
   cat > "$t/bus.conf" << EOF
@@ -301,6 +489,7 @@ EOF
   for _ in $(seq 50); do [[ -S $t/bus ]] && break; sleep 0.1; done
   export BLOCKIE_SETD_BUS=unix:path=$t/bus
   me=$(id -un)
+  rm -f "${t:?}/run/buttons" "${t:?}/run/settings"
   BLOCKIE_SETD_WRITERS=$me python3 "$setd" 2> "$t/setd.err" &
   pids+=($!)
   for _ in $(seq 50); do "$cli" get test.mode > /dev/null 2>&1 && break; sleep 0.1; done
@@ -349,6 +538,72 @@ EOF
   res $? "bus: Changed signals for the set keys"
   grep -q '"test.level": 5' "$t/store/settings.json"
   res $? "bus: the daemon wrote the store"
+
+  bm() { cat "$t/run/buttons"; }
+  bc() { grep -c "Changed ('buttons\." "$t/mon"; }
+  bdbus() {
+    DBUS_SESSION_BUS_ADDRESS=$BLOCKIE_SETD_BUS gdbus call --session --dest net.seilent.Blockie.Settings \
+      --object-path /net/seilent/Blockie/Settings --method "net.seilent.Blockie.Settings1.$1" "$2" 2>&1
+  }
+  dmap=$'version 1\nhome tap none\nhome hold switcher\nhome free no\nextra1 tap none\nextra1 hold none\nextra1 free yes'
+  dmap+=$'\nextra2 tap none\nextra2 hold none\nextra2 free yes\nextra3 tap game-menu\nextra3 hold game-quit\nextra3 free no'
+  [[ $(bm) == "$dmap" && $(stat -c %a "$t/run/buttons") == 644 && $(wc -l < "$t/run/buttons") == 13 &&
+    $(head -n 1 "$t/run/settings") == "version 1" && $(grep -c '^buttons\.' "$t/run/settings") == 8 ]]
+  res $? "bus: setd writes the buttons map (13 lines, 0644) and the settings map with the defaults at start"
+  "$cli" schema buttons. | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(len(d["keys"]) != 8 or [r["message"] for r in d["rules"]] != ["the session switcher needs a button", "a game needs a button for its menu or quit"])'
+  r=$?
+  "$cli" schema test. | python3 -c 'import json,sys; sys.exit(json.load(sys.stdin)["rules"] != [])'
+  [[ $r == 0 && $? == 0 ]]
+  res $? "bus: Schema(buttons.) carries the 8 keys with R-switch and R-game, another prefix no rule"
+  "$cli" set buttons.home.tap back 2> "$t/err"
+  [[ $? != 0 ]] && grep -q 'buttons.home.tap is one of none, switcher, game-menu, game-quit' "$t/err"
+  res $? "bus: an unknown word is refused"
+  cp "$t/store/settings.json" "$t/store.before"
+  "$cli" set buttons.home.hold none 2> "$t/err"
+  [[ $? != 0 ]] && grep -q 'the session switcher needs a button' "$t/err" &&
+    cmp -s "$t/store/settings.json" "$t/store.before" && [[ $(bm) == "$dmap" ]]
+  res $? "bus: the Set that clears the last switcher exits 1 with R-switch's message, store and map unchanged"
+  n=$(bc)
+  "$cli" set buttons.extra1.hold switcher && "$cli" set buttons.home.hold none
+  r=$?
+  sleep 0.3
+  [[ $r == 0 && $(sed -n 2,7p "$t/run/buttons") == $'home tap none\nhome hold none\nhome free yes\nextra1 tap none\nextra1 hold switcher\nextra1 free no' &&
+    $(bc) == $((n + 2)) ]] && grep -qx 'buttons.extra1.hold switcher' "$t/run/settings"
+  res $? "bus: two Sets move the switcher to extra1, new place first; both maps and Changed follow"
+  n=$(bc)
+  "$cli" set-many buttons.extra2.hold=switcher buttons.extra1.hold=none
+  r=$?
+  sleep 0.3
+  [[ $r == 0 && $(sed -n 5,10p "$t/run/buttons") == $'extra1 tap none\nextra1 hold none\nextra1 free yes\nextra2 tap none\nextra2 hold switcher\nextra2 free no' &&
+    $(bc) == $((n + 2)) ]] && grep -q "Changed ('buttons.extra1.hold', <'none'>)" "$t/mon" &&
+    grep -q "Changed ('buttons.extra2.hold', <'switcher'>)" "$t/mon"
+  res $? "bus: set-many moves it again in one call, one Changed per changed key"
+  cp "$t/run/buttons" "$t/map.before"
+  cp "$t/store/settings.json" "$t/store.before"
+  "$cli" reset buttons.extra2.hold 2> "$t/err"
+  [[ $? != 0 ]] && grep -q 'the session switcher needs a button' "$t/err" && cmp -s "$t/run/buttons" "$t/map.before" &&
+    cmp -s "$t/store/settings.json" "$t/store.before"
+  res $? "bus: a partial reset that leaves no switcher exits 1 with R-switch's message, store and map unchanged"
+  "$cli" set-many buttons.extra3.tap=switcher buttons.extra3.hold=bogus 2> "$t/err"
+  r=$?
+  "$cli" set-many buttons.extra3.tap 2>> "$t/err"
+  [[ $r != 0 && $? != 0 ]] && grep -q 'buttons.extra3.hold is one of' "$t/err" && grep -q 'is not <key>=<value>' "$t/err" &&
+    cmp -s "$t/run/buttons" "$t/map.before" && cmp -s "$t/store/settings.json" "$t/store.before"
+  res $? "bus: a set-many with one bad value or no = changes nothing"
+  a=$(bdbus SetMany "{'system.timezone': <'UTC'>}")
+  b=$(bdbus Reset "['system.timezone']")
+  c=$(bdbus SetMany "{'buttons.home.tap': <5>}")
+  [[ $a == *Settings.Error.ReadOnly:* && $b == *Settings.Error.ReadOnly:* && $c == *"takes s, not i"* ]] &&
+    cmp -s "$t/store/settings.json" "$t/store.before"
+  res $? "bus: SetMany and Reset of a backend key are ReadOnly, a wrong variant type is Invalid"
+  n=$(bc)
+  "$cli" reset buttons.home.tap buttons.home.hold buttons.extra1.tap buttons.extra1.hold buttons.extra2.tap \
+    buttons.extra2.hold buttons.extra3.tap buttons.extra3.hold
+  r=$?
+  sleep 0.3
+  [[ $r == 0 && $(bm) == "$dmap" && $(bc) == $((n + 2)) ]] &&
+    ! grep -q '"buttons\.' "$t/store/settings.json" && ! ls -A "$t/run" | grep -q '^\.'
+  res $? "bus: a reset of all 8 restores the default map, Changed for the two keys that changed, no temp file"
 
   gg() {
     DBUS_SESSION_BUS_ADDRESS=$BLOCKIE_SETD_BUS gdbus call --session --dest net.seilent.Blockie.Settings \
@@ -493,11 +748,19 @@ EOF
 
   kill "${pids[1]}"
   wait "${pids[1]}" 2> /dev/null
+  printf 'version 1\n' > "$t/run/buttons"
   BLOCKIE_SETD_WRITERS=nobody python3 "$setd" 2>> "$t/setd.err" &
   pids[1]=$!
   for _ in $(seq 50); do "$cli" get test.level > /dev/null 2>&1 && break; sleep 0.1; done
   [[ $("$cli" get test.level) == 5 ]]
   res $? "bus: values survive a daemon restart"
+  [[ $(bm) == "$dmap" ]]
+  res $? "bus: a restarted setd writes the map again"
+  "$cli" reset buttons.home.hold 2> "$t/err"
+  r=$?
+  "$cli" set-many buttons.extra1.hold=switcher 2>> "$t/err"
+  [[ $r != 0 && $? != 0 && $(grep -c "may not set" "$t/err") == 2 ]]
+  res $? "bus: a caller outside the writers may not reset or set-many"
   "$cli" set test.level 6 2> "$t/err"
   [[ $? != 0 ]] && grep -q "may not set test.level" "$t/err" && [[ $("$cli" get test.level) == 5 ]]
   res $? "bus: a caller outside the writers is refused"

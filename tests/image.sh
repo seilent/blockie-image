@@ -71,6 +71,11 @@ rpm -q e2fsprogs tzdata erofs-utils vulkan-tools egl-utils drm-utils strace file
 [[ -f /usr/share/zoneinfo/zone.tab ]] || fail "zone.tab missing"
 jq -e '.keys["system.timezone"] | .backend == "timedate1" and .enum_from == "zones"' \
   /usr/share/blockie/schema.d/10-system.json > /dev/null || fail "10-system.json lacks the timedate1 system.timezone key"
+jq -e '[.keys | to_entries[] | select(.key | test("^buttons\\.(home|extra[123])\\.(tap|hold)$")) | .value.map] |
+  length == 8 and all' /usr/share/blockie/schema.d/30-buttons.json > /dev/null || fail "30-buttons.json lacks the 8 mapped buttons keys"
+for l in RuntimeDirectory=blockie-set RuntimeDirectoryMode=0755 RuntimeDirectoryPreserve=yes; do
+  grep -qx "$l" /usr/lib/systemd/system/blockie-setd.service || fail "blockie-setd.service lacks $l"
+done
 [[ $(stat -c '%a %U' /usr/share/polkit-1/rules.d/50-blockie-timezone.rules 2> /dev/null) == '644 root' ]] ||
   fail "50-blockie-timezone.rules is not a 644 file owned by root"
 grep -q 'id="org.freedesktop.timedate1.set-timezone"' /usr/share/polkit-1/actions/org.freedesktop.timedate1.policy ||
