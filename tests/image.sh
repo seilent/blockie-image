@@ -161,7 +161,7 @@ rpm -q waydroid lxc dnsmasq iptables-legacy > /dev/null || fail "waydroid, lxc, 
 [[ $(rpm -q --qf '%{RELEASE}' waydroid) == *.blockie ]] || fail "waydroid is not the blockie build: $(rpm -q waydroid)"
 ! rpm -q waydroid-selinux > /dev/null || fail "waydroid-selinux is installed"
 grep -qx 'd /var/lib/dnsmasq 0755 root dnsmasq -' /usr/lib/tmpfiles.d/dnsmasq.conf || fail "no tmpfiles line for /var/lib/dnsmasq"
-for h in blank-on blank-off screen-on; do
+for h in blank-on blank-off screen-on menu-on; do
   [[ -f /usr/lib/blockie/hooks.d/$h && $(stat -c %a "/usr/lib/blockie/hooks.d/$h") == 755 ]] || fail "hook $h is not a 755 file"
 done
 [[ -x /usr/libexec/blockie/blockie-poweroff ]] || fail "blockie-poweroff missing"

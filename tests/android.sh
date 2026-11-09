@@ -159,6 +159,8 @@ for l in 'UnsetEnvironment=LD_PRELOAD LD_LIBRARY_PATH VK_DRIVER_FILES' \
 done
 [[ $(grep '^ExecStartPre=' "$au") == $'ExecStartPre=/usr/bin/mountpoint -q /var/lib/blockie/data\nExecStartPre=/usr/bin/systemctl start waydroid-container.service' ]] ||
   { ok=1; echo "  user unit ExecStartPre order"; }
+[[ $(grep '^ExecStop=' "$au") == $'ExecStop=-/usr/bin/systemctl start blockie-android-freeze@thaw.service\nExecStop=/usr/bin/systemctl stop waydroid-container.service' ]] ||
+  { ok=1; echo "  user unit ExecStop order: the thaw before the container stop"; }
 ! grep -q '^\[Install\]' "$au" || { ok=1; echo "  user unit has [Install]"; }
 systemd-analyze verify --man=no $sd/waydroid-container.service $sd/blockie-android-prep.service $sd/blockie-android-prep.path \
   $sd/blockie-data.service $sd/blockie-android-music.service $sd/blockie-android-pad.service > "$t/verify" 2>&1 || { ok=1; sed 's/^/  /' "$t/verify"; }

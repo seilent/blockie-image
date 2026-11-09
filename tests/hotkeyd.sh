@@ -36,21 +36,59 @@ voldown press switch test-b
 power hold none
 nonsense tap none
 home wiggle none
+home hold menu
 EOF
 printf 'extra3 press hook beep\nextra3 tap none\n' > "$t/usr/test-a.conf.d/50-x.conf"
 printf 'extra2 hold back\n' > "$t/etc/test-a.conf"
 
+mkdir -p "$t/fbin"
+: > "$t/menu.q"
+cat > "$t/fbin/fake-menu" << EOF
+#!/bin/sh
+echo "menu start from=\$BLOCKIE_POWERMENU_FROM state=\$BLOCKIE_BOOT_STATE" >> "$t/hooks.log"
+echo \$\$ > "$t/menu.pid"
+trap 'echo "menu term" >> "$t/hooks.log"; echo "term \$(date +%s%3N)" >> "$t/times"; [ -f "$t/menu.ignore" ] || { rm -f "$t/menu.pid"; exit 0; }' TERM
+while read -r d line; do
+  sleep "\$d" > /dev/null &
+  wait \$!
+  if [ "\$line" = exit ]; then
+    echo "menu exit" >> "$t/hooks.log"
+    rm -f "$t/menu.pid"
+    exit 0
+  fi
+  echo "\$line"
+done < "$t/menu.q"
+while :; do
+  sleep 20 > /dev/null &
+  wait \$!
+done
+EOF
+cat > "$t/fbin/fake-backlight" << EOF
+#!/bin/sh
+echo "backlight \$*" >> "$t/hooks.log"
+echo "backlight-\$1 \$(date +%s%3N)" >> "$t/times"
+EOF
+chmod 755 "$t/fbin/fake-menu" "$t/fbin/fake-backlight"
+endmenu() {
+  [[ ! -f $t/menu.pid ]] || kill -9 "$(< "$t/menu.pid")" 2> /dev/null
+  rm -f "$t/menu.pid" "$t/menu.ignore"
+  : > "$t/menu.q"
+}
+mq() { printf '%s\n' "$@" > "$t/menu.q"; }
+
 run() {
   local script=$1
-  rm -f "$t/fifo"
+  rm -f "$t/fifo" "$t/hooks.log"
   mkfifo "$t/fifo"
   BLOCKIE_HOTKEYD_INPUT=$t/fifo BLOCKIE_HOTKEYD_DRY=1 BLOCKIE_HOTKEYD_LONG_MS=300 \
     BLOCKIE_HOTKEYD_TABLES="${TABLES:-$t/usr:$t/etc}" BLOCKIE_HOTKEYD_CURRENT=$t/current \
-    BLOCKIE_HOTKEYD_SLEEP=$t/fbin/fake-sleep BLOCKIE_HOTKEYD_SYSFS=$t/psys \
+    BLOCKIE_HOTKEYD_SLEEP=$t/fbin/fake-sleep BLOCKIE_HOTKEYD_SYSFS=$t/psys BLOCKIE_HOTKEYD_MENU=$t/fbin/fake-menu \
     timeout -k 5 20 python3 "$bin" > "$t/out" 2> "$t/err" &
   local pid=$!
   timeout -k 5 60 bash -c "exec > '$t/fifo'; $script"
   wait "$pid"
+  endmenu
+  touch "$t/hooks.log"
 }
 
 run 'echo home down; sleep 0.5; echo home up'
@@ -79,8 +117,9 @@ run 'echo extra1 down; echo extra1 up; echo power down; sleep 0.5; echo power up
 res $? "call row and an explicit none row"
 
 grep -q 'test-a.conf:5: ignored: extra3 tap switch Bad' "$t/err" && grep -q 'test-a.conf:7: ignored: voldown press' "$t/err" &&
-  grep -q 'test-a.conf:9: ignored: nonsense' "$t/err" && grep -q 'test-a.conf:10: ignored: home wiggle' "$t/err"
-res $? "bad names, press rows that are not hooks, unknown keys and gestures are ignored with their line"
+  grep -q 'test-a.conf:9: ignored: nonsense' "$t/err" && grep -q 'test-a.conf:10: ignored: home wiggle' "$t/err" &&
+  grep -q 'test-a.conf:11: ignored: home hold menu' "$t/err"
+res $? "bad names, press rows that are not hooks, unknown keys and gestures, and menu on a key other than power are ignored with their line"
 
 printf 'home tap switch test-b\n' > "$t/usr/test-c.conf"
 printf 'test-c 1 1\n' > "$t/current"
@@ -111,32 +150,42 @@ run 'echo power down; echo power up; echo home down; sleep 0.5; echo home up; ec
 [[ $(cat "$t/out") == $'action power tap blank\ngrab\naction power tap blank\nungrab\nresync' ]]
 res $? "power tap blanks and grabs, other keys fire nothing while blanked, the next power tap wakes, ungrabs and resyncs"
 
-run 'echo power down; sleep 0.5; echo power down; echo power up'
-[[ $(cat "$t/out") == $'action power hold blank on\ngrab\naction power tap blank\nungrab\nresync' ]]
-res $? "a lost power release: the second down starts a new press and its tap wakes"
+run 'echo power down; sleep 2.3; echo power down; echo power up'
+[[ $(cat "$t/out") == $'action power hold=2000 menu\ngrab keys\naction power tap blank\nungrab\nresync\ngrab' ]]
+res $? "a lost power release: the second down starts a new press and its tap closes the menu and blanks"
 
-run 'echo power down; sleep 2; echo power up; echo power down; sleep 3.3; echo power up'
-[[ $(cat "$t/out") == $'action power hold blank on\ngrab\naction power hold blank on\naction power hold=3000 unit blockie-poweroff.service\nungrab\nresync' ]]
-res $? "default power hold: blank at the plain hold time, a release at 2 s stays blanked, 3000 ms starts blockie-poweroff.service"
+ok=0
+run 'echo power down; sleep 1.9; echo power up'
+[[ $(cat "$t/out") == $'action power tap blank\ngrab' ]] || { ok=1; echo "  1.9 s: $(paste -sd '|' "$t/out")"; }
+run 'echo power down; sleep 4.6; echo power up'
+[[ $(cat "$t/out") == $'action power hold=2000 menu\ngrab keys\naction power hold=4000 unit blockie-poweroff.service\nungrab\nresync\ngrab' ]] &&
+  grep -qx 'menu start from=awake state=/run/blockie/boot/state' "$t/hooks.log" || { ok=1; echo "  no shown: $(paste -sd '|' "$t/out")"; }
+mq '0.2 shown'
+run 'echo power down; sleep 4.6; echo power up'
+[[ $(cat "$t/out") == $'action power hold=2000 menu\ngrab keys' ]] || { ok=1; echo "  shown: $(paste -sd '|' "$t/out")"; }
+mq '0.2 shown' '0.2 cancel'
+run 'echo power down; sleep 2.6; echo power up; sleep 0.3'
+[[ $(cat "$t/out") == $'action power hold=2000 menu\ngrab keys\nungrab\nresync' ]] || { ok=1; echo "  cancel: $(paste -sd '|' "$t/out")"; }
+res $ok "default power rows: a release before 2000 ms taps blank; 2000 ms opens the menu and grabs the key nodes; 4000 ms starts blockie-poweroff.service only when the menu printed no shown, its lit-frozen taking the full grab; leaving the menu ungrabs"
 
 printf 'power tap none\npower hold none\n' > "$t/usr/test-p.conf"
 printf 'test-p 1 1\n' > "$t/current"
-run 'echo power down; echo power up; echo power down; sleep 3.3; echo power up'
+run 'echo power down; echo power up; echo power down; sleep 4.3; echo power up'
 [[ $(cat "$t/out") == $'action power tap none\naction power hold none' ]]
-res $? "session power rows replace the default tap and both default hold stages"
+res $? "session power rows replace the default tap and every default hold stage"
 
 printf '%s\n' 'power hold blank on' 'power hold=1200 unit blockie-test.service' 'power hold=abc none' 'power hold=0 none' \
   'power hold=70000 none' 'power tap blank off' > "$t/usr/test-h.conf"
 printf 'test-h 1 1\n' > "$t/current"
 run 'echo power down; sleep 0.7; echo power up; echo power down; sleep 1.5; echo power up'
-[[ $(cat "$t/out") == $'action power hold blank on\ngrab\naction power hold blank on\naction power hold=1200 unit blockie-test.service\nungrab\nresync' ]] &&
+[[ $(cat "$t/out") == $'action power hold blank on\ngrab\naction power hold blank on\naction power hold=1200 unit blockie-test.service' ]] &&
   grep -q 'test-h.conf:3: ignored: power hold=abc none' "$t/err" && grep -q 'test-h.conf:4: ignored: power hold=0 none' "$t/err" &&
   grep -q 'test-h.conf:5: ignored: power hold=70000 none' "$t/err" && grep -q 'test-h.conf:6: ignored: power tap blank off' "$t/err"
-res $? "hold=<ms> rows add a stage each next to the plain hold; bad hold times and blank arguments are ignored with their line"
+res $? "hold=<ms> rows add a stage each next to the plain hold, blanked to lit-frozen keeps the full grab; bad hold times and blank arguments are ignored with their line"
 
 hk=$t/hooks
-mkdir -p "$hk" "$t/fbin"
-for h in blank-on blank-off screen-on; do
+mkdir -p "$hk"
+for h in blank-on blank-off screen-on menu-on; do
   cat > "$hk/$h" << EOF
 #!/bin/sh
 echo "start $h" >> "$t/hooks.log"
@@ -152,10 +201,36 @@ exit "\$rc"
 EOF
   chmod 755 "$hk/$h"
 done
+nowus() { python3 -c 'import time; print(int(time.clock_gettime(time.CLOCK_MONOTONIC) * 1000000))'; }
+move() {
+  echo "$1" > "$t/unit.state"
+  echo "${2:-success}" > "$t/unit.result"
+  nowus > "$t/unit.since"
+}
+export -f nowus move
 cat > "$t/fbin/systemctl" << EOF
 #!/bin/sh
+nowus() { python3 -c 'import time; print(int(time.clock_gettime(time.CLOCK_MONOTONIC) * 1000000))'; }
 case "\$*" in
-  '--user show -P ActiveState '*) cat "$t/unit.state" 2> /dev/null || echo inactive ;;
+  '--user show -p LoadState -p ActiveState -p Result -p StateChangeTimestampMonotonic '*)
+    n=\$(cat "$t/unit.bad" 2> /dev/null || echo 0)
+    if [ "\$n" -gt 0 ]; then
+      echo \$((n - 1)) > "$t/unit.bad"
+      [ "\$n" != 1 ] || exit 0
+      printf 'LoadState=loaded\nActiveState=failed\nResult=exit-code\nStateChangeTimestampMonotonic=%s\n' "\$(nowus)"
+      exit 1
+    fi
+    echo "LoadState=\$(cat "$t/unit.load" 2> /dev/null || echo loaded)"
+    echo "ActiveState=\$(cat "$t/unit.state" 2> /dev/null || echo inactive)"
+    echo "Result=\$(cat "$t/unit.result" 2> /dev/null || echo success)"
+    echo "StateChangeTimestampMonotonic=\$(cat "$t/unit.since" 2> /dev/null || echo 0)"
+    ;;
+  '--user start --no-block '*)
+    echo "systemctl \$*" >> "$t/hooks.log"
+    [ ! -f "$t/unit.startrc" ] || exit "\$(cat "$t/unit.startrc")"
+    cp "$t/unit.stamp" "$t/unit.since" 2> /dev/null || nowus > "$t/unit.since"
+    ;;
+  is-system-running) cat "$t/sysrun" 2> /dev/null || echo running ;;
   *) echo "systemctl \$*" >> "$t/hooks.log" ;;
 esac
 EOF
@@ -166,16 +241,18 @@ live() {
   for x in ${FAST:-}; do
     e+=("BLOCKIE_HOTKEYD_$x")
   done
-  rm -f "$t/fifo" "$t/hooks.log" "$t/times" "$t/qn" "$t/slept"
+  rm -f "$t/fifo" "$t/hooks.log" "$t/times" "$t/qn" "$t/slept" "$t/unit.since"
   mkfifo "$t/fifo"
   PATH=$t/fbin:$PATH BLOCKIE_HOTKEYD_INPUT=$t/fifo BLOCKIE_HOTKEYD_HOOKS=$hk BLOCKIE_HOTKEYD_LONG_MS=300 \
     BLOCKIE_HOTKEYD_HOOK_MS=${HOOK_MS:-5000} BLOCKIE_HOTKEYD_BACKSTOP_MS=${BACKSTOP_MS:-20000} BLOCKIE_HOTKEYD_TABLES=$t/usr:$t/etc BLOCKIE_HOTKEYD_CURRENT=$t/current \
     BLOCKIE_HOTKEYD_SLEEP=$t/fbin/fake-sleep BLOCKIE_HOTKEYD_SLEPT=$t/slept BLOCKIE_HOTKEYD_SYSFS=$t/psys \
     BLOCKIE_HOTKEYD_KNOB=$t/knob BLOCKIE_HOTKEYD_HOOK_RUNNER=${RUNNER:-$runner} DBUS_SESSION_BUS_ADDRESS=unix:path=$t/nobus \
+    BLOCKIE_HOTKEYD_MENU=$t/fbin/fake-menu BLOCKIE_HOTKEYD_BACKLIGHT=$t/fbin/fake-backlight BLOCKIE_BOOT_STATE=$t/boot.state \
     env "${e[@]}" timeout -k 5 30 python3 "$bin" > "$t/out" 2> "$t/err" &
   local pid=$!
   timeout -k 5 60 bash -c "exec > '$t/fifo'; $script"
   wait "$pid"
+  endmenu
   touch "$t/hooks.log"
 }
 logis() { [[ $(< "$t/hooks.log") == "$1" ]]; }
@@ -410,7 +487,275 @@ tms() { grep "^$1 [0-9]*$" "$t/times" | awk '{print $NF}'; }
 gaps() { tms helper | awk 'NR > 1 {printf "%d ", $1 - p} {p = $1}'; }
 gap() { [[ -n $1 && -n $2 ]] && echo $(($1 - $2)) || echo -1; }
 fast='SETTLE_MS=300 RESLEEP_MS=300 WAKE_MS=1500 LOST_MS=1000 RETRY_MS=300 RETRY_SLOW_MS=2000 SLEEP_KILL_MS=1000 VBUS_MS=300'
-for h in blank-on blank-off screen-on; do
+for h in blank-on blank-off screen-on menu-on; do
+  echo 0.1 > "$hk/$h.sleep"
+done
+printf 'nobody-here 1 1\n' > "$t/current"
+rm -f "$t/unit.state" "$t/unit.result" "$t/sysrun"
+nt() { grep -vx 'menu term' "$t/hooks.log"; }
+termed() { grep -qx 'menu term' "$t/hooks.log"; }
+mo=$'start menu-on\nexit menu-on\nmenu start from=awake state='"$t/boot.state"
+hold='sleep 0.5; echo power down; sleep 2.3; echo power up'
+lit=$'start screen-on\nexit screen-on'
+reboot_line='systemctl --user start --no-block blockie-reboot@android.service'
+poff_line='systemctl --user start --no-block blockie-poweroff.service'
+
+ok=0
+for c in 'cancel|blank-off|no' 'screen-off|blank-on|no' 'failed wayland|blank-off|no' 'bogus line|blank-off|yes'; do
+  IFS='|' read -r line h term <<< "$c"
+  mq '0.1 shown' "0.2 $line"
+  live "$hold; sleep 1"
+  [[ $(nt) == "$woke"$'\n'"$mo"$'\nstart '"$h"$'\nexit '"$h" ]] || { ok=1; echo "  $line: $(nt | paste -sd '|')"; }
+  if [[ $term == yes ]]; then
+    termed && grep -q 'not a result: bogus line: back to awake' "$t/err" || { ok=1; echo "  $line: no SIGTERM"; }
+  else
+    ! termed || { ok=1; echo "  $line: SIGTERM to a child that exits by itself"; }
+  fi
+done
+mq '0.1 shown' '0.2 poweroff'
+live "$hold; sleep 1"
+[[ $(< "$t/hooks.log") == "$woke"$'\n'"$mo"$'\n'"$lit"$'\n'"$poff_line" ]] && grep -q 'lit-frozen: 0 key nodes and 0 more grabbed' "$t/err" ||
+  { ok=1; echo "  poweroff: $(paste -sd '|' "$t/hooks.log")"; }
+mq '0.1 shown' '0.2 boot android'
+live "$hold; sleep 2"
+[[ $(< "$t/hooks.log") == "$woke"$'\n'"$mo"$'\n'"$lit"$'\n'"$reboot_line" ]] && grep -q 'reboot is under way' "$t/err" ||
+  { ok=1; echo "  boot android: $(paste -sd '|' "$t/hooks.log")"; }
+res $ok "menu: menu-on exits before the child starts (from awake, the boot state path passed); cancel, screen-off, failed, a stray line, poweroff and boot android each run their hook or unit; only the stray line and no exit line get SIGTERM, boot keeps the child"
+
+mq '0.1 shown'
+live 'sleep 0.5; echo power down; sleep 4.6; echo power up; sleep 0.5'
+[[ $(< "$t/hooks.log") == "$woke"$'\n'"$mo" ]] && grep -q 'blockie-powermenu showed: unit blockie-poweroff.service skipped' "$t/err"
+res $? "menu: after shown a hold to 4000 ms starts nothing"
+
+mq '0.1 shown' '0.3 cancel'
+live 'sleep 0.5; echo power down; sleep 4.6; echo power up; sleep 0.5'
+[[ $(< "$t/hooks.log") == "$woke"$'\n'"$mo"$'\n'"$woke" ]] && grep -q 'blockie-powermenu showed: unit blockie-poweroff.service skipped' "$t/err"
+res $? "menu: shown, then closed inside the same hold: the 4000 ms stage stays skipped"
+
+: > "$t/menu.q"
+live 'sleep 0.5; echo power down; sleep 4.6; echo power up; sleep 1'
+blinked() {
+  local g a b
+  g=$(gap "$(tms backlight-on)" "$(tms backlight-off)")
+  a=$(gap "$(tms backlight-off)" "$(tms term)")
+  b=$(gap "$(tms 'start screen-on')" "$(tms backlight-on)")
+  [[ $(nt | grep -v '^backlight ') == "$1"$'\n'"$lit"$'\n'"$poff_line" ]] && grep -q 'lit-frozen: 0 key nodes and 0 more grabbed' "$t/err" &&
+    [[ $(grep '^backlight ' "$t/hooks.log") == $'backlight off\nbacklight on' ]] && ((g >= 250 && g < 700 && b >= -20)) &&
+    { [[ ${2:-} != term ]] || { termed && ((a >= -20)); }; } || { echo "  log $(paste -sd '|' "$t/hooks.log"), blink $g ms, term to off $a, on to screen-on $b"; return 1; }
+}
+blinked "$woke"$'\n'"$mo" term
+res $? "menu: no shown by 4000 ms: SIGTERM to the child, then backlight off and about 300 ms later on, then screen-on and the blockie-poweroff.service start"
+
+echo activating > "$t/unit.state"
+ok=0
+FAST="MENU=$t/none" live "sleep 0.5; echo power down; sleep 4.6; echo power up; sleep 0.8; $tap; sleep 0.5"
+blinked "$woke"$'\nstart menu-on\nexit menu-on\n'"$woke" && ! grep -q 'start blank-on' "$t/hooks.log" &&
+  grep -q "cannot run $t/none" "$t/err" || ok=1
+mq '0.1 failed wayland'
+live "sleep 0.5; echo power down; sleep 4.6; echo power up; sleep 0.8; $tap; sleep 0.5"
+blinked "$woke"$'\n'"$mo"$'\n'"$woke" && ! grep -q 'start blank-on' "$t/hooks.log" || ok=1
+res $ok "menu: with the menu binary missing, or failed before shown, the 4000 ms stage blinks and powers off through screen-on in lit-frozen, and a tap after it runs no blank-on"
+rm -f "$t/unit.state"
+
+echo 2.1 > "$hk/menu-on.sleep"
+: > "$t/menu.q"
+live 'sleep 0.5; echo power down; sleep 4.6; echo power up; sleep 1'
+e=$(tms 'exit menu-on')
+bon=$(tms backlight-on)
+[[ -n $e && -n $bon ]] && ((e < bon)) && ! grep -q '^menu start' "$t/hooks.log" && grep -qx "$poff_line" "$t/hooks.log"
+res $? "menu: a menu-on that ends inside the 4000 ms blink starts no child"
+echo 0.1 > "$hk/menu-on.sleep"
+
+: > "$t/menu.q"
+FAST='SHOWN_MS=1500' live "$hold; sleep 2"
+[[ $(nt) == "$woke"$'\n'"$mo"$'\n'"$woke" ]] && termed && grep -q 'printed no shown in 1500 ms: back to awake' "$t/err"
+res $? "menu: a child with no shown within the shown limit is ended and hotkeyd goes back to awake"
+
+: > "$t/menu.q"
+live 'sleep 0.5; echo power down; sleep 3; echo power up; sleep 2'
+[[ $(< "$t/hooks.log") == "$woke"$'\n'"$mo" ]]
+res $? "menu: a release at 3000 ms with no shown starts nothing and keeps the child"
+
+mq '0.1 shown' '0.2 boot android'
+FAST='BOOT_BACKSTOP_MS=3000' live "$hold; sleep 4.5"
+[[ $(nt) == "$woke"$'\n'"$mo"$'\n'"$lit"$'\n'"$reboot_line"$'\n'"$woke" ]] && termed && grep -q 'reboot is under way' "$t/err" &&
+  grep -q 'blockie-reboot@android.service started 3000 ms ago and the power is still on: back to awake' "$t/err"
+res $? "menu: boot android with the unit inactive and Result=success stays lit-frozen until the boot unit backstop (not the 20 s power off one), which SIGTERMs the child"
+
+echo failed > "$t/unit.state"
+echo exit-code > "$t/unit.result"
+echo stopping > "$t/sysrun"
+mq '0.1 shown' '0.2 boot android'
+live "$hold; sleep 2.5"
+[[ $(< "$t/hooks.log") == "$woke"$'\n'"$mo"$'\n'"$lit"$'\n'"$reboot_line" ]] && grep -q 'while the system is stopping: ignored' "$t/err"
+res $? "menu: the reboot unit failed while is-system-running prints stopping: ignored"
+rm -f "$t/sysrun"
+
+ok=0
+mq '0.1 shown' '0.2 boot android' '1.6 exit'
+live "$hold; sleep 3"
+[[ $(< "$t/hooks.log") == "$woke"$'\n'"$mo"$'\n'"$lit"$'\n'"$reboot_line"$'\nmenu exit\n'"$woke" ]] || { ok=1; echo "  child lives: $(paste -sd '|' "$t/hooks.log")"; }
+mq '0.1 shown' '0.2 boot android' '5.6 exit'
+live "$hold; sleep 7"
+[[ $(< "$t/hooks.log") == "$woke"$'\n'"$mo"$'\n'"$lit"$'\n'"$reboot_line"$'\nmenu exit\n'"$woke" ]] ||
+  { ok=1; echo "  child ends 4.6 s after the count: $(paste -sd '|' "$t/hooks.log")"; }
+mq '0.1 shown' '0.2 boot android' '0 exit'
+live "$hold; sleep 2.5"
+[[ $(grep -vx 'menu exit' "$t/hooks.log") == "$woke"$'\n'"$mo"$'\n'"$lit"$'\n'"$reboot_line"$'\n'"$woke" ]] ||
+  { ok=1; echo "  child gone: $(paste -sd '|' "$t/hooks.log")"; }
+mq '0.1 shown' '0.2 boot android'
+FAST='TOAST_MS=1000' live "$hold; sleep 3.5"
+[[ $(nt) == "$woke"$'\n'"$mo"$'\n'"$lit"$'\n'"$reboot_line"$'\n'"$woke" ]] && termed || { ok=1; echo "  toast bound: $(paste -sd '|' "$t/hooks.log")"; }
+res $ok "menu: a failed reboot unit gives awake after the child's exit (also 4.6 s after the count, inside the 5100 ms toast time), at once when the child is gone, and SIGTERMs a child still up after the toast time"
+rm -f "$t/unit.state" "$t/unit.result"
+
+ok=0
+echo 0 > "$t/unit.stamp"
+mq '0.1 shown' '0.2 boot android' '0 exit'
+live "$hold; sleep 2.5"
+[[ $(grep -vx 'menu exit' "$t/hooks.log") == "$woke"$'\n'"$mo"$'\n'"$lit"$'\n'"$reboot_line" ]] && ! grep -q 'under way\|back to awake' "$t/err" ||
+  { ok=1; echo "  fresh: $(paste -sd '|' "$t/hooks.log")"; }
+echo 1 > "$t/unit.stamp"
+echo failed > "$t/unit.state"
+echo exit-code > "$t/unit.result"
+mq '0.1 shown' '0.2 boot android' '0 exit'
+live "$hold; sleep 2.5"
+[[ $(grep -vx 'menu exit' "$t/hooks.log") == "$woke"$'\n'"$mo"$'\n'"$lit"$'\n'"$reboot_line" ]] && ! grep -q 'back to awake' "$t/err" ||
+  { ok=1; echo "  stale failed: $(paste -sd '|' "$t/hooks.log")"; }
+rm -f "$t/unit.stamp" "$t/unit.state" "$t/unit.result"
+echo not-found > "$t/unit.load"
+mq '0.1 shown' '0.2 boot android' '0 exit'
+live "$hold; sleep 2.5"
+[[ $(grep -vx 'menu exit' "$t/hooks.log") == "$woke"$'\n'"$mo"$'\n'"$lit"$'\n'"$reboot_line"$'\n'"$woke" ]] &&
+  grep -q 'blockie-reboot@android.service is not-found: back to awake' "$t/err" || { ok=1; echo "  not-found: $(paste -sd '|' "$t/hooks.log")"; }
+rm -f "$t/unit.load"
+echo failed > "$t/unit.state"
+echo start-limit-hit > "$t/unit.result"
+mq '0.1 shown' '0.2 boot android' '0 exit'
+live "$hold; sleep 2.5"
+[[ $(grep -vx 'menu exit' "$t/hooks.log") == "$woke"$'\n'"$mo"$'\n'"$lit"$'\n'"$reboot_line"$'\n'"$woke" ]] &&
+  grep -q 'blockie-reboot@android.service is failed start-limit-hit: back to awake' "$t/err" ||
+  { ok=1; echo "  inactive to failed with no activation: $(paste -sd '|' "$t/hooks.log")"; }
+rm -f "$t/unit.state" "$t/unit.result"
+res $ok "menu: the reboot unit poll ignores a never started unit and a failed state older than this start, and counts a unit not loaded, or moved from inactive to failed with no activation, as failed"
+
+echo activating > "$t/unit.state"
+echo 2 > "$t/unit.bad"
+mq '0.1 shown' '0.2 boot android'
+FAST='POLL_MS=300' live "$hold; sleep 1.4; move inactive; sleep 0.8"
+[[ $(< "$t/hooks.log") == "$woke"$'\n'"$mo"$'\n'"$lit"$'\n'"$reboot_line" ]] && [[ $(< "$t/unit.bad") == 0 ]] &&
+  [[ $(grep -c 'gave no state: polling on' "$t/err") == 2 ]] && grep -q 'reboot is under way' "$t/err" && ! grep -q 'back to awake' "$t/err"
+res $? "menu: an unreadable and an empty systemctl show keep polling, then activating and the reboot goes ahead"
+rm -f "$t/unit.state" "$t/unit.result" "$t/unit.bad"
+
+echo 1 > "$t/unit.startrc"
+mq '0.1 shown' '0.2 boot android' '0 exit'
+live "$hold; sleep 0.8"
+[[ $(grep -vx 'menu exit' "$t/hooks.log") == "$woke"$'\n'"$mo"$'\n'"$lit"$'\n'"$reboot_line"$'\n'"$woke" ]] &&
+  grep -q 'blockie-reboot@android.service is refused (start exit 1): back to awake' "$t/err"
+res $? "menu: a boot unit start that systemctl refuses counts as failed at once, before any poll"
+rm -f "$t/unit.startrc"
+
+printf '#!/bin/sh\necho beep >> "%s"\n' "$t/hooks.log" > "$hk/beep"
+chmod 755 "$hk/beep"
+printf '%s\n' 'volup press hook beep' 'home hold hook beep' 'extra3 tap hook beep' > "$t/usr/test-m.conf"
+printf 'test-m 1 1\n' > "$t/current"
+mq '0.1 shown'
+live "sleep 0.5; echo extra3 down; echo extra3 up; sleep 0.3; $hold; sleep 0.3; echo volup down; echo volup up; echo home down; sleep 0.5
+  echo home up; echo extra3 down; echo extra3 up; sleep 0.2; $tap; sleep 1"
+[[ $(nt) == "$woke"$'\nbeep\n'"$mo"$'\nstart blank-on\nexit blank-on' ]] && termed && grep -q 'SIGTERM to blockie-powermenu' "$t/err"
+res $? "menu: volup, home hold and extra3 rows fire nothing while it is up (extra3 fires before it), a power tap SIGTERMs the child and runs blank-on"
+
+echo 'home tap hook beep' >> "$t/usr/test-m.conf"
+keys='echo home down; echo home up; echo home down; sleep 0.5; echo home up; echo volup down; echo volup up; echo extra3 down; echo extra3 up'
+ok=0
+mq '0.1 shown' '0.2 boot reboot'
+live "sleep 0.5; echo extra3 down; echo extra3 up; sleep 0.3; $hold; sleep 0.5; $keys; sleep 0.5"
+[[ $(< "$t/hooks.log") == "$woke"$'\nbeep\n'"$mo"$'\n'"$lit"$'\nsystemctl --user start --no-block blockie-reboot@reboot.service' ]] ||
+  { ok=1; echo "  boot reboot: $(paste -sd '|' "$t/hooks.log")"; }
+echo activating > "$t/unit.state"
+: > "$t/menu.q"
+live "sleep 0.5; echo extra3 down; echo extra3 up; sleep 0.3; echo power down; sleep 4.6; echo power up; sleep 0.3; $keys; sleep 0.5"
+blinked "$woke"$'\nbeep\n'"$mo" term || ok=1
+rm -f "$t/unit.state"
+res $ok "lit-frozen: after boot reboot and after the 4000 ms fallback a home tap, a home hold, volup and extra3 fire nothing"
+
+printf '%s\n' 'home tap hook beep' 'home hold=1500 hook beep' > "$t/usr/test-n.conf"
+printf 'test-n 1 1\n' > "$t/current"
+echo failed > "$t/unit.state"
+echo exit-code > "$t/unit.result"
+ok=0
+for c in 'tap|0' 'hold|1.6'; do
+  IFS='|' read -r what held <<< "$c"
+  mq '0.1 shown' '0.2 boot reboot' '0 exit'
+  FAST='POLL_MS=300' live "sleep 0.5; echo home down; echo home up; $hold; until_n '^start screen-on$' $t/hooks.log; echo home down
+    until_n 'back to awake' $t/err; sleep $held; echo home up; sleep 0.5"
+  [[ $(grep -vx 'menu exit' "$t/hooks.log") == "$woke"$'\nbeep\n'"$mo"$'\n'"$lit"$'\nsystemctl --user start --no-block blockie-reboot@reboot.service\n'"$woke" ]] &&
+    grep -q 'blockie-reboot@reboot.service is failed exit-code: back to awake' "$t/err" ||
+    { ok=1; echo "  $what: $(paste -sd '|' "$t/hooks.log")"; }
+done
+rm -f "$t/unit.state" "$t/unit.result" "$t/usr/test-n.conf"
+printf 'test-m 1 1\n' > "$t/current"
+res $ok "lit-frozen: a home press that starts after boot reboot and ends after a counted failure moved the state to awake fires nothing, as a tap or with its 1500 ms hold reached in awake"
+
+echo activating > "$t/unit.state"
+mq '0.1 shown' '0.2 poweroff'
+live "$hold; until_n '^$poff_line\$' $t/hooks.log; sleep 0.3; echo failed > $t/unit.state; $tap; sleep 0.8"
+lg=$(grep -n 'lit-frozen: 0 key nodes and 0 more grabbed' "$t/err" | head -n 1 | cut -d: -f1)
+la=$(grep -n 'blockie-poweroff.service is failed: back to awake' "$t/err" | head -n 1 | cut -d: -f1)
+lu=$(grep -n 'ungrabbed$' "$t/err" | tail -n 1 | cut -d: -f1)
+[[ $(< "$t/hooks.log") == "$woke"$'\n'"$mo"$'\n'"$lit"$'\n'"$poff_line"$'\n'"$woke" && -n $lg && -n $la && -n $lu ]] && ((lg < la && la < lu))
+res $? "lit-frozen: after a POWER OFF pick the full grab is taken, a power tap still reads the unit and wakes once it failed, and leaving for awake ungrabs"
+rm -f "$t/unit.state"
+rm -f "$hk/beep" "$t/usr/test-m.conf"
+printf 'nobody-here 1 1\n' > "$t/current"
+
+mq '0.1 shown' '0.2 cancel' '4 exit'
+FAST='MENU_KILL_MS=6000' live "$hold; sleep 0.8; echo power down; sleep 2.3; echo power up; sleep 0.5"
+[[ $(< "$t/hooks.log") == "$woke"$'\n'"$mo"$'\n'"$woke" ]] && grep -q 'menu: ignored, blockie-powermenu still runs' "$t/err"
+res $? "menu: a menu stage while the fading child still runs is ignored"
+
+echo activating > "$t/unit.state"
+mq '0.1 shown' '0.2 poweroff'
+live "$hold; sleep 0.5; echo power down; sleep 2.3; echo power up; sleep 0.5"
+[[ $(< "$t/hooks.log") == "$woke"$'\n'"$mo"$'\n'"$lit"$'\n'"$poff_line" ]] && grep -q 'menu: ignored, lit-frozen' "$t/err" &&
+  grep -q 'blockie-powermenu still running after 2000 ms: killed' "$t/err"
+res $? "menu: a menu stage in lit-frozen is ignored; a child that said poweroff and stays is killed at the kill time"
+rm -f "$t/unit.state"
+
+dpart switcher-open
+echo 5 > "$hk/switcher-open.d.sleep"
+: > "$t/menu.q"
+RUNNER=$fr live 'sleep 0.5; echo power down; sleep 1.2; echo home down; sleep 0.4; echo home up; sleep 1; echo power up; sleep 1.5'
+[[ $(< "$t/hooks.log") == "$woke"$'\nrunner switcher-open\npart switcher-open\n'"$mo" ]] && grep -q 'switcher-open killed for the power menu' "$t/err"
+res $? "menu: a running switcher-open is killed and no switcher follows"
+rm -rf "${hk:?}/switcher-open.d" "${hk:?}/switcher-open.d.sleep"
+
+echo 1 > "$hk/menu-on.rc"
+live "$hold; sleep 1"
+[[ $(< "$t/hooks.log") == "$woke"$'\nstart menu-on\nexit menu-on\nstart menu-on\nexit menu-on\n'"$woke" ]] && grep -q 'menu-on failed twice: back to awake' "$t/err"
+res $? "menu: menu-on failing twice gives awake and no child"
+rm -f "$hk/menu-on.rc"
+
+mq '0.1 shown' '0.2 cancel' '0 poweroff'
+live "$hold; sleep 1"
+[[ $(< "$t/hooks.log") == "$woke"$'\n'"$mo"$'\n'"$woke" ]] && grep -q 'dropped: poweroff' "$t/err"
+res $? "menu: a line after the first result is dropped"
+
+mq '0.3 exit'
+live "$hold; sleep 1"
+[[ $(< "$t/hooks.log") == "$woke"$'\n'"$mo"$'\nmenu exit\n'"$woke" ]] && grep -q 'ended with no result: back to awake' "$t/err"
+res $? "menu: an exit with no line gives awake"
+
+: > "$t/menu.ignore"
+mq '0.1 shown'
+FAST='MENU_KILL_MS=800' live "$hold; sleep 0.3; $tap; until_n '^menu term$' $t/hooks.log; s0=\$(date +%s%3N); p=\$(< $t/menu.pid)
+  while kill -0 \"\$p\" 2> /dev/null; do sleep 0.02; done; echo \$((\$(date +%s%3N) - s0)) > $t/killed.ms; sleep 0.3"
+g=$(cat "$t/killed.ms" 2> /dev/null || echo -1)
+((g >= 600 && g < 1400)) && grep -q 'blockie-powermenu still running after 800 ms: killed' "$t/err"
+res $? "menu: a child ignoring SIGTERM is killed at the kill time ($g ms)"
+
+for h in blank-on blank-off screen-on menu-on; do
   echo 0.1 > "$hk/$h.sleep"
 done
 printf 'nobody-here 1 1\n' > "$t/current"
@@ -469,20 +814,27 @@ FAST=$fast live "$up; until_n 'refused deadman' $t/err; sleep 1"
 res $? "sleep: refused is not retried until the next tap"
 
 : > "$t/queue"
-FAST="$fast SETTLE_MS=1500" live "$up; until_n '^exit blank-on$' $t/hooks.log; echo power down; sleep 2.2; echo power up; sleep 0.5"
-[[ $(ev) == "start blank-off start blank-on" ]]
+FAST="$fast SETTLE_MS=1500" live "$up; until_n '^exit blank-on$' $t/hooks.log; echo power down; sleep 1.8; echo power up; sleep 0.5"
+[[ $(ev) == "start blank-off start blank-on start blank-off" ]]
 res $? "sleep: a power down during the settle wait holds it off, no helper call while the key is down"
 
 echo '5 0 slept power 5' > "$t/queue"
-FAST=$fast live "$up; until_n 'slept power' $t/err; echo power down; until_n '$offs' $t/hooks.log; echo power up; sleep 0.5"
-[[ $(ev) == "start blank-off start blank-on helper first start screen-on systemctl --user start --no-block blockie-poweroff.service" ]]
-res $? "sleep: a hold from asleep starts blockie-poweroff.service at 3000 ms after screen-on, no blank-off, no helper call while lit-frozen"
+: > "$t/menu.q"
+FAST=$fast live "$up; until_n 'slept power' $t/err; echo power down; until_n '^menu start' $t/hooks.log; sleep 0.6; echo power up; sleep 0.6"
+[[ $(ev) == "start blank-off start blank-on helper first start menu-on menu start from=dark state=$t/boot.state" ]]
+res $? "sleep: a hold right after a power wake opens the menu from dark: menu-on, then the child, no blank-off, no helper call in menu"
 
 : > "$t/queue"
-FAST=$fast live "sleep 0.4; echo power down; sleep 2; date +%s%3N > $t/rel; echo power up; until_n '^helper' $t/hooks.log; sleep 0.2"
+mq '0.1 shown' '0.2 screen-off' '1 exit'
+FAST=$fast live "sleep 0.4; echo power down; sleep 2.3; echo power up; until_n '^helper' $t/hooks.log; sleep 0.2"
+[[ $(ev) == "start blank-off start menu-on menu start from=awake state=$t/boot.state start blank-on menu exit helper first" ]]
+res $? "sleep: screen-off from the menu blanks and sleeps only once the child is gone"
+
+: > "$t/queue"
+FAST=$fast live "sleep 0.4; echo power down; sleep 1.5; date +%s%3N > $t/rel; echo power up; until_n '^helper' $t/hooks.log; sleep 0.2"
 g=$(gap "$(tms helper | head -n 1)" "$(cat "$t/rel" 2> /dev/null)")
 [[ $(ev) == "start blank-off start blank-on helper first" ]] && ((g >= 280))
-res $? "sleep: a hold released at 2 s stays blanked and sleeps one settle wait after the release ($g ms)"
+res $? "sleep: a press released at 1.5 s blanks at the release and sleeps one settle wait after it ($g ms)"
 
 bat 1 50
 FAST=$fast live "$up; sleep 1.5; date +%s%3N > $t/rel; echo 0 > $t/psys/$on; until_n '^helper' $t/hooks.log; sleep 0.2"
@@ -570,12 +922,12 @@ FAST=$fast live "until_n '^exit blank-off$' $t/hooks.log; echo 30 > $t/slept; $t
 [[ $(ev) == "start blank-off start blank-off" ]] && grep -q 'resume: ' "$t/err"
 res $? "sleep: a sleep seen while awake runs blank-off again and the tap after it does not blank"
 
-for h in blank-on blank-off screen-on; do
+for h in blank-on blank-off screen-on menu-on; do
   rm -f "$hk/$h.sleep"
 done
 
 BLOCKIE_HOTKEYD_DRY=1 BLOCKIE_HOTKEYD_LONG_MS=300 BLOCKIE_HOTKEYD_CURRENT=$t/none BLOCKIE_HOTKEYD_SYSFS=$t/psys \
-  BLOCKIE_HOTKEYD_INPUT=/dev/null BLOCKIE_HOTKEYD_SLEEP=$t/fbin/fake-sleep timeout -k 5 60 python3 - "$bin" > "$t/drain.out" 2>&1 << 'EOF'
+  BLOCKIE_HOTKEYD_INPUT=/dev/null BLOCKIE_HOTKEYD_SLEEP=$t/fbin/fake-sleep BLOCKIE_HOTKEYD_MENU=$t/none timeout -k 5 60 python3 - "$bin" > "$t/drain.out" 2>&1 << 'EOF'
 import contextlib
 import importlib.machinery
 import importlib.util
@@ -597,6 +949,7 @@ class Ev:
 
 class Dev:
     def __init__(self, batches, held):
+        self.name = "mtk-pmic-keys"
         self.q = [[Ev(*e) for e in b] for b in batches]
         self.held = set(held)
         self.calls = []
@@ -645,8 +998,8 @@ bad = []
 d, dev, out, seen = case("queued tap", [[(116, 1)], [(116, 0)]], [])
 if out.count("action power tap blank") != 1 or d.wanted != "awake" or dev.calls[:1] != [(0, [])]:
     bad.append(seen)
-d, dev, out, seen = case("queued down, held", [[(116, 1)]], [116], run_ms=3800)
-if "action power hold blank on" not in out or "action power hold=3000 unit blockie-poweroff.service" not in out \
+d, dev, out, seen = case("queued down, held", [[(116, 1)]], [116], run_ms=4700)
+if "action power hold=2000 menu" not in out or "action power hold=4000 unit blockie-poweroff.service" not in out \
         or "action power tap blank" in out or dev.calls[:1] != [(0, [116])] or not d.keys["power"].down:
     bad.append(seen)
 d, dev, out, seen = case("down after the resume, up by EVIOCGKEY", [[(116, 1)]], [])
@@ -722,7 +1075,7 @@ def case(name, dev, step=None, run_ms=400):
     d.devices = {P0: (dev, {116: "power"}, 0)}
     err = io.StringIO()
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
-        d.set_grab(True)
+        d.set_grab("all")
         if step:
             step(d)
         GLib.timeout_add(run_ms, loop.quit)
@@ -751,7 +1104,7 @@ if a.calls != 3 or out.count("grab: Device or resource busy") != 1 or out.count(
         or d.regrab or d.regrab_timer:
     bad.append(seen)
 a = Dev(100)
-d, out, seen = case("awake after one failure", a, lambda d: d.set_grab(False))
+d, out, seen = case("awake after one failure", a, lambda d: d.set_grab(""))
 if a.calls != 1 or d.regrab or d.regrab_timer:
     bad.append(seen)
 a = Dev(100)
@@ -791,6 +1144,187 @@ EOF
 r=$?
 ((r == 0)) || sed 's/^/  /' "$t/grab.out"
 res $r "grab: an EBUSY node is retried every 250 ms while blanked, one log line; waking, a dropped or replaced node and a gone extra node end it; blank-on applied retries at once"
+
+BLOCKIE_HOTKEYD_CURRENT=$t/none BLOCKIE_HOTKEYD_SYSFS=$t/psys BLOCKIE_HOTKEYD_INPUT=/dev/null BLOCKIE_HOTKEYD_SLEEP=$t/fbin/fake-sleep \
+  timeout -k 5 60 python3 - "$bin" > "$t/mgrab.out" 2>&1 << 'EOF'
+import contextlib
+import importlib.machinery
+import importlib.util
+import io
+import sys
+
+loader = importlib.machinery.SourceFileLoader("hotkeyd", sys.argv[1])
+spec = importlib.util.spec_from_loader("hotkeyd", loader)
+m = importlib.util.module_from_spec(spec)
+loader.exec_module(m)
+
+
+class Dev:
+    def __init__(self, name, ev):
+        self.name = name
+        self.ev = ev
+
+    def grab(self):
+        self.ev.append(f"grab {self.name}")
+
+    def ungrab(self):
+        self.ev.append(f"ungrab {self.name}")
+
+    def active_keys(self):
+        self.ev.append(f"keys {self.name}")
+        return []
+
+
+def make(state):
+    ev = []
+    d = m.Hotkeyd(m.GLib.MainLoop())
+    d.devices = {"/dev/input/event0": (Dev("mtk-pmic-keys", ev), {116: "power"}, 0),
+                 "/dev/input/event1": (Dev("AYANEO Controller", ev), {316: "extra1"}, 0),
+                 "/dev/input/event2": (Dev("odm:gpio_keys", ev), {0x2F2: "extra3"}, 0)}
+    d.spawn = lambda name, ms: (ev.append(f"hook {name}"), (None, True, 0))[1]
+    d.wanted = d.applied = state
+    d.set_grab("all" if state == "blanked" else "")
+    ev.clear()
+    return d, ev
+
+
+bad = []
+keys = ["keys mtk-pmic-keys", "keys AYANEO Controller", "keys odm:gpio_keys"]
+ungrab = ["ungrab mtk-pmic-keys", "ungrab AYANEO Controller", "ungrab odm:gpio_keys"]
+with contextlib.redirect_stderr(io.StringIO()):
+    d, ev = make("blanked")
+    d.open_menu()
+    want = ungrab + keys + ["grab mtk-pmic-keys", "grab odm:gpio_keys", "hook menu-on"]
+    if ev != want or d.menu_from != "dark" or d.grabbed != "keys":
+        bad.append(f"from blanked: {ev}, from {d.menu_from}")
+    ev.clear()
+    d.applied = "menu"
+    d.want("awake")
+    if ev != ungrab + keys + ["hook blank-off"] or d.grabbed:
+        bad.append(f"leaving: {ev}")
+    d, ev = make("awake")
+    d.open_menu()
+    if ev != ["grab mtk-pmic-keys", "grab odm:gpio_keys", "hook menu-on"] or d.menu_from != "awake":
+        bad.append(f"from awake: {ev}, from {d.menu_from}")
+    for state in ("menu", "lit-frozen"):
+        d, ev = make(state)
+        d.open_menu()
+        if ev:
+            bad.append(f"{state}: {ev}")
+    for state, eaten in (("blanked", True), ("menu", True), ("lit-frozen", True), ("awake", False)):
+        d, ev = make(state)
+        d.handle("home", 1)
+        k = d.keys["home"]
+        if k.consumed != eaten or bool(k.timer) == eaten:
+            bad.append(f"home down in {state}: consumed {k.consumed}, hold timer {bool(k.timer)}")
+        d.handle("home", 0)
+for b in bad:
+    print(f"FAILED {b}")
+sys.exit(1 if bad else 0)
+EOF
+r=$?
+((r == 0)) || sed 's/^/  /' "$t/mgrab.out"
+res $r "menu grab: entering the menu from blanked ungrabs and resyncs before it grabs the key nodes (not the pad) and runs menu-on; leaving ungrabs and resyncs; no menu-on from menu or lit-frozen; a home down is consumed with no hold timer in blanked, menu and lit-frozen, and arms its hold when awake"
+
+BLOCKIE_HOTKEYD_CURRENT=$t/none BLOCKIE_HOTKEYD_SYSFS=$t/psys BLOCKIE_HOTKEYD_INPUT=/dev/null BLOCKIE_HOTKEYD_SLEEP=$t/fbin/fake-sleep \
+  BLOCKIE_HOTKEYD_GRAB_RETRY_MS=50 timeout -k 5 60 python3 - "$bin" > "$t/lgrab.out" 2>&1 << 'EOF'
+import contextlib
+import errno
+import importlib.machinery
+import importlib.util
+import io
+import sys
+
+loader = importlib.machinery.SourceFileLoader("hotkeyd", sys.argv[1])
+spec = importlib.util.spec_from_loader("hotkeyd", loader)
+m = importlib.util.module_from_spec(spec)
+loader.exec_module(m)
+
+
+class Dev:
+    def __init__(self, name, ev, busy=0):
+        self.name = name
+        self.ev = ev
+        self.busy = busy
+
+    def grab(self):
+        if self.busy:
+            self.busy -= 1
+            self.ev.append(f"busy {self.name}")
+            raise OSError(errno.EBUSY, "Device or resource busy")
+        self.ev.append(f"grab {self.name}")
+
+    def ungrab(self):
+        self.ev.append(f"ungrab {self.name}")
+
+    def active_keys(self):
+        self.ev.append(f"keys {self.name}")
+        return []
+
+
+ev = []
+loop = m.GLib.MainLoop()
+d = m.Hotkeyd(loop)
+d.devices = {"/dev/input/event0": (Dev("mtk-pmic-keys", ev), {116: "power"}, 0),
+             "/dev/input/event1": (Dev("AYANEO Controller", ev, busy=3), {316: "extra1"}, 0)}
+d.spawn = lambda name, ms: (ev.append(f"hook {name}"), (None, True, 0))[1]
+d.wanted = d.applied = "menu"
+d.set_grab("keys")
+ev.clear()
+err = io.StringIO()
+bad = []
+with contextlib.redirect_stderr(err):
+    d.want("lit-frozen")
+    m.GLib.timeout_add(400, loop.quit)
+    loop.run()
+    head = ["ungrab mtk-pmic-keys", "ungrab AYANEO Controller", "keys mtk-pmic-keys", "keys AYANEO Controller",
+            "grab mtk-pmic-keys", "busy AYANEO Controller", "hook screen-on"]
+    if ev[:7] != head or ev[7:] != ["busy AYANEO Controller", "busy AYANEO Controller", "grab AYANEO Controller"] \
+            or d.regrab or d.regrab_timer or d.grabbed != "all" or "lit-frozen: 2 key nodes and 0 more grabbed" not in err.getvalue() \
+            or err.getvalue().count("grabbed on retry") != 1:
+        bad.append(f"entering lit-frozen with the pad held: {ev}, grabbed {d.grabbed}, log {err.getvalue().splitlines()}")
+    ev.clear()
+    d.applied = "lit-frozen"
+    d.want("awake")
+    if ev != ["ungrab mtk-pmic-keys", "ungrab AYANEO Controller", "keys mtk-pmic-keys", "keys AYANEO Controller",
+              "hook blank-off"] or d.grabbed:
+        bad.append(f"leaving lit-frozen: {ev}, grabbed {d.grabbed}")
+
+
+class Gone:
+    def wait_finish(self, res):
+        pass
+
+    def get_if_exited(self):
+        return True
+
+    def get_exit_status(self):
+        return 0
+
+
+m.GRAB_RETRY_MS = 10000
+ev = []
+d = m.Hotkeyd(loop)
+d.devices = {"/dev/input/event0": (Dev("mtk-pmic-keys", ev), {116: "power"}, 0),
+             "/dev/input/event1": (Dev("AYANEO Controller", ev, busy=1), {316: "extra1"}, 0)}
+d.spawn = lambda name, ms: (ev.append(f"hook {name}"), (None, True, 0))[1]
+d.wanted = d.applied = "lit-frozen"
+child = m.Menu(Gone())
+d.menu = d.last = child
+with contextlib.redirect_stderr(io.StringIO()):
+    d.set_grab("all")
+    held = (sorted(d.regrab), bool(d.regrab_timer))
+    ev.clear()
+    d.menu_exited(Gone(), None, child)
+if held != (["/dev/input/event1"], True) or ev != ["grab AYANEO Controller"] or d.regrab or d.regrab_timer or d.menu:
+    bad.append(f"child exit: held before {held}, then {ev}, retry set {sorted(d.regrab)}, timer {bool(d.regrab_timer)}")
+for b in bad:
+    print(f"FAILED {b}")
+sys.exit(1 if bad else 0)
+EOF
+r=$?
+((r == 0)) || sed 's/^/  /' "$t/lgrab.out"
+res $r "lit-frozen grab: from the menu it ungrabs and resyncs, then takes every node; the pad the child still holds gets EBUSY and is taken on the retry once it is free, and at once in the child's exit; leaving for awake ungrabs and resyncs"
 
 S=$t/sys
 sysnode() {
@@ -833,7 +1367,7 @@ sys.exit(1 if bad else 0)
 EOF
 res $? "virtual nodes stay out except the AYANEO Controller by name, ids and phys"
 
-env -u BLOCKIE_HOTKEYD_BACKSTOP_MS timeout -k 5 60 python3 - "$bin" > "$t/backstop.out" 2>&1 << 'EOF'
+env -u BLOCKIE_HOTKEYD_BACKSTOP_MS -u BLOCKIE_HOTKEYD_BOOT_BACKSTOP_MS timeout -k 5 60 python3 - "$bin" > "$t/backstop.out" 2>&1 << 'EOF'
 import importlib.machinery
 import importlib.util
 import sys
@@ -842,10 +1376,11 @@ loader = importlib.machinery.SourceFileLoader("hotkeyd", sys.argv[1])
 spec = importlib.util.spec_from_loader("hotkeyd", loader)
 m = importlib.util.module_from_spec(spec)
 loader.exec_module(m)
-print(m.BACKSTOP_MS)
-sys.exit(0 if m.BACKSTOP_MS == 35000 else 1)
+print(m.BACKSTOP_MS, m.BOOT_BACKSTOP_MS, m.SHOWN_MS, m.MENU_KILL_MS, m.TOAST_MS, m.POLL_MS)
+ok = (m.BACKSTOP_MS, m.BOOT_BACKSTOP_MS, m.SHOWN_MS, m.MENU_KILL_MS, m.TOAST_MS, m.POLL_MS) == (35000, 50000, 5000, 2000, 5100, 1000)
+sys.exit(0 if ok and m.TOAST_MS >= 350 + 3500 + 250 + m.POLL_MS and m.BOOT_BACKSTOP_MS > 45000 else 1)
 EOF
-res $? "the power off backstop defaults to 35000 ms, past the 25 s limit of blockie-poweroff.service"
+res $? "defaults: the power off backstop 35000 ms (past the 25 s limit of blockie-poweroff.service), the boot unit backstop 50000 ms (past the 45 s limit of blockie-reboot@.service), the menu shown limit 5000 ms, kill 2000 ms, toast 5100 ms (toast in 350, hold 3500, out 250 plus one poll), reboot unit poll 1000 ms"
 
 if (( fails )); then
   echo "hotkeyd: $fails failed"

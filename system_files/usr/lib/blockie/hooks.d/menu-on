@@ -1,0 +1,15 @@
+#!/bin/sh
+rc=0
+if [ "$(systemctl --user show -P ActiveState blockie-game.scope)" = active ]; then
+    systemctl --user kill --signal=SIGSTOP blockie-game.scope || rc=1
+fi
+cur=
+current=${BLOCKIE_RUNDIR:-/run/blockie-session}/session-current
+[ ! -r "$current" ] || read -r cur _ < "$current"
+if [ "$cur" = android ]; then
+    timeout 1 systemctl start --no-block blockie-android-freeze@freeze.service || rc=1
+fi
+timeout 2 wlopm --on '*'
+/usr/libexec/blockie/blockie-backlight on cached
+[ "$?" != 2 ] || /usr/libexec/blockie/blockie-backlight on lookup
+exit $rc

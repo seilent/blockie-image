@@ -677,8 +677,10 @@ grep -qxF "rundir=\${BLOCKIE_RUNDIR:-$run}" "$bin" &&
   grep -q "^ReadWritePaths=$run\( \|$\)" "$sf/usr/lib/systemd/system/blockie-session-switcher.service" &&
   grep -q "^ReadWritePaths=$run\( \|$\)" "$sf/usr/lib/systemd/system/blockie-session-switch@.service" &&
   grep -qF "\"$run/session-current\"" "$sf/usr/libexec/blockie/blockie-hotkeyd" &&
-  ! grep -qs "/run/blockie/" "$bin" "$sf/usr/lib/systemd/system"/blockie-session-* "$sf/usr/libexec/blockie/blockie-hotkeyd"
-res $? "the runtime dir is $run everywhere, nothing in the init's /run/blockie"
+  grep -qxF 'BOOT_STATE = os.environ.get("BLOCKIE_BOOT_STATE", "/run/blockie/boot/state")' "$sf/usr/libexec/blockie/blockie-hotkeyd" &&
+  ! grep -ohs "/run/blockie/[^\"' ]*" "$bin" "$sf/usr/lib/systemd/system"/blockie-session-* "$sf/usr/libexec/blockie/blockie-hotkeyd" |
+    grep -qv '^/run/blockie/boot\(/\|$\)'
+res $? "the runtime dir is $run everywhere, nothing in the init's /run/blockie except the boot gates in /run/blockie/boot, hotkeyd's gate file is /run/blockie/boot/state"
 
 sw=$sf/usr/lib/systemd/system/blockie-session-switcher.service
 grep -qxF 'TimeoutStartSec=1320' "$sw" && grep -qxF 'TimeoutStopSec=90' "$sw"

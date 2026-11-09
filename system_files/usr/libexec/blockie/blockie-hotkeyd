@@ -26,6 +26,7 @@ PART_MS = int(os.environ.get("BLOCKIE_HOTKEYD_PART_MS", "1000"))
 GRAB_RETRY_MS = int(os.environ.get("BLOCKIE_HOTKEYD_GRAB_RETRY_MS", "250"))
 SWITCHER_HOOK_MS = int(os.environ.get("BLOCKIE_HOTKEYD_SWITCHER_HOOK_MS", "1500"))
 BACKSTOP_MS = int(os.environ.get("BLOCKIE_HOTKEYD_BACKSTOP_MS", "35000"))
+BOOT_BACKSTOP_MS = int(os.environ.get("BLOCKIE_HOTKEYD_BOOT_BACKSTOP_MS", "50000"))
 SLEEP = os.environ.get("BLOCKIE_HOTKEYD_SLEEP", "/usr/libexec/blockie/blockie-sleep")
 SLEPT = os.environ.get("BLOCKIE_HOTKEYD_SLEPT")
 KNOB = os.environ.get("BLOCKIE_HOTKEYD_KNOB", "/run/blockie-sleep/on-vbus")
@@ -37,6 +38,14 @@ RETRY_MS = int(os.environ.get("BLOCKIE_HOTKEYD_RETRY_MS", "3000"))
 RETRY_SLOW_MS = int(os.environ.get("BLOCKIE_HOTKEYD_RETRY_SLOW_MS", "60000"))
 SLEEP_KILL_MS = int(os.environ.get("BLOCKIE_HOTKEYD_SLEEP_KILL_MS", "60000"))
 VBUS_MS = int(os.environ.get("BLOCKIE_HOTKEYD_VBUS_MS", "5000"))
+MENU = os.environ.get("BLOCKIE_HOTKEYD_MENU", "/usr/libexec/blockie/blockie-powermenu")
+MENU_KILL_MS = int(os.environ.get("BLOCKIE_HOTKEYD_MENU_KILL_MS", "2000"))
+TOAST_MS = int(os.environ.get("BLOCKIE_HOTKEYD_TOAST_MS", "5100"))
+POLL_MS = int(os.environ.get("BLOCKIE_HOTKEYD_POLL_MS", "1000"))
+SHOWN_MS = int(os.environ.get("BLOCKIE_HOTKEYD_SHOWN_MS", "5000"))
+BACKLIGHT = os.environ.get("BLOCKIE_HOTKEYD_BACKLIGHT", "/usr/libexec/blockie/blockie-backlight")
+BOOT_STATE = os.environ.get("BLOCKIE_BOOT_STATE", "/run/blockie/boot/state")
+BLINK_MS = 300
 RESLEEP_MAX_MS = 30000
 STORM_MS = 600000
 RESUME_S = 0.05
@@ -62,13 +71,16 @@ KEYS = {
 }
 VIRTUAL = {("AYANEO Controller", "0019", "4001", "0428", "ayaneo-gamepad/input0")}
 ARGS = {"switcher": (0, 0), "next": (0, 0), "back": (0, 0), "switch": (1, 1), "hook": (1, 1), "unit": (1, 1),
-        "call": (4, 4), "blank": (0, 1), "none": (0, 0)}
+        "call": (4, 4), "blank": (0, 1), "menu": (0, 0), "none": (0, 0)}
 GESTURES = ("tap", "hold", "press")
-DISPLAY = {"awake": "blank-off", "blanked": "blank-on", "lit-frozen": "screen-on"}
+DISPLAY = {"awake": "blank-off", "blanked": "blank-on", "lit-frozen": "screen-on", "menu": "menu-on"}
 DEFAULTS = {("home", "hold"): ((LONG_MS, "hold", ("switcher",)),), ("volup", "press"): ("hook", "volume-up"),
             ("voldown", "press"): ("hook", "volume-down"), ("power", "tap"): ("blank",),
-            ("power", "hold"): ((LONG_MS, "hold", ("blank", "on")),
-                                (3000, "hold=3000", ("unit", "blockie-poweroff.service")))}
+            ("power", "hold"): ((2000, "hold=2000", ("menu",)),
+                                (4000, "hold=4000", ("unit", "blockie-poweroff.service")))}
+TARGETS = ("reboot", "android", "recovery")
+EXITS = ("cancel", "screen-off", "poweroff", "failed")
+RUNNING = ("activating", "active", "deactivating", "reloading")
 NAME = re.compile(r"[a-z0-9][a-z0-9-]*")
 UNIT = re.compile(r"[a-z0-9][a-z0-9@._-]*\.service")
 HOLD = re.compile(r"hold(?:=([1-9][0-9]{0,4}))?")
@@ -152,7 +164,8 @@ def load_table(session):
             ms = int(m.group(1) or LONG_MS) if m else 0
             gesture = "hold" if m else words[1] if len(words) > 1 else ""
             if (len(words) < 3 or words[0] not in KEYS or gesture not in GESTURES or not valid(words[2], words[3:])
-                    or (gesture == "press" and words[2] not in ("hook", "none")) or ms > HOLD_MAX_MS):
+                    or (gesture == "press" and words[2] not in ("hook", "none")) or ms > HOLD_MAX_MS
+                    or (words[2] == "menu" and words[0] != "power")):
                 log(f"{path}:{n}: ignored: {line.strip()}")
                 continue
             if gesture != "hold":
@@ -210,6 +223,18 @@ class Key:
         self.stage = 0
 
 
+class Menu:
+    def __init__(self, proc):
+        self.proc = proc
+        self.at = time.monotonic()
+        self.shown = False
+        self.result = ""
+        self.failed = False
+        self.kill = 0
+        self.toast = 0
+        self.late = 0
+
+
 class Hotkeyd:
     def __init__(self, loop):
         self.loop = loop
@@ -222,7 +247,7 @@ class Hotkeyd:
         self.applied = "unknown"
         self.busy = False
         self.kill_timer = 0
-        self.opening = False
+        self.opening = None
         self.open_timer = 0
         self.regrab = {}
         self.regrab_timer = 0
@@ -230,7 +255,15 @@ class Hotkeyd:
         self.pending = None
         self.started = None
         self.backstop = 0
-        self.grabbed = False
+        self.grabbed = ""
+        self.menu = None
+        self.last = None
+        self.menu_due = False
+        self.menu_from = "awake"
+        self.boot = None
+        self.poll_timer = 0
+        self.started_at = 0
+        self.under_way = False
         self.extra = {}
         self.nograb = {}
         self.helper = None
@@ -295,6 +328,9 @@ class Hotkeyd:
             GLib.timeout_add(ms, lambda: p.force_exit() or False)
 
     def want(self, state):
+        if state == "menu" and self.opening is not None:
+            log("switcher-open killed for the power menu")
+            self.opening.force_exit()
         self.wanted = state
         self.retry = 1
         self.next_ms = SETTLE_MS
@@ -305,7 +341,11 @@ class Hotkeyd:
         if state != "blanked" and self.helper is not None:
             log("SIGTERM to blockie-sleep")
             self.helper.send_signal(15)
-        self.set_grab(state == "blanked")
+        if state != "menu":
+            self.menu_due = False
+        if state in ("awake", "blanked") and self.menu is not None:
+            self.end_menu(self.menu)
+        self.set_grab("all" if state in ("blanked", "lit-frozen") else "keys" if state == "menu" else "")
         self.apply()
         self.consider()
 
@@ -325,20 +365,24 @@ class Hotkeyd:
                     return
                 self.applied = "unknown" if found else state
         self.start_pending()
+        if self.menu_due and self.wanted == self.applied == "menu":
+            self.start_menu()
 
     def start_pending(self):
         if self.pending and self.wanted == "lit-frozen":
             unit, self.pending = self.pending, None
+            self.started_at = int(time.clock_gettime(time.CLOCK_MONOTONIC) * 1000000)
             self.start(unit)
             self.started = unit
             if self.backstop:
                 GLib.source_remove(self.backstop)
-            self.backstop = GLib.timeout_add(BACKSTOP_MS, self.lapsed, unit)
+            ms = BOOT_BACKSTOP_MS if unit == self.boot else BACKSTOP_MS
+            self.backstop = GLib.timeout_add(ms, self.lapsed, unit, ms)
 
-    def lapsed(self, unit):
+    def lapsed(self, unit, ms):
         self.backstop = 0
         if self.wanted == "lit-frozen" and self.started == unit:
-            log(f"{unit} started {BACKSTOP_MS} ms ago and the power is still on: back to awake")
+            log(f"{unit} started {ms} ms ago and the power is still on: back to awake")
             self.want("awake")
         return False
 
@@ -346,7 +390,8 @@ class Hotkeyd:
         if DRY:
             return
         try:
-            p = Gio.Subprocess.new(["systemctl", "--user", "show", "-P", "ActiveState", self.started],
+            p = Gio.Subprocess.new(["systemctl", "--user", "show", "-p", "LoadState", "-p", "ActiveState", "-p", "Result",
+                                    "-p", "StateChangeTimestampMonotonic", self.started],
                                    Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE)
         except GLib.Error as err:
             log(f"cannot run systemctl: {err.message}")
@@ -359,11 +404,91 @@ class Hotkeyd:
         except GLib.Error as err:
             log(f"systemctl show {unit}: {err.message}")
             out = ""
-        state = out.strip()
-        if self.wanted == "lit-frozen" and self.started == unit and state not in ("activating", "active", "deactivating",
-                                                                                   "reloading"):
-            log(f"{unit} is {state or 'unknown'}: back to awake")
+        props = {}
+        for line in out.splitlines():
+            k, _, v = line.partition("=")
+            props[k] = v
+        load, state, result = props.get("LoadState", ""), props.get("ActiveState", ""), props.get("Result", "")
+        try:
+            since = int(props.get("StateChangeTimestampMonotonic", "0"))
+        except ValueError:
+            since = 0
+        if self.wanted != "lit-frozen" or self.started != unit:
+            return
+        if unit != self.boot:
+            if state not in RUNNING:
+                log(f"{unit} is {state or 'unknown'}: back to awake")
+                self.want("awake")
+            return
+        if not (out.strip() and p.get_if_exited() and p.get_exit_status() == 0):
+            log(f"systemctl show {unit} gave no state: polling on")
+            return
+        if load != "loaded":
+            why = load or "unknown"
+        elif since < self.started_at or state in RUNNING:
+            return
+        elif state == "inactive" and result == "success":
+            if not self.under_way:
+                self.under_way = True
+                log(f"{unit} ended with success: the reboot is under way")
+            return
+        else:
+            why = f"{state or 'unknown'} {result}"
+        self.boot_failure(unit, why)
+
+    def boot_started(self, p, res, unit):
+        try:
+            p.wait_finish(res)
+        except GLib.Error as err:
+            log(f"systemctl start {unit}: {err.message}")
+            return
+        if p.get_if_exited() and p.get_exit_status() == 0:
+            return
+        if self.wanted == "lit-frozen" and self.started == unit:
+            self.boot_failure(unit, f"refused (start {'exit ' + str(p.get_exit_status()) if p.get_if_exited() else 'killed'})")
+
+    def boot_failure(self, unit, why):
+        try:
+            q = Gio.Subprocess.new(["systemctl", "is-system-running"],
+                                   Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE)
+        except GLib.Error as err:
+            log(f"cannot run systemctl: {err.message}")
+            return
+        q.communicate_utf8_async(None, None, self.boot_checked, (unit, why))
+
+    def boot_checked(self, p, res, data):
+        unit, why = data
+        try:
+            out = p.communicate_utf8_finish(res)[1] or ""
+        except GLib.Error as err:
+            log(f"systemctl is-system-running: {err.message}")
+            out = ""
+        if out.strip() == "stopping":
+            log(f"{unit} is {why} while the system is stopping: ignored")
+            return
+        if self.wanted != "lit-frozen" or self.started != unit:
+            return
+        m = self.menu
+        if m is None or m is not self.last:
+            log(f"{unit} is {why}: back to awake")
             self.want("awake")
+        elif not m.failed:
+            log(f"{unit} is {why}: back to awake once blockie-powermenu showed it")
+            m.failed = True
+            m.toast = GLib.timeout_add(TOAST_MS, self.toast_over, m)
+
+    def toast_over(self, m):
+        m.toast = 0
+        self.end_menu(m)
+        return False
+
+    def poll(self):
+        if self.wanted != "lit-frozen" or self.boot not in (self.pending, self.started):
+            self.poll_timer = 0
+            return False
+        if self.started == self.boot:
+            self.check_started()
+        return True
 
     def kill(self, p):
         self.kill_timer = 0
@@ -389,6 +514,10 @@ class Hotkeyd:
             log(f"{DISPLAY[state]}: " + (f"exit {p.get_exit_status()}" if p.get_if_exited() else "killed")
                 + (", once more" if self.retry else ""))
             if not self.retry:
+                if state == "menu" and self.wanted == "menu":
+                    log("menu-on failed twice: back to awake")
+                    self.want("awake")
+                    return
                 self.start_pending()
                 return
             self.retry -= 1
@@ -396,7 +525,9 @@ class Hotkeyd:
         self.consider()
 
     def start(self, unit):
-        self.run(["systemctl", "--user", "start", "--no-block", unit])
+        p = self.run(["systemctl", "--user", "start", "--no-block", unit])
+        if p is not None and unit == self.boot:
+            p.wait_async(None, self.boot_started, unit)
 
     def blank(self, args, wake=False):
         if self.wanted == "awake":
@@ -404,6 +535,8 @@ class Hotkeyd:
                 self.want("blanked")
         elif self.wanted == "blanked":
             self.want("blanked" if args else "awake")
+        elif self.wanted == "menu":
+            self.want("blanked")
         elif not args and self.started:
             self.check_started()
 
@@ -414,6 +547,140 @@ class Hotkeyd:
             self.pending = name
             self.started = None
             self.want("lit-frozen")
+
+    def open_menu(self):
+        if self.menu is not None or self.wanted in ("menu", "lit-frozen"):
+            log(f"menu: ignored, {'blockie-powermenu still runs' if self.menu is not None else self.wanted}")
+            return
+        self.menu_from = "dark" if self.wanted == "blanked" else "awake"
+        self.menu_due = True
+        self.last = None
+        self.want("menu")
+
+    def start_menu(self):
+        self.menu_due = False
+        if DRY and "BLOCKIE_HOTKEYD_MENU" not in os.environ:
+            log("dry run: no blockie-powermenu started")
+            return
+        try:
+            launcher = Gio.SubprocessLauncher.new(Gio.SubprocessFlags.STDOUT_PIPE)
+            launcher.setenv("BLOCKIE_POWERMENU_FROM", self.menu_from, True)
+            launcher.setenv("BLOCKIE_BOOT_STATE", BOOT_STATE, True)
+            p = launcher.spawnv([MENU])
+        except GLib.Error as err:
+            log(f"cannot run {MENU}: {err.message}: back to awake")
+            self.want("awake")
+            return
+        m = Menu(p)
+        m.late = GLib.timeout_add(SHOWN_MS, self.not_shown, m)
+        self.menu = self.last = m
+        log(f"blockie-powermenu started from {self.menu_from}")
+        Gio.DataInputStream.new(p.get_stdout_pipe()).read_line_async(GLib.PRIORITY_DEFAULT, None, self.menu_line, m)
+        p.wait_async(None, self.menu_exited, m)
+
+    def menu_line(self, stream, res, m):
+        try:
+            line = stream.read_line_finish_utf8(res)[0]
+        except GLib.Error as err:
+            log(f"blockie-powermenu: {err.message}")
+            line = None
+        if line is not None:
+            stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self.menu_line, m)
+            self.menu_said(m, line.split())
+        elif m is self.last and not m.result and self.wanted == "menu":
+            log("blockie-powermenu ended with no result: back to awake")
+            m.result = "eof"
+            self.want("awake")
+
+    def menu_said(self, m, words):
+        line = " ".join(words)
+        if m is not self.last or m.result or self.wanted != "menu":
+            log(f"blockie-powermenu: dropped: {line}")
+            return
+        log(f"blockie-powermenu: {line}")
+        if words == ["shown"]:
+            m.shown = True
+            if m.late:
+                GLib.source_remove(m.late)
+                m.late = 0
+            return
+        m.result = words[0] if words else "?"
+        if words == ["cancel"] or words[:1] == ["failed"]:
+            self.want("awake")
+        elif words == ["screen-off"]:
+            self.want("blanked")
+        elif words == ["poweroff"]:
+            self.end_menu(m)
+            self.unit("blockie-poweroff.service")
+        elif len(words) == 2 and words[0] == "boot" and words[1] in TARGETS:
+            self.boot = f"blockie-reboot@{words[1]}.service"
+            self.under_way = False
+            self.unit(self.boot)
+            if not self.poll_timer:
+                self.poll_timer = GLib.timeout_add(POLL_MS, self.poll)
+        else:
+            log(f"blockie-powermenu: not a result: {line}: back to awake")
+            m.result = "?"
+            self.want("awake")
+
+    def not_shown(self, m):
+        m.late = 0
+        if m is self.last and not m.shown and not m.result:
+            log(f"blockie-powermenu printed no shown in {SHOWN_MS} ms: back to awake")
+            m.result = "late"
+            if self.wanted == "menu":
+                self.want("awake")
+            else:
+                self.end_menu(m)
+        return False
+
+    def end_menu(self, m):
+        if m.kill:
+            return
+        if m.result not in EXITS:
+            log("SIGTERM to blockie-powermenu")
+            m.proc.send_signal(15)
+        m.kill = GLib.timeout_add(MENU_KILL_MS, self.kill_menu, m)
+
+    def kill_menu(self, m):
+        m.kill = 0
+        log(f"blockie-powermenu still running after {MENU_KILL_MS} ms: killed")
+        m.proc.force_exit()
+        return False
+
+    def menu_exited(self, p, res, m):
+        try:
+            p.wait_finish(res)
+        except GLib.Error as err:
+            log(f"blockie-powermenu: {err.message}")
+        for timer in (m.kill, m.toast, m.late):
+            if timer:
+                GLib.source_remove(timer)
+        m.kill = m.toast = m.late = 0
+        log("blockie-powermenu " + (f"exit {p.get_exit_status()}" if p.get_if_exited() else "killed"))
+        if self.menu is m:
+            self.menu = None
+        timer = self.regrab_timer
+        if self.regrab and timer and not self.regrab_tick():
+            GLib.source_remove(timer)
+        if m.failed and m is self.last and self.wanted == "lit-frozen":
+            self.want("awake")
+        self.consider()
+
+    def blink(self, unit):
+        if self.menu is not None:
+            self.end_menu(self.menu)
+        self.last = None
+        self.menu_due = False
+        self.run([BACKLIGHT, "off"])
+        GLib.timeout_add(BLINK_MS, self.blinked, unit)
+
+    def blinked(self, unit):
+        self.run([BACKLIGHT, "on"])
+        self.pending = unit
+        self.started = None
+        self.want("lit-frozen")
+        return False
 
     def grab(self, dev, path):
         try:
@@ -488,22 +755,36 @@ class Hotkeyd:
                 self.nograb[path] = real
                 continue
             if self.grab(dev, path):
-                log(f"{path} {dev.name}: grabbed while blanked")
+                log(f"{path} {dev.name}: grabbed while {self.wanted}")
             self.extra[path] = (dev, real)
 
-    def set_grab(self, on):
-        if on == self.grabbed:
+    def grabs(self, dev):
+        return self.grabbed == "all" or dev.name not in KEYS["extra1"][0]
+
+    def set_grab(self, mode):
+        if mode == self.grabbed:
             return
-        self.grabbed = on
+        if self.grabbed:
+            self.ungrab()
+        self.grabbed = mode
+        if not mode:
+            return
         if DRY:
-            print("grab" if on else "ungrab", flush=True)
-        if on:
-            for path, (dev, _, _) in self.devices.items():
-                self.grab(dev, path)
-            if not INPUT:
-                self.grab_more()
-            log(f"blanked: {len(self.devices)} key nodes and {len(self.extra)} more grabbed")
+            print("grab" if mode == "all" else "grab keys", flush=True)
+        nodes = [(path, dev) for path, (dev, _, _) in self.devices.items() if self.grabs(dev)]
+        for path, dev in nodes:
+            self.grab(dev, path)
+        if mode == "keys":
+            log(f"menu: {len(nodes)} key nodes grabbed")
             return
+        if not INPUT:
+            self.grab_more()
+        log(f"{self.wanted}: {len(self.devices)} key nodes and {len(self.extra)} more grabbed")
+
+    def ungrab(self):
+        self.grabbed = ""
+        if DRY:
+            print("ungrab", flush=True)
         if self.regrab_timer:
             GLib.source_remove(self.regrab_timer)
             self.regrab_timer = 0
@@ -565,6 +846,8 @@ class Hotkeyd:
             return "key"
         if self.helper is not None or self.lost_timer:
             return "helper"
+        if self.menu is not None:
+            return "menu"
         if self.refused or self.storm:
             return "held"
         if sysfs(ONLINE) == "1" and not os.path.exists(KNOB):
@@ -752,14 +1035,14 @@ class Hotkeyd:
     def switcher(self):
         if DRY:
             return
-        if self.opening:
+        if self.opening is not None:
             log("switcher-open still running: switcher ignored")
             return
         p, _, ms = self.spawn("switcher-open", SWITCHER_HOOK_MS)
         if p is None:
             self.open_switcher()
             return
-        self.opening = True
+        self.opening = p
         self.open_timer = GLib.timeout_add(ms, self.kill_open, p)
         p.wait_async(None, self.opened, None)
 
@@ -776,7 +1059,7 @@ class Hotkeyd:
         if self.open_timer:
             GLib.source_remove(self.open_timer)
             self.open_timer = 0
-        self.opening = False
+        self.opening = None
         if self.wanted != "awake":
             return
         self.open_switcher()
@@ -795,8 +1078,12 @@ class Hotkeyd:
         else:
             self.run(["blockie-session", "next"])
 
-    def fire(self, key, gesture, row):
-        if self.wanted == "blanked" and key != "power":
+    def fire(self, key, gesture, row, fallback=False):
+        if self.wanted in ("blanked", "menu", "lit-frozen") and key != "power":
+            return
+        m = self.last
+        if fallback and m is not None and m.shown and (m is self.menu or m.at >= self.keys[key].down_at):
+            log(f"{key} {gesture}: blockie-powermenu showed: {' '.join(row)} skipped")
             return
         action, args = row[0], row[1:]
         if DRY:
@@ -813,9 +1100,14 @@ class Hotkeyd:
             if not DRY:
                 self.hook(args[0])
         elif action == "unit":
-            self.unit(args[0])
+            if fallback:
+                self.blink(args[0])
+            else:
+                self.unit(args[0])
         elif action == "blank":
             self.blank(args, gesture == "tap" and self.keys[key].wake)
+        elif action == "menu":
+            self.open_menu()
         elif action == "call":
             self.call(*args)
 
@@ -834,7 +1126,7 @@ class Hotkeyd:
             k.stage += 1
             if k.stage < len(stages):
                 k.timer = GLib.timeout_add(stages[k.stage][0] - ms, self.held, key)
-            self.fire(key, word, row)
+            self.fire(key, word, row, row[0] == "unit" and any(r[0] == "menu" for _, _, r in stages[:k.stage - 1]))
         return False
 
     def repeat(self, key, first):
@@ -856,7 +1148,7 @@ class Hotkeyd:
             k.down = True
             k.down_at = time.monotonic()
             k.wake = key == "power" and self.resumed is not None and k.down_at - self.resumed < WAKE_MS / 1000
-            k.consumed = self.wanted == "blanked" and key != "power"
+            k.consumed = self.wanted in ("blanked", "menu", "lit-frozen") and key != "power"
             k.stage = 0
             self.stop_timer(k)
             if not k.consumed:
@@ -902,10 +1194,10 @@ class Hotkeyd:
             watch = GLib.io_add_watch(dev.fd, GLib.PRIORITY_DEFAULT, GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR,
                                       self.readable, path)
             self.devices[path] = (dev, m, watch)
-            if self.grabbed:
+            if self.grabbed and self.grabs(dev):
                 self.grab(dev, path)
             log(f"{path} {dev.name}: {', '.join(sorted(m.values()))}")
-        if self.grabbed:
+        if self.grabbed == "all":
             self.grab_more()
         return True
 

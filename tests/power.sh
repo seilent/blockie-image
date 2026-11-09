@@ -50,6 +50,10 @@ case "\$*" in
     [ "\$rc" != 0 ] || { [ "\$3" = --signal=SIGSTOP ] && : > "$s/stopped" || rm -f "$s/stopped"; }
     exit "\$rc"
     ;;
+  'start --no-block blockie-android-freeze@freeze.service')
+    echo "systemctl \$*" >> "$t/log"
+    exit \$(cat "$s/freeze.rc" 2> /dev/null || echo 0)
+    ;;
   is-system-running) cat "$s/sysrun" 2> /dev/null || echo running ;;
   '--user show -P ActiveState blockie-poweroff.service') cat "$s/po.state" 2> /dev/null || echo inactive ;;
   '--user show -P FreezerState blockie-emulation.slice') cat "$s/slice" 2> /dev/null || echo running ;;
@@ -133,7 +137,7 @@ bl102=$(bl 102)
 off_line='busctl call org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager PowerOff b false'
 
 ok=0
-for h in blank-on blank-off screen-on; do
+for h in blank-on blank-off screen-on menu-on; do
   [[ -x $hooks/$h && $(head -n 1 "$hooks/$h") == '#!/bin/sh' ]] && sh -n "$hooks/$h" || { ok=1; echo "  $h"; }
 done
 for f in "$off" "$sl"; do
@@ -188,6 +192,47 @@ state 1 stopped
 run "$hooks/screen-on"
 [[ $rc == 0 ]] && logis $'wlopm --on *\n'"$bl102" && stopped
 res $? "screen-on turns the output on and leaves the game stopped"
+
+rd=$t/rundir
+mkdir -p "$rd"
+freeze_line='systemctl start --no-block blockie-android-freeze@freeze.service'
+menu_on() { run env BLOCKIE_RUNDIR="$rd" "$hooks/menu-on"; }
+ok=0
+printf 'emulation blockie-emulation.service 3\n' > "$rd/session-current"
+state 1 running
+menu_on
+[[ $rc == 0 ]] && logis "$stop_line"$'\nwlopm --on *\n'"$bl102" && stopped || { ok=1; echo "  game: rc $rc $(tr '\n' '|' < "$t/log")"; }
+state 0 running
+menu_on
+[[ $rc == 0 ]] && logis $'wlopm --on *\n'"$bl102" && ! grep -q SIGSTOP "$t/log" || { ok=1; echo "  no game: rc $rc $(tr '\n' '|' < "$t/log")"; }
+printf 'android blockie-android.service 7\n' > "$rd/session-current"
+state 1 running
+menu_on
+[[ $rc == 0 ]] && logis "$stop_line"$'\n'"$freeze_line"$'\nwlopm --on *\n'"$bl102" && stopped ||
+  { ok=1; echo "  android: rc $rc $(tr '\n' '|' < "$t/log")"; }
+res $ok "menu-on SIGSTOPs only an active game scope, freezes Android only with android current, then lights the panel"
+
+ok=0
+printf 'emulation blockie-emulation.service 3\n' > "$rd/session-current"
+state 1 running
+echo 1 > "$s/wlopm.rc"
+: > "$s/sb.fail"
+menu_on
+[[ $rc == 0 ]] && stopped || { ok=1; echo "  wlopm and backlight fail: rc $rc"; }
+state 1 running
+: > "$s/wlopm.hang"
+menu_on
+[[ $rc == 0 ]] && ((ms >= 2000 && ms < 5000)) || { ok=1; echo "  wlopm hangs: rc $rc $ms ms"; }
+state 1 running
+echo 1 > "$s/kill.rc"
+menu_on
+[[ $rc == 1 ]] && logis "$stop_line"$'\nwlopm --on *\n'"$bl102" || { ok=1; echo "  SIGSTOP fails: rc $rc"; }
+printf 'android blockie-android.service 7\n' > "$rd/session-current"
+state 0 running
+echo 1 > "$s/freeze.rc"
+menu_on
+[[ $rc == 1 ]] && logis "$freeze_line"$'\nwlopm --on *\n'"$bl102" || { ok=1; echo "  freeze fails: rc $rc $(tr '\n' '|' < "$t/log")"; }
+res $ok "menu-on exits 0 when wlopm or the backlight fail or wlopm hangs (cut at 2 s), 1 when the SIGSTOP or the Android freeze fail"
 
 ok=0
 state 1 running
