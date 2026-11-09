@@ -4,13 +4,44 @@ export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 sink=@DEFAULT_AUDIO_SINK@
 step=${BLOCKIE_VOLUME_STEP:-5%}
 
+usage() {
+    echo "usage: blockie-volume up|down|mute [on|off]|set <pct> [muted|unmuted]|get" >&2
+    exit 2
+}
+
 case "${1:-}" in
 up) exec wpctl set-volume -l 1.0 "$sink" "$step+" ;;
 down) exec wpctl set-volume "$sink" "$step-" ;;
-mute) exec wpctl set-mute "$sink" toggle ;;
-get) exec wpctl get-volume "$sink" ;;
-*)
-    echo "usage: blockie-volume up|down|mute|get" >&2
-    exit 2
+mute)
+    case "${2:-toggle}" in
+    on) exec wpctl set-mute "$sink" 1 ;;
+    off) exec wpctl set-mute "$sink" 0 ;;
+    toggle) exec wpctl set-mute "$sink" toggle ;;
+    *) usage ;;
+    esac
     ;;
+set)
+    pct=${2:-}
+    case "$pct" in
+    "" | *[!0-9]* | ????*) usage ;;
+    esac
+    [ "$pct" -le 100 ] || usage
+    case "${3:-unmuted}" in
+    muted) m=1 ;;
+    unmuted) m=0 ;;
+    *) usage ;;
+    esac
+    wpctl set-volume "$sink" "$pct%" && exec wpctl set-mute "$sink" "$m"
+    ;;
+get)
+    out=$(wpctl get-volume "$sink") || exit
+    printf '%s\n' "$out" | awk '
+        $1 == "Volume:" && $2 ~ /^[0-9]+(\.[0-9]+)?$/ {
+            printf "%d %s\n", $2 * 100 + 0.5, ($3 == "[MUTED]" ? "muted" : "unmuted")
+            ok = 1
+            exit
+        }
+        END { exit !ok }'
+    ;;
+*) usage ;;
 esac

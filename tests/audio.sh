@@ -242,7 +242,11 @@ rc=0
 mkdir "$tmp/bin"
 cat > "$tmp/bin/wpctl" << 'EOF'
 #!/bin/sh
-echo "$XDG_RUNTIME_DIR $*"
+case $1 in
+get-volume) [ -z "$WPCTL_OUT" ] || echo "$WPCTL_OUT" ;;
+*) echo "$XDG_RUNTIME_DIR $*" ;;
+esac
+exit "${WPCTL_RC:-0}"
 EOF
 chmod 755 "$tmp/bin/wpctl"
 for k in up down; do
@@ -256,5 +260,41 @@ got=$(env -u XDG_RUNTIME_DIR PATH="$tmp/bin:$PATH" /usr/lib/blockie/hooks.d/volu
 want="/x set-volume @DEFAULT_AUDIO_SINK@ 2%-"
 got=$(XDG_RUNTIME_DIR=/x BLOCKIE_VOLUME_STEP=2% PATH="$tmp/bin:$PATH" /usr/lib/blockie/hooks.d/volume-down)
 [[ $got == "$want" ]] || fail "volume-down ran '$got', want '$want'"
+s=@DEFAULT_AUDIO_SINK@
+ran() {
+  local want=$1 got
+  shift
+  got=$(XDG_RUNTIME_DIR=/x PATH="$tmp/bin:$PATH" "$vol" "$@") || fail "blockie-volume $* gave rc $?"
+  [[ $got == "$want" ]] || fail "blockie-volume $* ran '$got', want '$want'"
+}
+ran "/x set-mute $s toggle" mute
+ran "/x set-mute $s 1" mute on
+ran "/x set-mute $s 0" mute off
+ran "/x set-volume $s 40%"$'\n'"/x set-mute $s 0" set 40
+ran "/x set-volume $s 0%"$'\n'"/x set-mute $s 1" set 0 muted
+ran "/x set-volume $s 100%"$'\n'"/x set-mute $s 0" set 100 unmuted
+for a in "mute maybe" set "set 101" "set -1" "set 4x" "set 1000" "set 40 loud"; do
+  read -ra args <<< "$a"
+  rc=0
+  XDG_RUNTIME_DIR=/x PATH="$tmp/bin:$PATH" "$vol" "${args[@]}" > "$tmp/out" 2> /dev/null || rc=$?
+  [[ $rc == 2 && ! -s $tmp/out ]] || fail "blockie-volume $a gave rc $rc, want 2 with no wpctl call"
+done
+rc=0
+got=$(WPCTL_RC=4 XDG_RUNTIME_DIR=/x PATH="$tmp/bin:$PATH" "$vol" set 40) || rc=$?
+[[ $rc == 4 && $got == "/x set-volume $s 40%" ]] ||
+  fail "set 40 with set-volume failing gave rc $rc and '$got', want rc 4 and no set-mute"
+for c in "Volume: 0.40|40 unmuted" "Volume: 0.35 [MUTED]|35 muted" "Volume: 0.29|29 unmuted" \
+  "Volume: 0.00 [MUTED]|0 muted" "Volume: 1.00|100 unmuted"; do
+  got=$(WPCTL_OUT=${c%|*} PATH="$tmp/bin:$PATH" "$vol" get) || fail "get on '${c%|*}' gave rc $?"
+  [[ $got == "${c#*|}" ]] || fail "get on '${c%|*}' printed '$got', want '${c#*|}'"
+done
+for o in "" "Volume:" "Volume: x" "Mute: 0.40"; do
+  rc=0
+  got=$(WPCTL_OUT=$o PATH="$tmp/bin:$PATH" "$vol" get) || rc=$?
+  [[ $rc == 1 && -z $got ]] || fail "get on '$o' gave rc $rc and '$got', want rc 1 and no output"
+done
+rc=0
+got=$(WPCTL_OUT="Volume: 0.40" WPCTL_RC=3 PATH="$tmp/bin:$PATH" "$vol" get) || rc=$?
+[[ $rc == 3 && -z $got ]] || fail "get with wpctl rc 3 gave rc $rc and '$got', want rc 3 and no output"
 
 echo "audio: ok, $clients audio client units, PipeWire $(rpm -q --qf '%{VERSION}' pipewire), WirePlumber $(rpm -q --qf '%{VERSION}' wireplumber)"
