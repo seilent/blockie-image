@@ -42,6 +42,7 @@ STALE = -1
 HOLD = {"boot": 120.0, "launch": 6.0, "switch": 0.5, "touch": 0.2}
 UCLAMP = {"boot": 100, "launch": 100, "switch": 100, "touch": 80}
 LAUNCH_AGE = 2.0
+REPORT_EVERY = 60.0
 FAST = 0.25
 SLOW = 1.5
 FAST_FOR = 2.0
@@ -58,6 +59,7 @@ TOP_NICE = -10
 BG_ADJ = 300
 ISOLATED = range(90000, 100000)
 ZYGOTES = ("zygote", "zygote64")
+ZYGOTE_COMMS = ("main", "zygote", "zygote64")
 PERF_KEY = "android.perf"
 PERF_DEFAULT = "policy"
 PERF_VALUES = ("policy", "off")
@@ -260,6 +262,8 @@ class Sched:
         self.min_bad = set()
         self.last_pid = None
         now = self.clock()
+        self.counts = {}
+        self.counted_at = now
         self.pinged = now
         self.next_slow = now
         self.next_fast = now
@@ -521,9 +525,21 @@ class Sched:
         if skip:
             self.perf_busy(f"{kind} window without knob writes")
         r = Req(kind, until, self.values(kind), skip)
+        self.count(kind)
         self.requests.append(r)
         self.apply(now)
         return r
+
+    def count(self, key):
+        self.counts[key] = self.counts.get(key, 0) + 1
+
+    def report(self, now, force=False):
+        if now - self.counted_at < REPORT_EVERY and not force:
+            return
+        if self.counts:
+            log(f"last {now - self.counted_at:.0f} s: " + " ".join(f"{k} {v}" for k, v in sorted(self.counts.items())))
+        self.counts = {}
+        self.counted_at = now
 
     def extend(self, r, until, now):
         r.until = max(r.until, until)
@@ -864,8 +880,8 @@ class Sched:
             if slow or nice == TOP_NICE or pr.group == "top" or pr.adj is None:
                 pr.adj = self.adj(pr)
             want = self.classify(nice, pr.adj)
-            if want != pr.group:
-                self.move(pid, pr, want)
+            if want != pr.group and self.move(pid, pr, want):
+                self.count("to_" + want)
         top = {pid for pid, pr in self.pids.items() if pr.group == "top"}
         fresh = top - self.top_prev
         self.top_prev = top
@@ -875,7 +891,7 @@ class Sched:
             self.baseline = False
             return
         kind = None
-        zyg = {pid for pid, pr in self.pids.items() if pr.comm in ZYGOTES}
+        zyg = self.zygotes() if fresh else set()
         for pid in fresh:
             pr = self.pids[pid]
             uid = self.uid(pr)
@@ -887,6 +903,17 @@ class Sched:
         if kind:
             log(f"window {kind}")
             self.boost(kind, now)
+
+    def zygotes(self):
+        mains = {pid: pr for pid, pr in self.pids.items() if pr.comm in ZYGOTE_COMMS}
+        found = set()
+        for pid, pr in mains.items():
+            if pr.ppid in mains:
+                continue
+            arg0 = (self.pidfile(pr, "cmdline") or "").split("\0", 1)[0]
+            if os.path.basename(arg0) in ZYGOTES:
+                found.add(pid)
+        return found
 
     def age(self, pr):
         try:
@@ -1109,6 +1136,7 @@ class Sched:
                     self.boot_check(now)
             if self.dirty and self.lock_fd is None and not self.requests:
                 self.restore("retry")
+            self.report(now)
         elif self.ready and not self.frozen and ((self.fast_until > now and now >= self.next_fast)
                                                  or (self.extra and now >= self.extra[0])):
             self.next_fast = now + FAST
@@ -1135,6 +1163,7 @@ class Sched:
             self.step()
             if self.clock() - self.pinged >= PING:
                 self.ping()
+        self.report(self.clock(), True)
         self.restore("stop")
         for _ in range(STOP_TRIES):
             if not self.mins_failed:

@@ -43,7 +43,7 @@ BOOST = {"policy0": 1800000, "policy6": 2000000, "gpu": 15, "ddr": 0, "payload":
 TOUCH = {"policy0": 1500000, "policy6": 1710000, "gpu": 20, "payload": 80, "top": 80}
 IDLE = {"policy0": 500000, "policy6": 850000, "gpu": 29, "payload": 0, "top": 0, "fg": 0}
 FIX = [
-    dict(pid=200, comm="zygote64", ppid=1, nice=-20, uid=0, adj=-1000),
+    dict(pid=200, comm="main", cmd="zygote64", ppid=1, nice=-20, uid=0, adj=-1000),
     dict(pid=201, comm="webview_zygote", ppid=200, nice=0, uid=1053, adj=-1000),
     dict(pid=300, comm="launcher", nice=-10, uid=10050, adj=0),
     dict(pid=301, comm="renderer", ppid=201, nice=-10, uid=99002, adj=0),
@@ -164,9 +164,11 @@ class World:
     def loadavg(self):
         self.f("/proc/loadavg", f"0.10 0.10 0.10 1/100 {self.last}\n")
 
-    def proc(self, pid, comm="app", ppid=200, nice=0, age=100.0, uid=10000, adj=0, group=""):
+    def proc(self, pid, comm="app", ppid=200, nice=0, age=100.0, uid=10000, adj=0, group="", cmd=None):
         self.ps[pid] = {"comm": comm, "ppid": ppid, "nice": nice, "start": int((self.uptime - age) * m.CLK_TCK),
                         "uid": uid, "adj": adj, "group": group}
+        if cmd is not None:
+            self.ps[pid]["cmd"] = cmd
         self.render(pid)
         self.add(pid, group)
         self.last = max(self.last, pid) + 1
@@ -179,6 +181,7 @@ class World:
         self.f(d + "/stat", f"{pid} ({p['comm']}) {' '.join(fields)}\n")
         self.f(d + "/status", f"Name:\t{p['comm']}\nUid:\t{p['uid']}\t{p['uid']}\t{p['uid']}\t{p['uid']}\n")
         self.f(d + "/oom_score_adj", f"{p['adj']}\n")
+        self.f(d + "/cmdline", p.get("cmd", p["comm"]) + "\0")
         cg = p.get("cg", f"/lxc.payload.waydroid{'/' + p['group'] if p['group'] else ''}")
         self.f(d + "/cgroup", f"1:name=elogind:/\n0::{cg}\n")
 
@@ -391,6 +394,34 @@ def _(c):
     c(not s.requests, f"requests {[r.kind for r in s.requests]}")
     c(w.pids("") == [], f"payload holds {w.pids('')}")
     c(not [x for x in LOG if "window" in x], f"log {LOG}")
+
+
+@case("zygotes: a process is a zygote when its comm is main, zygote or zygote64, its cmdline names zygote or "
+      "zygote64 and its parent is no zygote; a fresh child of zygote64 still named main is not one")
+def _(c):
+    w, s = up()
+    w.proc(pid=210, comm="main", cmd="zygote", ppid=1, nice=-20, uid=0, adj=-1000, group="fg")
+    w.proc(pid=420, comm="main", cmd="zygote64", ppid=200, group="fg")
+    w.proc(pid=421, comm="main", cmd="/system/bin/app_process64", ppid=1, uid=0, adj=-1000, group="fg")
+    w.proc(pid=422, comm="zygote64", cmd="zygote64", ppid=1, uid=0, adj=-1000, group="fg")
+    run_for(s, 1.6)
+    z = s.zygotes()
+    c(z == {200, 210, 422}, f"zygotes {sorted(z)}")
+
+
+@case("report: once a minute the journal gets the windows started and the pids moved per group since the last report")
+def _(c):
+    w, s = up()
+    run_for(s, m.REPORT_EVERY + 2)
+    LOG.clear()
+    newpid(w, 404, 0.5)
+    c(run_until(s, lambda: req(s, "launch") is not None), "no launch window")
+    run_for(s, m.REPORT_EVERY + 2)
+    lines = [x for x in LOG if x.startswith("last ")]
+    c(len(lines) == 1 and lines[0].endswith(": launch 1 to_top 1"), f"report {lines}")
+    LOG.clear()
+    run_for(s, m.REPORT_EVERY + 2)
+    c(not [x for x in LOG if x.startswith("last ")], f"quiet minute {LOG}")
 
 
 @case("classify: a renderer, an app zygote child or a pid whose parent is no zygote joins top with no window; an old "
@@ -996,7 +1027,7 @@ def _(c):
     for g, cpus in (("top", "0-7"), ("fg", "0-7"), ("bg", "0-3")):
         w.f(f"{PAY}/{g}/cpuset.cpus", cpus + "\n")
     w.f(PAY + "/cgroup.subtree_control", "cpuset cpu\n")
-    w.proc(pid=200, comm="zygote64", ppid=1, nice=-20, uid=0, adj=-1000, group="fg")
+    w.proc(pid=200, comm="main", cmd="zygote64", ppid=1, nice=-20, uid=0, adj=-1000, group="fg")
     bindir = w.r + "/bin"
     os.makedirs(bindir)
     with open(bindir + "/lxc-info", "w") as fh:
@@ -1197,7 +1228,7 @@ def _(c):
     for g in ("top", "fg", "bg"):
         w.mkdir(w.r + PAY + "/" + g)
     w.f(PAY + "/cgroup.subtree_control", "cpuset cpu\n")
-    w.proc(pid=200, comm="zygote64", ppid=1, nice=-20, uid=0, adj=-1000, group="fg")
+    w.proc(pid=200, comm="main", cmd="zygote64", ppid=1, nice=-20, uid=0, adj=-1000, group="fg")
     w.proc(pid=300, comm="launcher", nice=-10, uid=10050, adj=0, group="top")
     w.proc(pid=305, comm="cached", nice=0, uid=10070, adj=905, group="bg")
     w.proc(pid=306, comm="other", nice=0, uid=10071, adj=905, group="bg")
