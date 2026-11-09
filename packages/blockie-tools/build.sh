@@ -9,7 +9,7 @@ top=$(mktemp -d)
 chmod 755 "$top"
 trap 'rm -rf "${top:?}"' EXIT
 mkdir -p "$top/SOURCES"
-tar -C "$src" --sort=name --mtime="@$SOURCE_DATE_EPOCH" --owner=0 --group=0 --numeric-owner -cf - files tests |
+tar -C "$src" --sort=name --mtime="@$SOURCE_DATE_EPOCH" --owner=0 --group=0 --numeric-owner -cf - files src tests |
   gzip -n > "$top/SOURCES/blockie-tools-src.tar.gz"
 rpmbuild -bb \
   --define "_topdir $top" \

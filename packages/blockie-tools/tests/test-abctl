@@ -1,0 +1,590 @@
+#!/usr/bin/env python3
+import argparse
+import atexit
+import mmap
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import zlib
+
+fails = []
+
+
+def check(ok, what):
+    print(("ok   " if ok else "FAIL ") + what)
+    if not ok:
+        fails.append(what)
+
+
+def abctl(*args, root=False):
+    r = subprocess.run((["sudo", "-n"] if root else []) + [ABCTL] + list(args), capture_output=True, text=True)
+    return r.returncode, r.stdout, r.stderr
+
+
+def sudo(*args, data=None):
+    return subprocess.run(["sudo", "-n"] + list(args), input=data, capture_output=True, check=True).stdout
+
+
+def fix_crc(bc):
+    bc[28:32] = zlib.crc32(bytes(bc[:28])).to_bytes(4, "little")
+    return bytes(bc)
+
+
+def slots(out):
+    return [line for line in out.splitlines() if line.startswith(("slot ", "suffix ", "message "))]
+
+
+def slot(name, prio, tries, succ):
+    state = "bootable" if prio > 0 and (tries > 0 or succ) else "unbootable"
+    return f"slot {name} priority {prio} tries {tries} successful {succ} verity_corrupted 0 {state}"
+
+
+def bc_of(suffix, a, b):
+    bc = bytearray(32)
+    bc[0:2] = suffix.encode()
+    bc[4:8] = b"BCAB"
+    bc[8] = 1
+    bc[9] = 2
+    for i, (prio, tries, succ) in enumerate((a, b)):
+        bc[12 + 2 * i] = prio | tries << 4 | succ << 7
+    return fix_crc(bc)
+
+
+def bcb(command=b"", status=b"", recovery=b""):
+    s = bytearray(512)
+    s[0:len(command)] = command
+    s[32:32 + len(status)] = status
+    s[64:64 + len(recovery)] = recovery
+    return bytes(s)
+
+
+def synthetic(d):
+    files = {"bc-orig.bin": bc_of("_a", (14, 1, 1), (15, 1, 1)), "bc-test.bin": bc_of("_a", (15, 1, 0), (14, 1, 1)),
+             "bc-after.bin": bc_of("_b", (0, 0, 0), (15, 1, 1))}
+    misc = bytearray((i * 7 + 3) & 0xff for i in range(8192))
+    misc[:512] = bcb(b"bootonce-bootloader")
+    misc[0x800:0x820] = files["bc-after.bin"]
+    files["misc.bin"] = bytes(misc)
+    for n, b in files.items():
+        with open(os.path.join(d, n), "wb") as f:
+            f.write(b)
+    return d, os.path.join(d, "misc.bin")
+
+
+def odirect(d):
+    p = os.path.join(d, ".odirect-probe")
+    buf = mmap.mmap(-1, 4096)
+    mv = memoryview(buf)
+    try:
+        with open(p, "wb") as f:
+            f.write(bytes(4096))
+        fd = os.open(p, os.O_RDWR | os.O_DIRECT | os.O_SYNC)
+        try:
+            os.pwritev(fd, [mv[:512]], 2048)
+            os.preadv(fd, [mv], 0)
+        finally:
+            os.close(fd)
+    except OSError as e:
+        sys.exit(f"test-abctl: {d} does not take abctl's O_DIRECT 512 byte writes ({e.strerror}); give --tmp a "
+                 "directory on a filesystem that does")
+    finally:
+        mv.release()
+        buf.close()
+        if os.path.exists(p):
+            os.unlink(p)
+
+
+def main():
+    global ABCTL
+    p = argparse.ArgumentParser()
+    p.add_argument("--abctl", required=True)
+    p.add_argument("--abtest")
+    p.add_argument("--misc")
+    p.add_argument("--tmp", default=tempfile.gettempdir())
+    p.add_argument("--loop", action="store_true")
+    a = p.parse_args()
+    ABCTL = a.abctl
+    if (a.abtest is None) != (a.misc is None):
+        p.error("--abtest and --misc go together")
+    os.makedirs(a.tmp, exist_ok=True)
+    odirect(a.tmp)
+    if a.abtest is None:
+        fx = tempfile.mkdtemp(dir=a.tmp)
+        atexit.register(shutil.rmtree, fx, True)
+        a.abtest, a.misc = synthetic(fx)
+
+    want = {
+        "bc-orig.bin": ["suffix _a", slot("a", 14, 1, 1), slot("b", 15, 1, 1)],
+        "bc-test.bin": ["suffix _a", slot("a", 15, 1, 0), slot("b", 14, 1, 1)],
+        "bc-after.bin": ["suffix _b", slot("a", 0, 0, 0), slot("b", 15, 1, 1)],
+    }
+    for f, lines in want.items():
+        path = os.path.join(a.abtest, f)
+        data = open(path, "rb").read()
+        check(zlib.crc32(data[:28]) == int.from_bytes(data[28:32], "little"), f"{f}: zlib crc32 matches stored")
+        rc, out, err = abctl("-d", path, "-o", "0", "show")
+        print(out, end="")
+        check(rc == 0 and "crc32" in out and " ok" in out.split("crc32")[1].splitlines()[0], f"{f}: show exit 0, crc ok")
+        check(slots(out) == lines, f"{f}: decodes to {lines}")
+
+    os.makedirs(a.tmp, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=a.tmp) as d:
+        orig = open(a.misc, "rb").read()
+        bc_test = open(os.path.join(a.abtest, "bc-test.bin"), "rb").read()
+        m = os.path.join(d, "misc.bin")
+
+        def fresh():
+            shutil.copyfile(a.misc, m)
+
+        def cur():
+            return open(m, "rb").read()
+
+        fresh()
+        rc, out, err = abctl("-d", m, "show")
+        check(rc == 0 and slots(out) == want["bc-after.bin"] + ['message command "bootonce-bootloader"'],
+              "misc.bin: show matches bc-after.bin and bootonce-bootloader")
+        check(orig[0x800:0x820] == open(os.path.join(a.abtest, "bc-after.bin"), "rb").read(),
+              "misc.bin+0x800 equals bc-after.bin")
+
+        rc, out, err = abctl("-d", m, "arm-a")
+        print(out, end="")
+        data = cur()
+        check(rc == 0, "arm-a exit 0")
+        check(data[0x800:0x820] == bc_test, "arm-a from bc-after state writes bc-test.bin byte for byte")
+        check(data[:0x800] == orig[:0x800] and data[0x820:] == orig[0x820:], "arm-a changes nothing outside 0x800..0x81f")
+
+        rc, out, err = abctl("-d", m, "clear-msg")
+        data = cur()
+        check(rc == 0 and "message zero" in out, "clear-msg exit 0, message zero")
+        check(data[:2048] == bytes(2048), "clear-msg zeroes misc 0..2047")
+        check(data[0x800:0x820] == bc_test and data[0x820:] == orig[0x820:], "clear-msg leaves the rest")
+        rc, out, err = abctl("-d", m, "show")
+        check(rc == 0 and "message zero" in out, "show after clear-msg: message zero")
+
+        rc, out, err = abctl("-d", m, "arm-b-once")
+        check(rc == 0 and slots(out)[:3] == ["suffix _b", slot("a", 14, 1, 0), slot("b", 15, 1, 0)],
+              "arm-b-once from arm-a state: a 14/1/0 (tries and successful kept), b 15/1/0")
+        data = cur()
+        check(zlib.crc32(data[0x800:0x81c]) == int.from_bytes(data[0x81c:0x820], "little"), "arm-b-once crc valid (zlib)")
+
+        before = cur()
+        rc, out, err = abctl("-d", m, "rearm")
+        check(rc == 1 and "both slots at priority 15" in err and cur() == before,
+              "rearm refused when b is at priority 15, file unchanged")
+
+        fresh()
+        rc, out, err = abctl("-d", m, "arm-a")
+        rc, out, err = abctl("-d", m, "rearm")
+        check(rc == 0 and slots(out)[:3] == ["suffix _a", slot("a", 15, 3, 0), slot("b", 14, 1, 1)],
+              "rearm from arm-a state: a 15/3/0, b untouched 14/1/1")
+
+        fresh()
+        rc, out, err = abctl("-d", m, "arm-b-once")
+        check(rc == 1 and "slot a unbootable" in err and cur() == orig,
+              "arm-b-once refused from bc-after state (a 0/0/0 would stay unbootable), file unchanged")
+        rc, out, err = abctl("-d", m, "rearm")
+        check(rc == 1 and cur() == orig, "rearm refused from bc-after state (both at 15), file unchanged")
+
+        bad = bytearray(orig)
+        bad[0x81c] ^= 1
+        open(m, "wb").write(bad)
+        rc, out, err = abctl("-d", m, "show")
+        check(rc == 1 and "bad" in out.split("crc32")[1].splitlines()[0], "show on bad crc: exit 1, crc bad")
+        rc, out, err = abctl("-d", m, "arm-a")
+        check(rc == 1 and cur() == bytes(bad), "arm-a refused on bad crc, file unchanged")
+        rc, out, err = abctl("-d", m, "clear-msg")
+        check(rc == 0 and cur()[:2048] == bytes(2048) and cur()[2048:] == bytes(bad)[2048:],
+              "clear-msg works on bad crc and keeps the control block as read")
+
+        rc, out, err = abctl("-d", m, "-o", "0", "arm-a")
+        check(rc == 2, "-o with a write command is a usage error")
+        rc, out, err = abctl("-d", m, "frob")
+        check(rc == 2, "unknown command is a usage error")
+        rc, out, err = abctl("-d", os.path.join(d, "absent"), "show")
+        check(rc == 1, "missing device: exit 1")
+        short = os.path.join(d, "short.bin")
+        open(short, "wb").write(bc_test)
+        rc, out, err = abctl("-d", short, "arm-a")
+        check(rc == 1 and open(short, "rb").read() == bc_test and "got 32 of 4096 bytes" in err,
+              "write on a 32 byte file refused: " + err.strip())
+
+        def put(bc):
+            open(m, "wb").write(orig[:0x800] + bc + orig[0x820:])
+
+        rich = bytearray(bc_test)
+        rich[9] = 2 | 3 << 3 | 1 << 6
+        rich[10] = 1
+        rich[11] = 0x5a
+        rich[13] = 0xfe
+        rich[15] = 0xff
+        rich[16:20] = b"\x11\x22\x33\x44"
+        rich[20:28] = b"\x77" * 8
+        rich = fix_crc(rich)
+        put(rich)
+        rc, out, err = abctl("-d", m, "show")
+        check(rc == 0 and "recovery_tries 3" in out and "merge_status 5" in out and
+              "slot b priority 14 tries 1 successful 1 verity_corrupted 1" in out,
+              "show decodes recovery tries 3, merge_status 5 across bytes 9 and 10, slot b verity_corrupted 1")
+        rc, out, err = abctl("-d", m, "arm-a")
+        r = cur()[0x800:0x820]
+        check(rc == 0 and r[9] == rich[9] and r[10] == rich[10] and r[16:20] == rich[16:20],
+              "arm-a keeps nb_slot, recovery tries, merge_status and slot_info 2 and 3")
+        check(r[13] == 0 and r[15] == 1, "arm-a keeps verity_corrupted (a 0, b 1) and zeroes the slot reserved bits")
+        check(r[11] == 0 and r[20:28] == bytes(8), "arm-a zeroes reserved0 and reserved1")
+        check(zlib.crc32(r[:28]) == int.from_bytes(r[28:], "little") and cur()[:0x800] == orig[:0x800],
+              "arm-a result crc valid, message untouched")
+
+        for what, off, val in (("magic", 4, 0x43), ("version", 8, 2), ("nb_slot", 9, 3)):
+            bc = bytearray(bc_test)
+            bc[off] = val
+            bc = fix_crc(bc)
+            put(bc)
+            rc, out, err = abctl("-d", m, "show")
+            check(rc == 1, f"show exit 1 on bad {what}")
+            rc, out, err = abctl("-d", m, "arm-a")
+            check(rc == 1 and "no valid bootloader_control" in err and cur()[0x800:0x820] == bc,
+                  f"arm-a refused on bad {what}, file unchanged")
+        bc = bytearray(bc_test)
+        bc[4] = 0x43
+        bc = fix_crc(bc)
+        put(bc)
+        rc, out, err = abctl("-d", m, "clear-msg")
+        check(rc == 1 and "magic" in err and cur()[:0x800] == orig[:0x800], "clear-msg refused without BCAB magic")
+
+        fresh()
+        abctl("-d", m, "arm-a")
+        armed = os.path.join(d, "armed.bin")
+        shutil.copyfile(m, armed)
+        fresh()
+        rc, out, err = abctl("-d", m, "restore", armed)
+        check(rc == 0 and cur()[:4096] == open(armed, "rb").read()[:4096] and cur()[4096:] == orig[4096:],
+              "restore of an armed file (both bootable) writes misc 0 to 4095 only")
+        rc, out, err = abctl("-d", m, "restore", a.misc)
+        check(rc == 1 and "slot a unbootable" in err and cur()[:4096] == open(armed, "rb").read()[:4096],
+              "restore refused when it would change the control block to a 0/0/0")
+        fresh()
+        abctl("-d", m, "clear-msg")
+        rc, out, err = abctl("-d", m, "restore", a.misc)
+        check(rc == 0 and cur() == orig and 'message command "bootonce-bootloader"' in out,
+              "P0.11 rollback: restore of the backup misc.bin after clear-msg (control block unchanged)")
+        bad = bytearray(open(armed, "rb").read())
+        bad[0x81c] ^= 1
+        badfile = os.path.join(d, "badcrc.bin")
+        open(badfile, "wb").write(bad)
+        rc, out, err = abctl("-d", m, "restore", badfile)
+        check(rc == 1 and "in the file" in err and cur() == orig, "restore refused for a file with a bad crc")
+        rc, out, err = abctl("-d", m, "restore", short)
+        check(rc == 1 and "got 32 of 4096 bytes" in err and cur() == orig, "restore refused for a 32 byte file")
+        eq = bytearray(bc_test)
+        eq[14] = 0x9f
+        eqfile = os.path.join(d, "equal.bin")
+        open(eqfile, "wb").write(orig[:0x800] + fix_crc(eq) + orig[0x820:])
+        rc, out, err = abctl("-d", m, "restore", eqfile)
+        check(rc == 1 and "both slots at priority 15" in err and cur() == orig, "restore refused for equal priorities")
+        rc, out, err = abctl("-d", m, "restore", os.path.join(d, "absent"))
+        check(rc == 1 and cur() == orig, "restore of a missing file: exit 1")
+        rc, out, err = abctl("-d", m, "restore")
+        check(rc == 2, "restore without a file is a usage error")
+        rc, out, err = abctl("-d", m, "arm-a", armed)
+        check(rc == 2 and cur() == orig, "arm-a with an extra argument is a usage error")
+
+        trace = os.path.join(d, "trace")
+        subprocess.run(["strace", "-f", "-qq", "-e", "trace=open,openat,openat2", "-o", trace, ABCTL, "-d", m, "show"],
+                       capture_output=True)
+        check(f'"{m}"' in open(trace).read(), "strace control: the open of a misc file shows in the trace")
+        for args in (["-d", "/dev/null", "clear-msg"], ["-d", "/dev/null", "arm-a"], ["-d", "/dev/null", "show"],
+                     ["-d", m, "restore", "/dev/null"]):
+            r = subprocess.run(["strace", "-f", "-qq", "-e", "trace=open,openat,openat2", "-o", trace, ABCTL] + args,
+                               capture_output=True, text=True)
+            opened = [line for line in open(trace).read().splitlines() if '"/dev/null"' in line]
+            check(r.returncode == 1 and "not opened" in r.stderr and not opened and cur() == orig,
+                  "char device refused before any open: abctl " + " ".join(args))
+
+        D = bc_of("_a", (15, 3, 0), (13, 1, 1))
+        D2 = bc_of("_a", (15, 2, 0), (13, 1, 1))
+        D0 = bc_of("_a", (15, 0, 0), (13, 1, 1))
+        F = bc_of("_b", (0, 0, 0), (15, 1, 1))
+        H = bc_of("_b", (14, 3, 0), (15, 1, 1))
+        T = bc_of("_a", (15, 1, 0), (14, 1, 1))
+        RESET = bc_of("_a", (15, 7, 0), (15, 7, 0))
+        TORN = D[:16] + F[16:]
+        check(F == open(os.path.join(a.abtest, "bc-after.bin"), "rb").read(), "bc_of builds bc-after.bin byte for byte")
+
+        def slot_cmd(cmd, before, after, what):
+            put(before)
+            rc, out, err = abctl("-d", m, cmd)
+            data = cur()
+            check(rc == 0 and data[0x800:0x820] == after and data[:0x800] == orig[:0x800] and
+                  data[0x820:] == orig[0x820:], what + (": " + err.strip() if rc else ""))
+
+        def refused(cmd, before, why, what):
+            put(before)
+            rc, out, err = abctl("-d", m, cmd)
+            check(rc == 1 and why in err and cur() == orig[:0x800] + before + orig[0x820:], what + ": " + err.strip())
+
+        slot_cmd("default-a", F, D, "default-a from a 0/0/0, b 15/1/1: a 15/3/0, b 13/1/1, suffix _a, misc+0 kept")
+        slot_cmd("default-a", RESET, D, "default-a from the preloader default (both 15/7/0)")
+        slot_cmd("default-a", H, D, "default-a from hold-b's state")
+        slot_cmd("hold-b", D, H, "hold-b from D: a 14/3/0, b 15/1/1, suffix _b")
+        slot_cmd("hold-b", D2, bc_of("_b", (14, 2, 0), (15, 1, 1)), "hold-b keeps a's tries")
+        refused("hold-b", F, "slot a unbootable", "hold-b refused on a 0/0/0, b 15/1/1")
+        refused("hold-b", D0, "slot a unbootable", "hold-b refused while a reads tries 0")
+        slot_cmd("arm-b-once", D, bc_of("_b", (14, 3, 0), (15, 1, 0)), "arm-b-once from D: a 14/3/0, b 15/1/0")
+        refused("arm-b-once", bc_of("_a", (15, 0, 1), (13, 1, 1)), "not bootable with tries left",
+                "arm-b-once refused while a reads tries 0 (a successful)")
+        for cmd in ("hold-b", "arm-b-once"):
+            refused(cmd, bc_of("_a", (0, 2, 0), (13, 1, 1)), "not bootable with tries left",
+                    f"{cmd} refused on a 0/2/0 (a unbootable as read, the result would raise it to 14)")
+        slot_cmd("fix-b", bc_of("_a", (15, 0, 0), (0, 0, 0)), bc_of("_a", (15, 0, 0), (13, 1, 1)),
+                 "fix-b on a 15/0/0, b 0/0/0: b 13/1/1, a and suffix as read")
+        slot_cmd("fix-b", bc_of("_b", (0, 0, 0), (0, 0, 0)), bc_of("_b", (0, 0, 0), (13, 1, 1)),
+                 "fix-b with no bootable slot: b 13/1/1")
+        x = bytearray(bc_of("_a", (15, 0, 0), (0, 0, 0)))
+        y = bytearray(bc_of("_a", (15, 0, 0), (13, 1, 1)))
+        x[13] = y[13] = 0xfe
+        slot_cmd("fix-b", fix_crc(x), fix_crc(y), "fix-b leaves slot a's two bytes as read (reserved bits 0xfe)")
+        refused("fix-b", D2, "slot b reads bootable", "fix-b refused on a 15/2/0, b 13/1/1")
+        refused("fix-b", bc_of("_b", (14, 3, 0), (15, 1, 0)), "slot b reads bootable",
+                "fix-b refused on arm-b-once's b 15/1/0")
+        refused("fix-b", bc_of("_a", (13, 1, 0), (0, 0, 0)), "both slots at priority 13",
+                "fix-b refused when a reads priority 13")
+        slot_cmd("refund-a", D2, bc_of("_a", (15, 3, 0), (12, 1, 1)), "refund-a on a 15/2/0, b 13: a 15/3/0, b 12/1/1")
+        slot_cmd("refund-a", D0, bc_of("_a", (15, 1, 0), (12, 1, 1)), "refund-a on a's last try: a 15/1/0, b 12")
+        slot_cmd("refund-a", D, bc_of("_a", (15, 3, 0), (12, 1, 1)), "refund-a keeps a's tries at 3")
+        slot_cmd("refund-a", bc_of("_b", (15, 2, 0), (13, 1, 1)), bc_of("_b", (15, 3, 0), (12, 1, 1)),
+                 "refund-a keeps the suffix")
+        refused("refund-a", bc_of("_a", (15, 2, 0), (12, 1, 1)), "refund-a refused", "refund-a refused on b 12")
+        refused("refund-a", T, "refund-a refused", "refund-a refused on a test arm (b 14)")
+        refused("refund-a", H, "refund-a refused", "refund-a refused in hold-b's state (a 14)")
+        refused("refund-a", bc_of("_a", (15, 2, 1), (13, 1, 1)), "refund-a refused",
+                "refund-a refused on a 15/2/1 (a successful), b 13")
+        slot_cmd("test-b", D, bc_of("_b", (14, 3, 0), (15, 1, 0)),
+                 "test-b from a 15/3/0: a 14/3/0, b 15/1/0, suffix _b")
+        refused("test-b", T, "not 15/3/0", "test-b refused on a 15/1/0")
+        refused("test-b", D2, "not 15/3/0", "test-b refused on a 15/2/0")
+        refused("test-b", bc_of("_a", (15, 3, 1), (13, 1, 1)), "not 15/3/0", "test-b refused on a 15/3/1")
+        refused("test-b", H, "not 15/3/0", "test-b refused on a 14/3/0")
+
+        for bc, cls, what in ((D, "ours", "D"), (H, "ours", "H"), (F, "ours", "a 0/0/0, b 15/1/1"),
+                              (RESET, "reset", "equal priorities"), (bc_of("_a", (15, 7, 0), (13, 1, 1)), "reset",
+                              "a tries 7"), (TORN, "invalid", "torn sector")):
+            put(bc)
+            rc, out, err = abctl("-d", m, "show")
+            check(f"class {cls}" in out.splitlines(), f"show prints class {cls} for {what}")
+        for cmd in ("default-a", "hold-b", "fix-b", "refund-a", "test-b", "arm-a", "arm-b-once", "rearm"):
+            refused(cmd, TORN, "no valid bootloader_control", f"{cmd} refused on a torn sector")
+
+        def traced(args):
+            r = subprocess.run(["strace", "-qq", "-e", "trace=openat,pwrite64", "-o", trace, ABCTL] + args,
+                               capture_output=True, text=True)
+            lines = open(trace).read().splitlines()
+            opens = [line for line in lines if line.startswith("openat(") and f'"{m}"' in line]
+            pw = [re.search(r", (\d+), (\d+)\) = (-?\d+)$", line).groups() for line in lines
+                  if line.startswith("pwrite64(")]
+            return r.returncode, opens, pw
+
+        for args, before, size, off in ((["default-a"], F, 512, 2048), (["hold-b"], D, 512, 2048),
+                                        (["fix-b"], bc_of("_a", (15, 0, 0), (0, 0, 0)), 512, 2048),
+                                        (["refund-a"], D2, 512, 2048), (["test-b"], D, 512, 2048),
+                                        (["arm-a"], F, 512, 2048), (["arm-b-once"], D, 512, 2048),
+                                        (["rearm"], T, 512, 2048), (["bcb-recovery", "menu"], D, 512, 0),
+                                        (["bcb-attempt"], D, 512, 0), (["bcb-input"], D, 512, 0),
+                                        (["bcb-clear"], D, 512, 0), (["clear-msg"], D, 2048, 0)):
+            put(before)
+            rc, opens, pw = traced(["-d", m] + args)
+            check(rc == 0 and pw == [(str(size), str(off), str(size))] and len(opens) == 1 and
+                  "O_DIRECT" in opens[0] and "O_SYNC" in opens[0],
+                  f"abctl {' '.join(args)}: one O_DIRECT|O_SYNC open, one {size} byte write at {off}: {pw}")
+
+        def put_msg(sec, bc=D):
+            open(m, "wb").write(sec + orig[512:0x800] + bc + orig[0x820:])
+
+        def msg_is(sec, what, bc=D):
+            check(cur() == sec + orig[512:0x800] + bc + orig[0x820:], what)
+
+        ours = b"recovery\n--blockie=menu"
+        put(D)
+        rc, out, err = abctl("-d", m, "bcb-recovery", "menu")
+        check(rc == 0 and 'message command "boot-recovery"' in out, "bcb-recovery menu exit 0")
+        msg_is(bcb(b"boot-recovery", b"", ours), "bcb-recovery menu: sector 0 command, empty status, recovery args; "
+                                                 "the rest of misc as before")
+        for n in (1, 2, 3):
+            rc, out, err = abctl("-d", m, "bcb-attempt")
+            check(rc == 0 and out == f"{n}\n", f"bcb-attempt {n} on our command prints {n}")
+            msg_is(bcb(b"boot-recovery", f"blockie-attempt={n}".encode(), ours),
+                   f"bcb-attempt {n}: status blockie-attempt={n}, command and recovery kept")
+        rc, out, err = abctl("-d", m, "bcb-attempt")
+        check(rc == 0 and out == "3\n" and "counted as the bound" in err, "bcb-attempt on blockie-attempt=3 prints 3")
+        wipe = b"recovery\n--wipe_data\n"
+        put_msg(bcb(b"boot-recovery", b"", wipe))
+        for n in (1, 2, 3):
+            rc, out, err = abctl("-d", m, "bcb-attempt")
+            check(rc == 0 and out == f"{n}\n", f"bcb-attempt {n} on Android's --wipe_data prints {n}")
+            msg_is(bcb(b"boot-recovery", f"blockie-attempt={n}".encode(), wipe),
+                   f"bcb-attempt {n} on --wipe_data: command and recovery kept")
+        for status, what in ((b"blockie-attem\xff\x13", "torn"), (b"blockie-attempt=1\x00\x00x", "torn tail"),
+                             (b"OKAY", "foreign"), (b"blockie-attempt=0", "foreign =0"),
+                             (b"blockie-attempt=12", "foreign =12")):
+            put_msg(bcb(b"boot-recovery", status, ours))
+            rc, out, err = abctl("-d", m, "bcb-attempt")
+            check(rc == 0 and out == "3\n" and "counted as the bound" in err,
+                  f"bcb-attempt on a {what} status prints 3")
+            msg_is(bcb(b"boot-recovery", b"blockie-attempt=3", ours), f"bcb-attempt on a {what} status writes =3")
+        put_msg(bcb(b"boot-recovery", b"", ours))
+        rc, out, err = abctl("-d", m, "show")
+        check(rc == 0 and out.splitlines()[-2:] == ['message command "boot-recovery"', "message reason menu"],
+              "show of our menu command: the command line, then 'message reason menu'")
+        for sec, why, what in ((bcb(b"boot-recovery", b"blockie-attempt=2", ours), "menu", "our command with a count"),
+                               (bcb(b"boot-recovery", b"", b"recovery\n--blockie=" + b"x" * 32), "x" * 32,
+                                "a 32 character reason"),
+                               (bcb(b"boot-recovery", b"", wipe), None, "Android's --wipe_data"),
+                               (bcb(b"boot-recovery", b"", b"recovery\n--blockie=menu\n"), None, "a reason and a newline"),
+                               (bcb(b"boot-recovery", b"", b"recovery\n--blockie="), None, "an empty reason"),
+                               (bcb(b"boot-recovery", b"", b"recovery\n--blockie=" + b"x" * 33), None,
+                                "a 33 character reason"),
+                               (bcb(b"boot-recovery", b"", b"recovery\n--blockie=Menu"), None, "an upper case reason"),
+                               (bcb(b"boot-recoveryx", b"", ours), None, "another command"),
+                               (bcb(b"bootonce-bootloader", b"", ours), None, "bootonce-bootloader with our arguments")):
+            put_msg(sec)
+            rc, out, err = abctl("-d", m, "show")
+            r = [x for x in out.splitlines() if x.startswith("message reason ")]
+            check(rc == 0 and r == ([f"message reason {why}"] if why else []), f"show on {what}: reason lines {r}")
+        for sec, what in ((bytes(512), "zero sector 0"),
+                          (bcb(b"", b"blockie-attempt=2", ours), "no command, status 2")):
+            put_msg(sec)
+            rc, out, err = abctl("-d", m, "bcb-attempt")
+            check(rc == 3 and out == "empty\n", f"bcb-attempt on {what}: exit 3, empty")
+            msg_is(sec, f"bcb-attempt on {what}: nothing written")
+        put_msg(bcb(b"boot-recovery", b"blockie-attempt=2", ours))
+        rc, out, err = abctl("-d", m, "bcb-clear")
+        check(rc == 0, "bcb-clear exit 0")
+        msg_is(bytes(512), "bcb-clear zeroes sector 0 only")
+        put_msg(bcb(b"boot-recovery", b"", ours), TORN)
+        rc, out, err = abctl("-d", m, "bcb-clear")
+        check(rc == 0, "bcb-clear works on a torn slot sector with the magic intact")
+        msg_is(bytes(512), "bcb-clear on a torn slot sector keeps it as read", TORN)
+        nomagic = bytearray(D)
+        nomagic[4] = 0x43
+        nomagic = fix_crc(nomagic)
+        for args in (["bcb-recovery", "menu"], ["bcb-attempt"], ["bcb-clear"]):
+            put_msg(bcb(b"boot-recovery", b"", ours), nomagic)
+            rc, out, err = abctl("-d", m, *args)
+            check(rc == 1 and "magic" in err, f"{' '.join(args)} refused without BCAB at 0x804")
+            msg_is(bcb(b"boot-recovery", b"", ours), f"{' '.join(args)} without magic: file unchanged", nomagic)
+        put_msg(bcb(b"boot-recovery", b"blockie-attempt=2", ours))
+        rc, out, err = abctl("-d", m, "bcb-input")
+        check(rc == 0, "bcb-input exit 0")
+        msg_is(bcb(b"boot-recovery", b"", ours), "bcb-input empties the status, keeps command and recovery")
+        rc, out, err = abctl("-d", m, "bcb-attempt")
+        check(rc == 0 and out == "1\n", "bcb-attempt after bcb-input prints 1")
+        put_msg(bcb(b"boot-recovery", b"blockie-attem\xff", wipe))
+        rc, out, err = abctl("-d", m, "bcb-input")
+        msg_is(bcb(b"boot-recovery", b"", wipe), "bcb-input on --wipe_data with a torn status: status empty, rest kept")
+        sec = bcb(b"", b"blockie-attempt=2", ours)
+        put_msg(sec)
+        rc, out, err = abctl("-d", m, "bcb-input")
+        check(rc == 3 and out == "empty\n", "bcb-input with no command: exit 3, empty")
+        msg_is(sec, "bcb-input with no command: nothing written")
+        put_msg(bcb(b"boot-recovery", b"blockie-attempt=1", ours), nomagic)
+        rc, out, err = abctl("-d", m, "bcb-input")
+        check(rc == 1 and "magic" in err, "bcb-input refused without BCAB at 0x804")
+        msg_is(bcb(b"boot-recovery", b"blockie-attempt=1", ours), "bcb-input without magic: file unchanged", nomagic)
+
+        put(F)
+        rc, opens, pw = traced(["-d", m, "hold-b"])
+        check(rc == 1 and pw == [], f"hold-b refused on F: no pwrite64: {pw}")
+        put_msg(bytes(512))
+        rc, opens, pw = traced(["-d", m, "bcb-attempt"])
+        check(rc == 3 and pw == [], f"bcb-attempt empty: no pwrite64: {pw}")
+
+        def injected(spec, args):
+            r = subprocess.run(["strace", "-qq", "-o", trace, "-e", "inject=" + spec, ABCTL, "-d", m] + args,
+                               capture_output=True, text=True)
+            return r.returncode, r.stdout, r.stderr
+
+        for spec, args, why, changed in (("pwrite64:error=EIO", ["default-a"], "Input/output error", False),
+                                         ("pwrite64:retval=100", ["default-a"], "got 100 of 512 bytes", False),
+                                         ("pwrite64:retval=512", ["default-a"], "read back differs", False),
+                                         ("fsync:error=EIO", ["default-a"], "fsync failed", True),
+                                         ("pwrite64:error=EIO", ["bcb-attempt"], "Input/output error", False)):
+            put(F)
+            rc, out, err = injected(spec, args)
+            after = orig[:0x800] + (D if changed else F) + orig[0x820:]
+            check(rc == 4 and why in err and cur() == after,
+                  f"abctl {' '.join(args)} with {spec}: exit 4 (write attempted, state unknown): {err.strip()}")
+
+        put(D)
+        rc, out, err = abctl("-d", m, "bcb-recovery", "x" * 32)
+        check(rc == 0, "bcb-recovery takes a 32 character reason")
+        msg_is(bcb(b"boot-recovery", b"", b"recovery\n--blockie=" + b"x" * 32),
+               "bcb-recovery writes a 32 character reason")
+        put(D)
+        for args in (["bcb-recovery"], ["bcb-recovery", ""], ["bcb-recovery", "Menu"], ["bcb-recovery", "a b"],
+                     ["bcb-recovery", "../x"], ["bcb-recovery", "x" * 33], ["bcb-recovery", "menu", "x"],
+                     ["bcb-attempt", "x"], ["bcb-input", "x"], ["bcb-clear", "x"], ["default-a", "x"],
+                     ["fix-b", "x"]):
+            rc, out, err = abctl("-d", m, *args)
+            check(rc == 2 and cur() == orig[:0x800] + D + orig[0x820:], f"abctl {' '.join(args)} is a usage error")
+
+        if a.loop:
+            img = os.path.join(d, "loop.img")
+            with open(img, "wb") as f:
+                f.truncate(8 << 20)
+            subprocess.run(["sfdisk", "-q", img], input="label: gpt\nsize=1MiB, name=misc\nsize=1MiB, name=boot_a\n",
+                           text=True, check=True, capture_output=True)
+            dev = sudo("losetup", "--find", "--show", "--partscan", img).decode().strip()
+            try:
+                p1, p2 = dev + "p1", dev + "p2"
+                nodes = all(os.path.exists(p) and stat.S_ISBLK(os.stat(p).st_mode) for p in (p1, p2))
+                check(nodes, f"{p1} and {p2} exist and are block devices before any dd")
+                if not nodes:
+                    sys.exit("loop partition nodes missing, nothing written")
+                for p in (p1, p2):
+                    sudo("dd", "of=" + p, "bs=4096", "conv=fsync", "status=none", data=orig)
+                rc, out, err = abctl("-d", p1, "clear-msg", root=True)
+                check(rc == 0 and "message zero" in out, f"clear-msg on {p1} (PARTNAME misc) exit 0")
+                head = sudo("dd", "if=" + p1, "bs=4096", "count=1", "status=none")
+                check(head[:2048] == bytes(2048) and head[2048:] == orig[2048:4096], f"{p1}: bytes 0 to 2047 zero")
+                rc, out, err = abctl("-d", p2, "clear-msg", root=True)
+                head = sudo("dd", "if=" + p2, "bs=4096", "count=1", "status=none")
+                check(rc == 1 and "not the misc partition" in err and head == orig[:4096],
+                      f"clear-msg refused on {p2} (PARTNAME boot_a), unchanged")
+                rc, out, err = abctl("-d", dev, "clear-msg", root=True)
+                check(rc == 1 and "not the misc partition" in err, f"clear-msg refused on the whole disk {dev}")
+                rc, out, err = abctl("-d", p1, "restore", a.misc, root=True)
+                head = sudo("dd", "if=" + p1, "bs=4096", "count=1", "status=none")
+                check(rc == 0 and head == orig[:4096], f"restore of the backup misc.bin on {p1}")
+                rc, out, err = abctl("-d", p1, "default-a", root=True)
+                head = sudo("dd", "if=" + p1, "bs=4096", "count=1", "status=none")
+                check(rc == 0 and head[0x800:0x820] == bc_of("_a", (15, 3, 0), (13, 1, 1)) and
+                      head[:0x800] == orig[:0x800] and head[0x820:] == orig[0x820:4096],
+                      f"default-a on {p1}: a 15/3/0, b 13/1/1, the rest as before")
+                rc, out, err = abctl("-d", p1, "bcb-recovery", "menu", root=True)
+                rc2, out2, err2 = abctl("-d", p1, "bcb-attempt", root=True)
+                head = sudo("dd", "if=" + p1, "bs=4096", "count=1", "status=none")
+                check(rc == 0 and rc2 == 0 and out2 == "1\n" and
+                      head[:512] == bcb(b"boot-recovery", b"blockie-attempt=1", b"recovery\n--blockie=menu") and
+                      head[512:0x800] == orig[512:0x800], f"bcb-recovery menu and bcb-attempt on {p1}")
+                rc, out, err = abctl("-d", p1, "bcb-clear", root=True)
+                rc2, out2, err2 = abctl("-d", p1, "bcb-attempt", root=True)
+                head = sudo("dd", "if=" + p1, "bs=4096", "count=1", "status=none")
+                check(rc == 0 and head[:512] == bytes(512) and head[512:0x800] == orig[512:0x800] and rc2 == 3 and
+                      out2 == "empty\n", f"bcb-clear on {p1}, then bcb-attempt exits 3 (empty)")
+                rc, out, err = abctl("-d", p2, "bcb-clear", root=True)
+                check(rc == 1 and "not the misc partition" in err, f"bcb-clear refused on {p2}")
+                rc, out, err = abctl("-d", p2, "arm-a", root=True)
+                check(rc == 1 and "not the misc partition" in err, f"arm-a refused on {p2}")
+            finally:
+                sudo("losetup", "-d", dev)
+
+    if fails:
+        sys.exit(f"{len(fails)} failed")
+    print("all passed")
+
+
+if __name__ == "__main__":
+    main()
