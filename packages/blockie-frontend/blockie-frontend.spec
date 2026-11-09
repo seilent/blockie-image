@@ -1,14 +1,14 @@
 %global debug_package %{nil}
 %global _build_id_links none
-%global commit 01ca1aa4e75db1730779f0cdd1f0dc1dd7227aa5
-%global shortcommit 01ca1aa
+%global commit 97919c1ff1c45030a7297fdfdcce0b1c582ebae8
+%global shortcommit 97919c1
 %global qrdir qrcodegen-720f62bd
 
 Name:           blockie-frontend
 Version:        0
 Release:        1.git%{shortcommit}%{?dist}
 Summary:        Blockie frontend, the Wayland launcher built on funeOS's UI layers
-License:        GPL-3.0-or-later AND BSD-2-Clause AND Zlib AND MIT AND LGPL-2.1-or-later AND MIT-Modern-Variant AND blessing AND OFL-1.1
+License:        GPL-3.0-or-later AND BSD-2-Clause AND Zlib AND MIT AND LGPL-2.1-or-later AND MIT-Modern-Variant AND blessing AND OFL-1.1 AND HPND-sell-variant
 URL:            https://github.com/seilent/blockie-frontend
 Source0:        https://github.com/seilent/blockie-frontend/archive/%{commit}.tar.gz#/blockie-frontend-%{commit}.tar.gz
 Source1:        https://raw.githubusercontent.com/nothings/stb/6e9f34d5429cf16790ec43c9bac3f1ee4ad1f760/stb_truetype.h
@@ -22,6 +22,7 @@ Source8:        https://gitlab.freedesktop.org/wayland/wayland-protocols/-/raw/1
 Source9:        https://www.sqlite.org/2026/sqlite-amalgamation-3540100.zip
 Source10:       https://github.com/microsoft/Selawik/releases/download/1.01/Selawik_Release.zip
 Source11:       https://raw.githubusercontent.com/microsoft/Selawik/b65ff9ce7c4673e75ec5c622924a6b6f61f2f876/LICENSE.txt#/Selawik-LICENSE.txt
+Source12:       https://gitlab.freedesktop.org/wlroots/wlr-protocols/-/raw/1106a4a1c57562ddd438c547da4c0d6dc150d624/unstable/wlr-layer-shell-unstable-v1.xml#/wlr-layer-shell-1106a4a1.xml
 BuildRequires:  gcc
 BuildRequires:  gcc-c++
 BuildRequires:  wayland-devel
@@ -47,12 +48,13 @@ cp %{SOURCE4} %{SOURCE5} "$cache/src/%{qrdir}/"
 cp %{SOURCE6} "$cache/fribidi-1.0.16.tar.xz"
 cp %{SOURCE7} "$cache/harfbuzz-14.3.0.tar.xz"
 cp %{SOURCE8} "$cache/xdg-shell-1.41.xml"
+cp %{SOURCE12} "$cache/wlr-layer-shell-1106a4a1.xml"
 cp %{SOURCE9} "$cache/sqlite-amalgamation-3540100.zip"
 cp %{SOURCE10} "$cache/Selawik_Release.zip"
 
 %build
 BLOCKIE_FE_CACHE=$PWD/.fe-cache BLOCKIE_FE_OUT=$PWD/.fe-out BLOCKIE_FE_JOBS=%{_smp_build_ncpus} CC=gcc CXX=g++ \
-  BLOCKIE_FE_CFLAGS="%{build_cflags}" BLOCKIE_FE_LDFLAGS="%{build_ldflags}" ./build.sh app
+  BLOCKIE_FE_CFLAGS="%{build_cflags}" BLOCKIE_FE_LDFLAGS="%{build_ldflags}" BLOCKIE_FE_COMMIT=%{shortcommit} ./build.sh app
 mkdir -p third-party
 cp .fe-cache/src/libspng-0.7.4/LICENSE third-party/libspng-LICENSE
 cp .fe-cache/src/zlib-1.3.1/LICENSE third-party/zlib-LICENSE
@@ -61,6 +63,8 @@ cp .fe-cache/src/harfbuzz-14.3.0/COPYING third-party/harfbuzz-COPYING
 cp .fe-cache/src/%{qrdir}/qrcodegen.h third-party/qrcodegen.h
 cp .fe-cache/inc/stb_truetype.h third-party/stb_truetype.h
 sed -n '1,/^\*\*\*\*/p' .fe-cache/src/sqlite-amalgamation-3540100/sqlite3.h > third-party/sqlite-NOTICE
+sed -n '/<copyright>/,/<\/copyright>/p' .fe-cache/xdg-shell-1.41.xml > third-party/xdg-shell-NOTICE
+sed -n '/<copyright>/,/<\/copyright>/p' .fe-cache/wlr-layer-shell-1106a4a1.xml > third-party/wlr-layer-shell-NOTICE
 cp %{SOURCE11} third-party/Selawik-LICENSE.txt
 
 %install
@@ -68,7 +72,7 @@ BLOCKIE_FE_CACHE=$PWD/.fe-cache BLOCKIE_FE_OUT=$PWD/.fe-out ./build.sh install D
 
 %check
 BLOCKIE_FE_CACHE=$PWD/.fe-cache BLOCKIE_FE_OUT=$PWD/.fe-out BLOCKIE_FE_JOBS=%{_smp_build_ncpus} CC=gcc CXX=g++ \
-  BLOCKIE_FE_CFLAGS="%{build_cflags}" BLOCKIE_FE_LDFLAGS="%{build_ldflags}" ./build.sh test
+  BLOCKIE_FE_CFLAGS="%{build_cflags}" BLOCKIE_FE_LDFLAGS="%{build_ldflags}" BLOCKIE_FE_COMMIT=%{shortcommit} ./build.sh test
 
 %files
 %license LICENSE third-party/*

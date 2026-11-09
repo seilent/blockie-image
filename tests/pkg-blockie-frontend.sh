@@ -12,7 +12,7 @@ lic=/usr/share/licenses/blockie-frontend
 fonts=/usr/share/blockie/fonts
 want=$(printf '%s\n' /usr/libexec/blockie/blockie-frontend /usr/lib/systemd/user/blockie-frontend.service "$fonts" \
   "$fonts/selawk.ttf" "$fonts/selawkb.ttf" "$fonts/selawkl.ttf" "$fonts/selawksl.ttf" /usr/share/blockie/schema.d/20-frontend.json "$lic/Selawik-LICENSE.txt" "$lic/sqlite-NOTICE" "$lic" "$lic/LICENSE" "$lic/fribidi-COPYING" "$lic/harfbuzz-COPYING" \
-  "$lic/libspng-LICENSE" "$lic/qrcodegen.h" "$lic/stb_truetype.h" "$lic/zlib-LICENSE" | LC_ALL=C sort)
+  "$lic/libspng-LICENSE" "$lic/qrcodegen.h" "$lic/stb_truetype.h" "$lic/zlib-LICENSE" "$lic/xdg-shell-NOTICE" "$lic/wlr-layer-shell-NOTICE" | LC_ALL=C sort)
 [[ $(rpm -qpl "${rpms[0]}" | LC_ALL=C sort) == "$want" ]] || fail "file list: $(rpm -qpl "${rpms[0]}" | tr '\n' ' ')"
 t=$(mktemp -d)
 trap 'rm -rf "${t:?}"' EXIT
@@ -45,4 +45,13 @@ got_reqs=$(awk '!/^rpmlib\(/ && !/^[^(]*\([^)]+\)\(64bit\)$/' <<< "$reqs" | LC_A
 [[ $got_reqs == "$want_reqs" ]] || fail "requires: $(tr '\n' ' ' <<< "$got_reqs")"
 grep -q 'SIL Open Font License, Version 1.1' "$t$lic/Selawik-LICENSE.txt" || fail "Selawik-LICENSE.txt is not the OFL"
 grep -q 'here is a blessing' "$t$lic/sqlite-NOTICE" || fail "sqlite-NOTICE lacks the blessing"
+grep -q 'Intel Corporation' "$t$lic/xdg-shell-NOTICE" || fail "xdg-shell-NOTICE lacks the copyright"
+grep -q '2017 Drew DeVault' "$t$lic/wlr-layer-shell-NOTICE" || fail "wlr-layer-shell-NOTICE lacks the copyright"
+[[ $(rpm -qp --qf '%{LICENSE}' "${rpms[0]}") == "GPL-3.0-or-later AND BSD-2-Clause AND Zlib AND MIT AND LGPL-2.1-or-later AND MIT-Modern-Variant AND blessing AND OFL-1.1 AND HPND-sell-variant" ]] ||
+  fail "License: $(rpm -qp --qf '%{LICENSE}' "${rpms[0]}")"
+rel=$(rpm -qp --qf '%{RELEASE}' "${rpms[0]}")
+sc=$(sed -n 's/^[0-9][0-9]*\.git\([0-9a-f]\{7\}\)\..*$/\1/p' <<< "$rel")
+[[ -n $sc ]] || fail "release $rel has no short commit"
+rodata=$(LC_ALL=C readelf -p .rodata "$bin")
+grep -qE "^ +\[ *[0-9a-f]+\]  $sc\$" <<< "$rodata" || fail "blockie-frontend does not carry its short commit $sc"
 echo "pkg-blockie-frontend: ok"
