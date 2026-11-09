@@ -10,7 +10,7 @@ slang=/var/lib/blockie/shaders
 gpuenv=/run/blockie-gpu/gpu.env
 dl1=/usr/libexec/blockie/dl1
 
-usage() { echo "usage: $me <system> <rompath> [--core <id>] [--config <file>]" >&2; exit 64; }
+usage() { echo "usage: $me <system> <rompath> [--core <id>] [--config <file>] [--theme dark|light]" >&2; exit 64; }
 refuse() { echo "$me: $*" >&2; exit 64; }
 q() { printf '%q' "$1"; }
 die() { echo "$me: $*" >&2; exit 70; }
@@ -26,8 +26,10 @@ rom=$2
 shift 2
 core=
 config=
+theme=dark
 have_core=0
 have_config=0
+have_theme=0
 while (( $# )); do
   case $1 in
     --core)
@@ -42,6 +44,12 @@ while (( $# )); do
       have_config=1
       shift 2
       ;;
+    --theme)
+      (( $# >= 2 && ! have_theme )) || usage
+      theme=$2
+      have_theme=1
+      shift 2
+      ;;
     *) usage ;;
   esac
 done
@@ -49,6 +57,7 @@ done
 [[ $system =~ ^[a-z0-9]+$ && -n ${default[$system]:-} ]] || refuse "unknown system $(q "$system")"
 (( have_core )) || core=${default[$system]}
 [[ $core =~ ^[a-z0-9_]+$ && $ids == *" $core "* ]] || refuse "unknown core $(q "$core")"
+[[ $theme == dark || $theme == light ]] || refuse "unknown theme $(q "$theme")"
 
 [[ $rom == /* && $rom != *[[:cntrl:]]* ]] || refuse "rompath $(q "$rom") is not an absolute path"
 real=$(realpath -e -- "$rom" 2> /dev/null) || refuse "rompath $(q "$rom") does not exist"
@@ -103,9 +112,22 @@ if ! flock -n 9; then
   exit 75
 fi
 state=$(systemctl --user show -P ActiveState blockie-game.scope 2> /dev/null)
+end=$((${EPOCHREALTIME//[!0-9]/} + 500000))
+while [[ $state == deactivating ]] && (( ${EPOCHREALTIME//[!0-9]/} < end )); do
+  sleep 0.05
+  state=$(systemctl --user show -P ActiveState blockie-game.scope 2> /dev/null)
+done
 case $state in
   '' | inactive) ;;
-  failed) systemctl --user reset-failed blockie-game.scope ;;
+  failed)
+    if ! systemctl --user reset-failed blockie-game.scope; then
+      state=$(systemctl --user show -P ActiveState blockie-game.scope 2> /dev/null)
+      if [[ -n $state && $state != inactive ]]; then
+        echo "$me: cannot reset blockie-game.scope" >&2
+        exit 75
+      fi
+    fi
+    ;;
   *)
     echo "$me: blockie-game.scope is $state" >&2
     exit 75
@@ -161,6 +183,7 @@ if [[ -n $shader && $enable != false ]]; then
 else
   shader=
 fi
+[[ ! -f $share/rgui/$theme.cfg ]] || lines+=("rgui_menu_theme_preset = \"$share/rgui/$theme.cfg\"")
 
 append=()
 [[ ! -f $share/core/$core.cfg ]] || append+=("$share/core/$core.cfg")

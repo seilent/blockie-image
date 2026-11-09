@@ -112,6 +112,7 @@ done < "$ra/shader-defaults"
 cmp -s <(printf '%s\n' 'gambatte_gb_colorization = "auto"' 'gambatte_gb_internal_palette = "GBC - Pastel Mix"' \
   'gambatte_gbc_color_correction = "always"' 'gambatte_mix_frames = "lcd_ghosting"') "$ra/core/gambatte.opt" || fail "core/gambatte.opt"
 cmp -s <(printf '%s\n' 'mgba_interframe_blending = "mix_smart"') "$ra/core/mgba.opt" || fail "core/mgba.opt"
+grep -qxF 'menu_show_load_content_animation = "false"' "$ra/blockie.cfg" || fail "the load content animation is not off"
 [[ -f /usr/lib/firmware/regulatory.db ]] || fail "regulatory.db missing"
 
 jq -e '. == {

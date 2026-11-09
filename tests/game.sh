@@ -51,8 +51,14 @@ EOF
 cat > "$FAKE/bin/systemctl" << 'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FAKE/systemctl.log"
-[[ "$*" != "--user show -P ActiveState blockie-game.scope" ]] || printf '%s\n' "${FAKE_STATE:-}"
+if [[ "$*" == "--user show -P ActiveState blockie-game.scope" ]]; then
+  read -ra s <<< "${FAKE_STATE:-}"
+  n=$(grep -cxF -- "$*" "$FAKE/systemctl.log")
+  (( n <= ${#s[@]} )) || n=${#s[@]}
+  (( ! n )) || printf '%s\n' "${s[n - 1]}"
+fi
 [[ "$*" != "--user is-active --quiet blockie-frontend.service" || -z ${FAKE_NOFRONTEND:-} ]] || exit 3
+[[ "$*" != "--user reset-failed blockie-game.scope" || -z ${FAKE_NORESET:-} ]] || exit 1
 exit 0
 EOF
 cat > "$FAKE/bin/retroarch" << 'EOF'
@@ -405,6 +411,41 @@ o=$(sed -n 's/^core_options_path = "\(.*\)"$/\1/p' "$FAKE/append.cfg")
 res $? "shader and core options: the shader line, then the two option lines"
 defs
 
+ok=0
+for v in dark light; do
+  play ps1 "$rom" --theme "$v"
+  [[ $rc == 0 ]] && argv "$base -L /usr/lib64/libretro/pcsx_rearmed_libretro.so $rom" || { ok=1; echo "  theme $v: rc $rc"; }
+done
+res $ok "theme: --theme dark and light start the game, no run append file without a preset"
+
+ok=0
+refused ps1 "$rom" --theme || ok=1
+refused ps1 "$rom" --theme dark --theme dark || ok=1
+for v in '' blue Dark 'dark;x' ../dark; do
+  refused ps1 "$rom" --theme "$v" || { ok=1; echo "  theme '$v': rc $rc"; }
+done
+refused ps1 "$rom" --theme blue && grep -qxF 'blockie-game: unknown theme blue' "$t/out" || { ok=1; echo "  no unknown theme line"; }
+play ps1
+[[ $rc == 64 ]] && grep -qxF 'usage: blockie-game <system> <rompath> [--core <id>] [--config <file>] [--theme dark|light]' "$t/out" ||
+  { ok=1; echo "  usage: $(cat "$t/out")"; }
+res $ok "theme: a missing, repeated or unknown --theme exits 64 before anything starts, usage lists --theme"
+
+preset() { appended "rgui_menu_theme_preset = \"$share/rgui/$1.cfg\""; }
+mkdir "$share/rgui"
+printf 'invented preset\n' > "$share/rgui/dark.cfg"
+ok=0
+play ps1 "$rom"
+[[ $rc == 0 ]] && preset dark || { ok=1; echo "  no --theme: rc $rc"; }
+play ps1 "$rom" --theme dark
+[[ $rc == 0 ]] && preset dark || { ok=1; echo "  dark: rc $rc"; }
+play ps1 "$rom" --theme light
+[[ $rc == 0 ]] && noappend || { ok=1; echo "  light without light.cfg: rc $rc"; }
+printf 'invented preset\n' > "$share/rgui/light.cfg"
+play ps1 "$rom" --theme light
+[[ $rc == 0 ]] && preset light || { ok=1; echo "  light: rc $rc"; }
+rm -rf "${share:?}/rgui"
+res $ok "theme: the run append file names rgui/<theme>.cfg only when it exists, dark without --theme"
+
 mv /usr/lib64/libretro/mgba_libretro.so "$t/mgba.so"
 play gba "$rom"
 [[ $rc == 69 ]] && ! ran
@@ -426,12 +467,31 @@ rm -f "$fifo" "$t/run/blockie-game.quit"
 kill "$holder" 2> /dev/null
 wait "$holder" 2> /dev/null
 
+queries() { grep -cxF -- '--user show -P ActiveState blockie-game.scope' "$FAKE/systemctl.log"; }
+shows() { [[ $(queries) == "$1" ]]; }
 ok=0
-for s in active activating deactivating reloading; do
+for s in active activating reloading; do
   FAKE_STATE=$s play gba "$rom"
-  [[ $rc == 75 ]] && ! ran || { ok=1; echo "  $s: rc $rc"; }
+  [[ $rc == 75 ]] && ! ran && shows 1 || { ok=1; echo "  $s: rc $rc"; }
 done
-res $ok "a scope still active, starting or stopping exits 75"
+res $ok "a scope still active, starting or reloading exits 75 at once"
+
+ok=0
+FAKE_STATE='deactivating deactivating inactive' play gba "$rom"
+[[ $rc == 0 ]] && ran && shows 3 || { ok=1; echo "  deactivating, inactive: rc $rc"; }
+FAKE_STATE='deactivating failed' play gba "$rom"
+[[ $rc == 0 ]] && ran && shows 2 && grep -qx -- '--user reset-failed blockie-game.scope' "$FAKE/systemctl.log" ||
+  { ok=1; echo "  deactivating, failed: rc $rc"; }
+FAKE_STATE='deactivating active' play gba "$rom"
+[[ $rc == 75 ]] && ! ran && shows 2 && grep -q 'blockie-game.scope is active' "$t/out" ||
+  { ok=1; echo "  deactivating, active: rc $rc"; }
+t0=$(date +%s%N)
+FAKE_STATE=deactivating play gba "$rom"
+ms=$((($(date +%s%N) - t0) / 1000000))
+n=$(queries)
+[[ $rc == 75 ]] && ! ran && (( n >= 3 && n <= 11 && ms >= 400 && ms <= 5000 )) &&
+  grep -q 'blockie-game.scope is deactivating' "$t/out" || { ok=1; echo "  deactivating: rc $rc, $n queries in $ms ms"; }
+res $ok "a stopping scope is polled every 50 ms for 500 ms: inactive or failed starts the game, active or still stopping exits 75"
 
 FAKE_NOFRONTEND=1 play gba "$rom"
 [[ $rc == 75 ]] && ! ran && grep -q 'frontend not active' "$t/out"
@@ -440,6 +500,13 @@ res $? "frontend not active exits 75 and starts nothing"
 FAKE_STATE=failed play gba "$rom"
 [[ $rc == 0 ]] && ran && grep -qx -- '--user reset-failed blockie-game.scope' "$FAKE/systemctl.log"
 res $? "a failed scope is reset, then the game starts"
+
+FAKE_NORESET=1 FAKE_STATE=failed play gba "$rom"
+[[ $rc == 75 ]] && ! ran && shows 2 && grep -q 'cannot reset blockie-game.scope' "$t/out"
+r1=$?
+FAKE_NORESET=1 FAKE_STATE='failed inactive' play gba "$rom"
+[[ $r1 == 0 && $rc == 0 ]] && ran && shows 2
+res $? "a failed reset reads the scope again: still failed exits 75 and starts nothing, collected meanwhile starts the game"
 
 printf ' 0 [mt6768mt6358   ]: mt6768mt6358 - mt6768-mt6358\n' > "$t/card"
 CARDS=$t/card play gba "$rom"
