@@ -288,7 +288,7 @@ prun() {
   : > "$p/calls"
   PATH=$p/bin:$PATH BLOCKIE_DATA_DIR=$p/data BLOCKIE_ANDROID_RUN=$p/run BLOCKIE_WAYDROID_WORK=$p/work \
     BLOCKIE_ANDROID_PIN=${1:-$p/pin} BLOCKIE_WAYDROID_BASE=$p/config_base BLOCKIE_ANDROID_PAYLOAD=$p/payload \
-    BLOCKIE_LOCALTIME=$p/localtime timeout 20 "$lx/blockie-android-prep" > "$p/out" 2>&1
+    BLOCKIE_LOCALTIME=$p/localtime BLOCKIE_ANDROID_DRM_STATE=${drmstate-} timeout 20 "$lx/blockie-android-prep" > "$p/out" 2>&1
   rc=$?
   st=$(cat "$p/run/state" 2> /dev/null)
 }
@@ -316,7 +316,7 @@ prun
 [[ $rc == 0 && $st == ok && $(cat "$p/calls") == '--details-to-stdout init' ]] || { ok=1; echo "  first: rc $rc '$st' $(cat "$p/calls")"; }
 for kv in properties:persist.waydroid.width:960 properties:persist.waydroid.height:720 properties:persist.waydroid.uevent:false \
   properties:persist.waydroid.suspend:false properties:ro.sf.lcd_density:240 properties:persist.sys.timezone:Asia/Tokyo \
-  waydroid:suspend_action:freeze \
+  properties:ro.vendor.blockie.vsync_period_ns:16666814 waydroid:suspend_action:freeze \
   waydroid:mount_overlays:True; do
   IFS=: read -r sec key val <<< "$kv"
   [[ $(cfgget "$sec" "$key") == "$val" ]] || { ok=1; echo "  $sec $key: $(cfgget "$sec" "$key")"; }
@@ -346,6 +346,40 @@ prun
 prun
 [[ $rc == 0 && ! -s $p/calls ]] || { ok=1; echo "  settled: $(cat "$p/calls")"; }
 res $ok "prep: no change runs nothing; a new config_base, image stamp or waydroid version runs upgrade --offline once"
+
+ok=0
+vs='vsync period\|display mode\|crtc\|not checked\|cannot read'
+prun
+[[ $rc == 0 && $st == ok ]] && ! grep -q "$vs" "$p/out" || { ok=1; echo "  off: rc $rc $(cat "$p/out")"; }
+dstate() {
+  printf 'plane[31]: plane-0\n\tcrtc=crtc-1\n\tfb=50\n'
+  printf 'crtc[44]: crtc-0\n\tenable=0\n\tactive=0\n\tself_refresh_active=0\n\tplane_mask=0\n'
+  printf '\tmode: "960x720": 59 %s 960 970 980 1000 720 730 740 800 0x48 0xa\n' "$1"
+  printf 'crtc[45]: crtc-1\n\tenable=1\n\tactive=1\n\tself_refresh_active=0\n\tplane_mask=1\n'
+  printf '\tmode: "960x720": 60 %s 960 970 980 1000 720 730 740 800 0x48 0xa\n' "$2"
+  printf 'connector[47]: DSI-1\n\tcrtc=crtc-1\n\tself_refresh_aware=0\n'
+}
+drmstate=$p/drmstate
+dstate 47200 48000 > "$drmstate"
+prun
+[[ $rc == 0 && $st == ok && ! -s $p/calls && $(grep -c "$vs" "$p/out") == 1 ]] &&
+  grep -qx 'blockie-android-prep: vsync period 16666667 ns, pinned 16666814' "$p/out" || { ok=1; echo "  active: $(cat "$p/out")"; }
+dstate 48000 47200 > "$drmstate"
+prun
+[[ $rc == 0 && $st == ok && $(grep -c "$vs" "$p/out") == 2 ]] &&
+  grep -qx 'blockie-android-prep: vsync period 16949153 ns, pinned 16666814' "$p/out" &&
+  grep -qx 'blockie-android-prep: warning: the display mode is 16940 ppm off the pinned vsync period' "$p/out" ||
+  { ok=1; echo "  warning: $(cat "$p/out")"; }
+dstate 48000 48000 | sed 's/ 0x48 0xa$//' > "$drmstate"
+prun
+[[ $rc == 0 && $st == ok && $(grep -c "$vs" "$p/out") == 1 ]] && grep -qx "blockie-android-prep: no active crtc mode in $drmstate" "$p/out" ||
+  { ok=1; echo "  unparsable: $(cat "$p/out")"; }
+rm -f "${drmstate:?}"
+prun
+[[ $rc == 0 && $st == ok && $(grep -c "$vs" "$p/out") == 1 ]] && grep -qx "blockie-android-prep: no $drmstate, vsync period not checked" "$p/out" ||
+  { ok=1; echo "  missing: $(cat "$p/out")"; }
+unset drmstate
+res $ok "prep: the debugfs state read is off with BLOCKIE_ANDROID_DRM_STATE empty; it takes the mode line of the active crtc, not the inactive one, logs htotal * vtotal / clock against 16666814 (8.8 ppm, no warning) and warns past 10 ppm; an unparsable state and a missing file log one line each and prep goes on, state ok"
 
 ok=0
 mkdir -p "$p/payload" "$p/data/android/images.old"
@@ -460,7 +494,7 @@ grun() {
     BLOCKIE_ANDROID_PIN=$g/imgpin BLOCKIE_WAYDROID_BASE=$g/config_base BLOCKIE_ANDROID_PAYLOAD=$g/payload \
     BLOCKIE_LOCALTIME=$g/localtime BLOCKIE_ANDROID_GPU_PIN=$g/gpin BLOCKIE_ANDROID_VENDOR=$g/vendor \
     BLOCKIE_ANDROID_HWC_SHIM=$g/hwc/hwcomposer.blockie.so BLOCKIE_KBASE_ARMED=$g/armed BLOCKIE_BOOT_ID=$g/bootid \
-    BLOCKIE_SETD_STORE=$g/gpusetting \
+    BLOCKIE_SETD_STORE=$g/gpusetting BLOCKIE_ANDROID_DRM_STATE='' \
     timeout 20 "$lx/blockie-android-prep" > "$g/out" 2>&1
   rc=$?
   st=$(cat "$g/run/state" 2> /dev/null)
@@ -479,7 +513,8 @@ gpin "$D"
 ok=0
 grun
 [[ $rc == 0 && $st == ok ]] || { ok=1; echo "  mali rc $rc '$st' $(cat "$g/out")"; }
-for kv in ro.hardware.egl:mali ro.hardware.gralloc:mediatek ro.hardware.vulkan:mt6768 ro.sf.lcd_density:240; do
+for kv in ro.hardware.egl:mali ro.hardware.gralloc:mediatek ro.hardware.vulkan:mt6768 ro.sf.lcd_density:240 \
+  ro.vendor.blockie.vsync_period_ns:16666814; do
   IFS=: read -r k v <<< "$kv"
   [[ $(gcfg "$k") == "$v" ]] || { ok=1; echo "  prop $k is $(gcfg "$k")"; }
 done
@@ -543,10 +578,10 @@ grun
 [[ $(gcfg ro.hardware.egl) == mali ]] || { ok=1; echo "  re-mali before removal"; }
 echo '0 0' > "$g/armed"
 grun
-[[ $rc == 0 && $(gcfg ro.hardware.egl) == - && $(gcfg ro.sf.lcd_density) == 240 && $(gcfg ro.hardware.vulkan) == - ]] ||
-  { ok=1; echo "  props not removed in soft"; }
+[[ $rc == 0 && $(gcfg ro.hardware.egl) == - && $(gcfg ro.sf.lcd_density) == 240 && $(gcfg ro.hardware.vulkan) == - &&
+  $(gcfg ro.vendor.blockie.vsync_period_ns) == 16666814 ]] || { ok=1; echo "  props not removed in soft"; }
 echo '1 0' > "$g/armed"
-res $ok "prep gpu: a switch to soft removes the hardware props (egl, gralloc, vulkan) from waydroid.cfg and keeps the density"
+res $ok "prep gpu: a switch to soft removes the hardware props (egl, gralloc, vulkan) from waydroid.cfg and keeps the density and the vsync period"
 
 ok=0
 echo gpu-boot-six > "$g/bootid"

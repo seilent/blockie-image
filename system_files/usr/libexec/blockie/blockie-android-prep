@@ -37,6 +37,9 @@ GPU_MODE = os.path.join(RUN, "gpu-mode")
 GPU_FAILED = os.path.join(ANDROID, "gpu-failed")
 SETD_STORE = os.environ.get("BLOCKIE_SETD_STORE", "/var/lib/blockie/settings/settings.json")
 SESSION_USER = os.environ.get("BLOCKIE_SESSION_USER", "blockie")
+DRM_STATE = os.environ.get("BLOCKIE_ANDROID_DRM_STATE", "/sys/kernel/debug/dri/0/state")
+DRM_MODE = re.compile(r'mode: ".*": -?\d+ (\d+) \d+ \d+ \d+ (\d+) \d+ \d+ \d+ (\d+) 0x[0-9a-f]+ 0x[0-9a-f]+')
+VSYNC_PERIOD_NS = 16666814
 SHIMPATH = "lib64/hw/hwcomposer.blockie.so"
 PROPERTIES = {
     "persist.waydroid.width": "960",
@@ -44,6 +47,7 @@ PROPERTIES = {
     "persist.waydroid.uevent": "false",
     "persist.waydroid.suspend": "false",
     "ro.sf.lcd_density": "240",
+    "ro.vendor.blockie.vsync_period_ns": str(VSYNC_PERIOD_NS),
 }
 PINNED = {"suspend_action": "freeze", "mount_overlays": "True"}
 GPU_PROPS = {
@@ -449,6 +453,40 @@ def waydroid(*argv):
         raise Refused("failed", f"waydroid {argv[0]} exited {r.returncode}")
 
 
+def vsync_check():
+    if not DRM_STATE:
+        return
+    try:
+        with open(DRM_STATE, errors="replace") as f:
+            text = f.read()
+    except FileNotFoundError:
+        log(f"no {DRM_STATE}, vsync period not checked")
+        return
+    except OSError as e:
+        log(f"cannot read {DRM_STATE}: {e.strerror or e}")
+        return
+    crtc = active = False
+    for line in text.splitlines():
+        if not line[:1].isspace():
+            crtc, active = line.startswith("crtc["), False
+            continue
+        field = line.strip()
+        if crtc and field == "active=1":
+            active = True
+        m = DRM_MODE.fullmatch(field) if crtc and active else None
+        if m and all(int(v) for v in m.groups()):
+            clock, htotal, vtotal = (int(v) for v in m.groups())
+            break
+    else:
+        log(f"no active crtc mode in {DRM_STATE}")
+        return
+    period = htotal * vtotal * 1000000 / clock
+    log(f"vsync period {round(period)} ns, pinned {VSYNC_PERIOD_NS}")
+    ppm = abs(period - VSYNC_PERIOD_NS) * 1000000 / VSYNC_PERIOD_NS
+    if ppm > 10:
+        log(f"warning: the display mode is {ppm:.0f} ppm off the pinned vsync period")
+
+
 def keylayout():
     d = os.path.join(WORK, "overlay", "system", "usr", "keylayout")
     os.makedirs(d, 0o755, exist_ok=True)
@@ -463,6 +501,7 @@ def keylayout():
 
 
 def prep():
+    vsync_check()
     if subprocess.run(["mountpoint", "-q", DATA]).returncode != 0:
         raise Refused("missing", f"{DATA} is not mounted")
     rows = pin()
