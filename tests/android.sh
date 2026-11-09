@@ -940,7 +940,7 @@ if [ -n "\$h" ]; then
       rm -f "$m/hang"
       echo "\$*" >> "$m/hung"
       printf 'populated 1\nfrozen 1\n' > "$m/payload/cgroup.events"
-      (sleep 1; printf 'populated 1\nfrozen 0\n' > "$m/payload/cgroup.events") > /dev/null 2>&1 &
+      (i=0; while [ \$i -lt 150 ] && ! grep -q 'Android is frozen, waiting for the thaw' "$m/out" 2> /dev/null; do sleep 0.1; i=\$((i + 1)); done; printf 'populated 1\nfrozen 0\n' > "$m/payload/cgroup.events") > /dev/null 2>&1 &
       exit 124
       ;;
   esac
@@ -1134,7 +1134,7 @@ if [ -n "\$h" ]; then
       rm -f "$d/hang"
       echo "\$*" >> "$d/hung"
       printf 'populated 1\nfrozen 1\n' > "$d/payload/cgroup.events"
-      (sleep 1; printf 'populated 1\nfrozen 0\n' > "$d/payload/cgroup.events") > /dev/null 2>&1 &
+      (i=0; while [ \$i -lt 150 ] && ! grep -q 'Android is frozen, waiting for the thaw' "$d/out" 2> /dev/null; do sleep 0.1; i=\$((i + 1)); done; printf 'populated 1\nfrozen 0\n' > "$d/payload/cgroup.events") > /dev/null 2>&1 &
       exit 124
       ;;
   esac
