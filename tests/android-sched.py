@@ -40,7 +40,7 @@ FREQ0 = [1800000, 1625000, 1500000, 1450000, 1375000, 1325000, 1275000, 1175000,
 FREQ6 = [2000000, 1950000, 1900000, 1850000, 1800000, 1710000, 1621000, 1532000, 1443000, 1354000, 1295000, 1176000,
          1087000, 998000, 909000, 850000]
 BOOST = {"policy0": 1800000, "policy6": 2000000, "gpu": 15, "ddr": 0, "payload": 100, "top": 100}
-TOUCH = {"policy0": 1500000, "policy6": 1710000, "gpu": 20, "payload": 80, "top": 80}
+TOUCH = {"policy0": 1500000, "policy6": 1710000, "gpu": 15, "payload": 80, "top": 80}
 IDLE = {"policy0": 500000, "policy6": 850000, "gpu": 29, "payload": 0, "top": 0, "fg": 0}
 FIX = [
     dict(pid=200, comm="main", cmd="zygote64", ppid=1, nice=-20, uid=0, adj=-1000),
@@ -626,7 +626,7 @@ def _(c):
 
 
 @case("arbitration: a touch window inside a launch hold keeps the launch values and ends at its own deadline; the "
-      "knobs return at the launch deadline; a touch alone writes the touch row (OPP 2 and 5, uclamp 80, GED 20) "
+      "knobs return at the launch deadline; a touch alone writes the touch row (OPP 2 and 5, uclamp 80, GED 15) "
       "and no DRAM floor")
 def _(c):
     w, s = up()
