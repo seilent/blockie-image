@@ -62,13 +62,21 @@ EOF
 echo "bootc \$*" >> "$d/calls"
 exit \$(cat "$d/bootc.rc")
 EOF
-  chmod 755 "$d/bin/findmnt" "$d/bin/systemctl" "$d/bin/bootc"
+  cat > "$d/bin/blockie-bootctl" << EOF
+#!/bin/sh
+echo "bootctl \$* confirmed=\$(cat "$d/state/confirmed" 2> /dev/null)" >> "$d/calls"
+exit \$(cat "$d/bootctl.rc" 2> /dev/null || echo 0)
+EOF
+  chmod 755 "$d/bin/findmnt" "$d/bin/systemctl" "$d/bin/bootc" "$d/bin/blockie-bootctl"
   root=$dep/$A
 }
 
 run() {
   PATH="$d/bin:$PATH" BLOCKIE_BOOT_OK_CONF=$d/conf BLOCKIE_BOOT_STATE=$d/state BLOCKIE_CMDLINE=$d/cmdline \
-    BLOCKIE_SYSROOT=$s BLOCKIE_ROOT=$root BLOCKIE_OSTREE_ROOT=$lib "$script" > "$d/out" 2>&1
+    BLOCKIE_SYSROOT=$s BLOCKIE_ROOT=$root BLOCKIE_OSTREE_ROOT=$lib BLOCKIE_PRODUCT_FILE=$d/product \
+    BLOCKIE_SESSION_READY=$d/ready BLOCKIE_BOOTCTL=$d/bin/blockie-bootctl BLOCKIE_HEALTHY_WAIT=${HW:-3} \
+    BLOCKIE_BOOT_GATES=$d/gates \
+    "$script" "$@" > "$d/out" 2>&1
   rc=$?
 }
 
@@ -228,6 +236,115 @@ setup no-conf
 rm -f "$d/conf"
 run
 refused "missing boot-ok.conf refused" "missing"
+
+tries0=$(printf '%s 1\n%s 2\n%s 1\nnot a line' "$A" "$B" "$C")
+product() {
+  setup "$1"
+  : > "$d/product"
+  echo "emulation blockie-frontend.service" > "$d/ready"
+  printf '%s\n' state=pending "arm=${2:-default}" android=bootable return=host recovery=no fastboot=no > "$d/gates"
+}
+
+product prod-ok
+run
+[[ $rc == 0 && ! -e $d/state/confirmed && $(cat "$d/state/tries") == "$tries0" && ! -s $d/calls ]] &&
+  grep -qx "blockie-boot-ok: checks passed, on a default armed product boot blockie-boot-healthy confirms $A" "$d/out"
+res $? "default armed product boot (b 13): boot-ok runs the checks and writes nothing, the confirm waits for healthy"
+
+ok=0
+for w in test other none; do
+  product "prod-$w" "$w"
+  [[ $w != none ]] || rm -f "$d/gates"
+  run
+  [[ $rc == 0 && $(cat "$d/state/confirmed") == "$A" && $(cat "$d/state/tries") == "$B 2" && ! -s $d/calls ]] &&
+    grep -qx "blockie-boot-ok: confirmed $A (default)" "$d/out" || { ok=1; echo "  ok $w: rc $rc"; }
+  : > "$d/calls"
+  run healthy
+  [[ $rc == 0 && ! -s $d/calls && $(cat "$d/state/confirmed") == "$A" ]] && grep -q 'nothing to do' "$d/out" ||
+    { ok=1; echo "  healthy $w: rc $rc"; }
+done
+res $ok "a product boot on a test arm (b 14), another arm or no gate file: boot-ok confirms as before, healthy exits 0 at once"
+
+product prod-ok-fail
+: > "$d/active"
+run
+refused "product boot: a failed check still fails boot-ok" "NetworkManager.service is not active"
+
+product healthy
+run healthy
+[[ $rc == 0 && $(cat "$d/state/confirmed") == "$A" && $(cat "$d/state/tries") == "$B 2" ]] &&
+  [[ $(cat "$d/calls") == "bootctl healthy confirmed=$A" ]] &&
+  grep -qx "blockie-boot-ok: ready: emulation blockie-frontend.service" "$d/out"
+res $? "healthy with the ready report written before multi-user: confirmed first, then blockie-bootctl healthy"
+
+product healthy-late
+rm -f "$d/ready"
+( sleep 1.5; echo "emulation blockie-frontend.service" > "$d/ready" ) &
+t0=${EPOCHREALTIME//[!0-9]/}
+run healthy
+ms=$(((${EPOCHREALTIME//[!0-9]/} - t0) / 1000))
+wait
+[[ $rc == 0 && $(cat "$d/state/confirmed") == "$A" && $(cat "$d/calls") == "bootctl healthy confirmed=$A" ]] && ((ms >= 1000))
+res $? "healthy waits for a ready report that comes after it started ($ms ms)"
+
+product healthy-noready
+rm -f "$d/ready"
+HW=1 run healthy
+[[ $rc == 1 && ! -e $d/state/confirmed && $(cat "$d/state/tries") == "$tries0" && ! -s $d/calls ]] &&
+  grep -q "no ready report from the default session after 1 s" "$d/out"
+res $? "healthy with no ready report: nothing confirmed, no re-arm, exit 1"
+
+setup healthy-dev
+echo "emulation blockie-frontend.service" > "$d/ready"
+run healthy
+[[ $rc == 1 && ! -e $d/state/confirmed && ! -s $d/calls ]] && grep -q "only on a product boot" "$d/out"
+res $? "healthy on a boot that is not a product boot: refused, nothing written"
+
+product healthy-check
+echo blockie-adbd.service > "$d/failed"
+run healthy
+[[ $rc == 1 && ! -e $d/state/confirmed && ! -s $d/calls ]] && grep -q "blockie-adbd.service failed" "$d/out"
+res $? "healthy re-runs the unit checks: a failed blockie-adbd refuses, no re-arm"
+
+product healthy-fallback
+sed -i 's/pick=default/pick=fallback/' "$d/cmdline"
+run healthy
+[[ $rc == 0 && $(cat "$d/state/confirmed") == "$A" && ! -s $d/state/tries ]] &&
+  [[ $(cat "$d/calls") == "bootc rollback"$'\n'"bootctl healthy confirmed=$A" ]]
+res $? "healthy on a fallback pick: confirmed, bootc rollback, then blockie-bootctl healthy"
+
+product healthy-fallback-fails
+sed -i 's/pick=default/pick=fallback/' "$d/cmdline"
+echo 1 > "$d/bootc.rc"
+run healthy
+[[ $rc == 1 && $(cat "$d/calls") == "bootc rollback" ]]
+res $? "healthy with a failed bootc rollback: no re-arm"
+
+product healthy-runconf
+sed -i "s/pick=default/pick=runconf/; s/blockie.deploy=$A/blockie.deploy=$B/" "$d/cmdline"
+root=$dep/$B
+run healthy
+[[ $rc == 0 && ! -e $d/state/confirmed && $(cat "$d/calls") == "bootctl healthy confirmed=" ]]
+res $? "healthy on a runconf boot of an older entry: nothing confirmed, slot a still re-armed"
+
+product healthy-bootctl
+echo 1 > "$d/bootctl.rc"
+run healthy
+[[ $rc == 1 && $(cat "$d/state/confirmed") == "$A" ]]
+res $? "a failed blockie-bootctl healthy fails the healthy unit after the confirm"
+
+product usage
+run other
+[[ $rc == 2 && ! -e $d/state/confirmed && ! -s $d/calls ]]
+res $? "boot-ok takes no argument or healthy"
+
+hu=/usr/lib/systemd/system/blockie-boot-healthy.service
+if [[ -f $hu ]]; then
+  grep -qx 'After=multi-user.target blockie-boot-ok.service' "$hu" && grep -qx 'ConditionPathExists=/run/blockie/product' "$hu" &&
+    grep -qx 'ExecStart=/usr/libexec/blockie/blockie-boot-ok healthy' "$hu" &&
+    [[ -L /etc/systemd/system/multi-user.target.wants/blockie-boot-healthy.service ]]
+  res $? "blockie-boot-healthy.service runs boot-ok healthy after multi-user.target on product boots, enabled"
+fi
 
 if [[ $fails == 0 ]]; then
   echo "boot-ok: all ok"

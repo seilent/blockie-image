@@ -10,13 +10,41 @@ cmdline=${BLOCKIE_CMDLINE:-/proc/cmdline}
 sysroot=${BLOCKIE_SYSROOT:-/sysroot}
 root=${BLOCKIE_ROOT:-/}
 lib=${BLOCKIE_OSTREE_ROOT:-/blockie/lib/ostree-root}
+product=${BLOCKIE_PRODUCT_FILE:-/run/blockie/product}
+gates=${BLOCKIE_BOOT_GATES:-/run/blockie/boot/state}
+ready=${BLOCKIE_SESSION_READY:-/run/blockie-session/ready}
+bootctl=${BLOCKIE_BOOTCTL:-/usr/bin/blockie-bootctl}
+wait_s=${BLOCKIE_HEALTHY_WAIT:-300}
 deploys=$sysroot/ostree/deploy/default/deploy
 id_re='^[0-9a-f]{64}\.[0-9]+$'
+
+mode=ok
+case $#:${1:-} in
+  0:) ;;
+  1:healthy) mode=healthy ;;
+  *) echo "usage: $me [healthy]" >&2; exit 2 ;;
+esac
 
 [[ -r $conf ]] || die "missing $conf"
 . "$conf"
 [[ -r $lib ]] || die "missing $lib"
 . "$lib"
+
+arm=$(sed -n 's/^arm=//p' "$gates" 2> /dev/null | head -n 1 || true)
+if [[ $mode == healthy ]]; then
+  [[ -e $product ]] || die "healthy runs only on a product boot"
+  if [[ $arm != default ]]; then
+    echo "$me: healthy: arm=${arm:-none}, not a default arm, the confirm stays with blockie-boot-ok: nothing to do"
+    exit 0
+  fi
+  n=0
+  until [[ -s $ready ]]; do
+    (( n < wait_s )) || die "not healthy: no ready report from the default session after $wait_s s"
+    sleep 1
+    n=$((n + 1))
+  done
+  echo "$me: ready: $(< "$ready")"
+fi
 
 src=$(findmnt -no SOURCE /var) || die "/var is not mounted"
 [[ $src == *"[/ostree/deploy/default/var]" ]] || die "/var is $src, not the stateroot var"
@@ -49,8 +77,14 @@ for u in $BLOCKIE_BOOT_OK_NOT_EXIT1; do
   [[ $(systemctl show -p ExecMainStatus --value "$u") != 1 ]] || die "not confirmed: $u exited 1"
 done
 
+if [[ $mode == ok && -e $product && $arm == default ]]; then
+  echo "$me: checks passed, on a default armed product boot blockie-boot-healthy confirms $deploy"
+  exit 0
+fi
+
 if [[ $pick == runconf && $deploy != "$default" ]]; then
   echo "$me: runconf boot of $deploy, the default entry is $default: nothing written"
+  [[ $mode == ok ]] || exec "$bootctl" healthy
   exit 0
 fi
 
@@ -85,3 +119,4 @@ if [[ $pick == fallback ]]; then
 else
   echo "$me: confirmed $deploy ($pick)"
 fi
+[[ $mode == ok ]] || exec "$bootctl" healthy

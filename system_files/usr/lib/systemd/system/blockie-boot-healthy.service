@@ -1,0 +1,15 @@
+[Unit]
+Description=Confirm the deployment and re-arm slot a once the default session is ready
+After=multi-user.target blockie-boot-ok.service
+ConditionKernelCommandLine=ostree
+ConditionPathExists=/run/blockie/product
+RequiresMountsFor=/var
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=420
+ExecStart=/usr/libexec/blockie/blockie-boot-ok healthy
+
+[Install]
+WantedBy=multi-user.target
