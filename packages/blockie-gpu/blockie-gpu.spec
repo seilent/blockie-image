@@ -7,11 +7,13 @@ BuildArch:      noarch
 Source0:        blockie-gpu-src.tar.gz
 BuildRequires:  python3
 BuildRequires:  coreutils
+BuildRequires:  util-linux-core
 Requires:       blockie-tools
 Requires:       systemd-udev
 Requires:       bash
 Requires:       coreutils
 Requires:       grep
+Requires:       util-linux-core
 
 %description
 The pinned list entry and Vulkan ICD for the Mali-G52 userspace blob, which is never

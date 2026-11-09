@@ -1,0 +1,1160 @@
+#!/usr/bin/python3
+import ctypes
+import errno
+import fcntl
+import json
+import os
+import re
+import select
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import time
+
+ME = "blockie-android-sched"
+LXC = "/var/lib/waydroid/lxc"
+PAYLOAD = "/lxc.payload.waydroid"
+GROUPS = ("top", "fg", "bg")
+CPUS = {"top": "0-7", "fg": "0-7", "bg": "0-3"}
+WEIGHT = "100"
+POLICIES = ("policy0", "policy6")
+KNOBS = POLICIES + ("gpu", "ddr")
+ORIG = {"policy0": 500000, "policy6": 850000, "gpu": 29, "ddr": 255}
+KHZ_RANGE = (100000, 3000000)
+MAX_KHZ = {"policy0": 1800000, "policy6": 2000000}
+TOUCH_OPP = {"policy0": 2, "policy6": 5}
+TOUCH_KHZ = {"policy0": 1500000, "policy6": 1710000}
+GPU_KHZ = {29: 299000, 28: 315000, 25: 366000, 20: 450000, 15: 560000, 10: 690000, 5: 823000, 1: 925000,
+           0: 950000}
+GPU_NO_FLOOR = 29
+GPU_FLOOR_BOOT = 15
+GPU_FLOOR_LAUNCH = 15
+GPU_FLOOR_SWITCH = 15
+GPU_FLOOR_TOUCH = 20
+GPU_FLOOR = {"boot": GPU_FLOOR_BOOT, "launch": GPU_FLOOR_LAUNCH, "switch": GPU_FLOOR_SWITCH,
+             "touch": GPU_FLOOR_TOUCH}
+DDR_FLOOR = 0
+DDR_RELEASE = 255
+DDR_FLOOR_KHZ = 3200000
+STALE = -1
+HOLD = {"boot": 120.0, "launch": 6.0, "switch": 0.5, "touch": 0.2}
+UCLAMP = {"boot": 100, "launch": 100, "switch": 100, "touch": 80}
+LAUNCH_AGE = 2.0
+FAST = 0.25
+SLOW = 1.5
+FAST_FOR = 2.0
+EXTRA = (0.05, 0.15, 0.3, 0.6)
+PARK = 0.1
+PING = 2.0
+WAIT_MAX = 5.0
+EVAC_PASSES = 10
+BUSY_TRIES = 5
+BUSY_WAIT = 0.05
+STOP_TRIES = 3
+RUN_TIMEOUT = 2
+TOP_NICE = -10
+BG_ADJ = 300
+ISOLATED = range(90000, 100000)
+ZYGOTES = ("zygote", "zygote64")
+PERF_KEY = "android.perf"
+PERF_DEFAULT = "policy"
+PERF_VALUES = ("policy", "off")
+EVENT = struct.Struct("@llHHi")
+EV_KEY = 1
+EV_ABS = 3
+BTN_TOUCH = 0x14A
+ABS_MT_POSITION_X = 0x35
+ABS_MT_TRACKING_ID = 0x39
+INPUT_PROP_DIRECT = 1
+IN_CREATE = 0x100
+IN_DELETE = 0x200
+IN_ATTRIB = 0x4
+IN_MOVED_TO = 0x80
+IN_CLOSE_WRITE = 0x8
+IN_Q_OVERFLOW = 0x4000
+CLK_TCK = os.sysconf("SC_CLK_TCK")
+
+
+def log(msg):
+    print(f"{ME}: {msg}", file=sys.stderr, flush=True)
+
+
+def notify(msg):
+    addr = os.environ.get("NOTIFY_SOCKET")
+    if not addr:
+        return
+    if addr[0] == "@":
+        addr = "\0" + addr[1:]
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
+            s.connect(addr)
+            s.sendall(msg.encode())
+    except OSError as e:
+        log(f"cannot send {msg}: {e.strerror}")
+
+
+def run_cmd(argv, timeout):
+    try:
+        r = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return r.returncode, r.stdout.replace("\r", "")
+
+
+def put(path, text):
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def parse_stat(text):
+    r = text.rindex(")")
+    f = text[r + 2:].split()
+    return text[text.index("(") + 1:r], int(f[1]), int(f[16]), int(f[19])
+
+
+def cgpath(group):
+    return PAYLOAD + ("/" + group if group else "")
+
+
+def eviocg(nr, size):
+    return (2 << 30) | (size << 16) | (ord("E") << 8) | nr
+
+
+def bit(buf, n):
+    return buf[n // 8] >> (n % 8) & 1
+
+
+class Paths:
+    def __init__(self, root):
+        self.payload = root + "/sys/fs/cgroup" + PAYLOAD
+        self.proc = root + "/proc"
+        self.cpufreq = root + "/sys/devices/system/cpu/cpufreq"
+        self.ged = root + "/sys/kernel/ged/hal/custom_boost_gpu_freq"
+        self.ddr = root + "/sys/devices/platform/10012000.dvfsrc/helio-dvfsrc/dvfsrc_req_ddr_opp"
+        self.state = root + "/run/blockie-android-sched"
+        self.orig = self.state + "/orig"
+        self.dirty = self.state + "/dirty"
+        self.lock = root + "/run/blockie-perf.lock"
+        self.current = root + "/run/blockie-session/session-current"
+        self.backlight = root + "/sys/class/leds/lcd-backlight/brightness"
+        self.store = root + "/var/lib/blockie/settings/settings.json"
+        self.input = root + "/dev/input"
+
+    def knob(self, k):
+        if k in POLICIES:
+            return f"{self.cpufreq}/{k}/scaling_min_freq"
+        return self.ged if k == "gpu" else self.ddr
+
+
+def valid_orig(v):
+    return (all(KHZ_RANGE[0] <= v[p] <= KHZ_RANGE[1] for p in POLICIES) and v["gpu"] == GPU_NO_FLOOR
+            and v["ddr"] == DDR_RELEASE)
+
+
+def read_orig(path):
+    try:
+        with open(path) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return dict(ORIG), False
+    out = {}
+    for line in lines:
+        w = line.split()
+        if len(w) != 2 or w[0] not in ORIG or w[0] in out or not w[1].isdigit():
+            return dict(ORIG), False
+        out[w[0]] = int(w[1])
+    if set(out) != set(ORIG) or not valid_orig(out):
+        return dict(ORIG), False
+    return out, True
+
+
+def write_orig(p):
+    if os.path.lexists(p.orig):
+        return 0
+    os.makedirs(p.state, exist_ok=True)
+    v = dict(ORIG)
+    for pol in POLICIES:
+        try:
+            with open(f"{p.cpufreq}/{pol}/cpuinfo_min_freq") as f:
+                v[pol] = int(f.read().strip())
+        except (OSError, ValueError):
+            log(f"cannot read the {pol} cpuinfo_min_freq, orig keeps {v[pol]}")
+    if not valid_orig(v):
+        log("cpuinfo_min_freq out of range, orig keeps the built in values")
+        v = dict(ORIG)
+    put(p.orig, "".join(f"{k} {v[k]}\n" for k in KNOBS))
+    log("wrote " + " ".join(f"{k}={v[k]}" for k in KNOBS))
+    return 0
+
+
+class Proc:
+    __slots__ = ("dfd", "comm", "ppid", "start", "uid", "group", "adj")
+
+    def __init__(self, dfd, comm, ppid, start, group):
+        self.dfd = dfd
+        self.comm = comm
+        self.ppid = ppid
+        self.start = start
+        self.uid = None
+        self.group = group
+        self.adj = None
+
+
+class Req:
+    __slots__ = ("kind", "until", "values", "skip")
+
+    def __init__(self, kind, until, values, skip):
+        self.kind = kind
+        self.until = until
+        self.values = values
+        self.skip = skip
+
+
+class Dev:
+    __slots__ = ("fd", "kind", "rdev", "park")
+
+    def __init__(self, fd, kind, rdev):
+        self.fd = fd
+        self.kind = kind
+        self.rdev = rdev
+        self.park = 0.0
+
+
+class Sched:
+    def __init__(self, root="", clock=time.monotonic, sleep=time.sleep, run=run_cmd):
+        self.p = Paths(root)
+        self.clock = clock
+        self.sleep = sleep
+        self.run = run
+        self.orig, ok = read_orig(self.p.orig)
+        if not ok:
+            log(f"{self.p.orig} missing or bad, restoring to the built in values")
+        self.max = {}
+        self.touch = {}
+        for pol in POLICIES:
+            self.max[pol] = self.policy_max(pol)
+            self.touch[pol] = self.policy_touch(pol)
+        self.dirty = self.read_dirty()
+        self.lock_fd = None
+        self.applied = {k: STALE if k in self.dirty else None for k in KNOBS}
+        self.uclamp = {"payload": None, "top": None, "fg": None}
+        self.requests = []
+        self.perf = PERF_DEFAULT
+        self.store_key = None
+        self.instance = None
+        self.ready = False
+        self.clean = False
+        self.frozen = False
+        self.efd = None
+        self.pids = {}
+        self.top_prev = set()
+        self.baseline = True
+        self.fifo_ui = None
+        self.booting = False
+        self.boot_known = False
+        self.mins_failed = False
+        self.min_bad = set()
+        self.last_pid = None
+        now = self.clock()
+        self.pinged = now
+        self.next_slow = now
+        self.next_fast = now
+        self.fast_until = now
+        self.extra = []
+        self.devices = {}
+        self.skipped = {}
+        self.ino = None
+        self.wds = {}
+        self.stopping = False
+        self.sig = None
+        self.busy_logged = False
+        self.move_errors = set()
+
+    def read(self, path):
+        with open(path) as f:
+            return f.read()
+
+    def write(self, path, text):
+        fd = os.open(path, os.O_WRONLY | os.O_TRUNC | os.O_CLOEXEC)
+        try:
+            os.write(fd, text.encode())
+        finally:
+            os.close(fd)
+
+    def mkdir(self, path):
+        try:
+            os.mkdir(path)
+        except FileExistsError:
+            pass
+
+    def read_pids(self, d):
+        try:
+            return [int(x) for x in self.read(f"{d}/cgroup.procs").split()]
+        except (OSError, ValueError):
+            return []
+
+    def policy_max(self, pol):
+        try:
+            return int(self.read(f"{self.p.cpufreq}/{pol}/cpuinfo_max_freq").strip())
+        except (OSError, ValueError):
+            return MAX_KHZ[pol]
+
+    def policy_touch(self, pol):
+        try:
+            f = [int(x) for x in self.read(f"{self.p.cpufreq}/{pol}/scaling_available_frequencies").split()]
+        except (OSError, ValueError):
+            f = []
+        f.sort(reverse=True)
+        return f[TOUCH_OPP[pol]] if len(f) > TOUCH_OPP[pol] else TOUCH_KHZ[pol]
+
+    def read_dirty(self):
+        try:
+            return {k for k in self.read(self.p.dirty).split() if k in KNOBS}
+        except OSError:
+            return set()
+
+    def save_dirty(self):
+        os.makedirs(self.p.state, exist_ok=True)
+        put(self.p.dirty, "".join(f"{k}\n" for k in KNOBS if k in self.dirty))
+
+    def setting(self):
+        try:
+            v = json.loads(self.read(self.p.store)).get(PERF_KEY)
+        except (OSError, ValueError, AttributeError):
+            return PERF_DEFAULT
+        return v if v in PERF_VALUES else PERF_DEFAULT
+
+    def check_setting(self):
+        try:
+            st = os.stat(self.p.store)
+            key = (st.st_ino, st.st_mtime_ns, st.st_size)
+        except OSError:
+            key = None
+        if key == self.store_key:
+            return
+        self.store_key = key
+        perf = self.setting()
+        if perf == self.perf:
+            return
+        self.perf = perf
+        log(f"{PERF_KEY} {perf}")
+        if perf == "off" and self.ready:
+            self.restore("off")
+            self.flatten()
+            self.drop_instance(keep=True)
+
+    def flatten(self):
+        n = 0
+        for g in ("top", "bg"):
+            for pid in self.read_pids(f"{self.p.payload}/{g}"):
+                if self.move_listed(pid, g, "fg"):
+                    n += 1
+        log(f"moved {n} pids to fg")
+
+    def lock(self):
+        if self.lock_fd is not None:
+            return True
+        fd = os.open(self.p.lock, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+        os.fchmod(fd, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as e:
+            os.close(fd)
+            if e.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
+                return False
+            raise
+        self.lock_fd = fd
+        self.busy_logged = False
+        return True
+
+    def unlock(self):
+        if self.lock_fd is not None:
+            os.close(self.lock_fd)
+            self.lock_fd = None
+
+    def perf_busy(self, what):
+        if not self.busy_logged:
+            log(f"perf_busy: {self.p.lock} is held, {what}")
+            self.busy_logged = True
+
+    def knob_text(self, k, v):
+        if k in POLICIES:
+            return str(v if v is not None else self.orig[k])
+        if k == "gpu":
+            return str(self.gpu_index(v) if v is not None else self.orig["gpu"])
+        return str(DDR_FLOOR if v is not None else self.orig["ddr"])
+
+    def gpu_index(self, khz):
+        return min((i for i, f in GPU_KHZ.items() if f >= khz), key=lambda i: GPU_KHZ[i])
+
+    def base(self, k):
+        if k in POLICIES:
+            return self.orig[k]
+        if k == "gpu":
+            return GPU_KHZ[self.orig["gpu"]]
+        return 0
+
+    def set_knob(self, k, v):
+        if self.applied[k] == v:
+            return
+        path = self.p.knob(k)
+        added = v is not None and k not in self.dirty
+        if added:
+            self.dirty.add(k)
+            self.save_dirty()
+        try:
+            self.write(path, self.knob_text(k, v))
+        except OSError as e:
+            if v is None and e.errno != errno.ENOENT:
+                if self.applied[k] != STALE:
+                    log(f"cannot restore {path}: {e.strerror}, trying again")
+                self.applied[k] = STALE
+                return
+            log(f"cannot write {path}: {e.strerror}")
+            if added:
+                self.dirty.discard(k)
+                self.save_dirty()
+        self.applied[k] = v
+        if v is None and k in self.dirty:
+            self.dirty.discard(k)
+            self.save_dirty()
+
+    def set_min(self, name, v):
+        if self.uclamp[name] == v:
+            return True
+        d = self.p.payload if name == "payload" else f"{self.p.payload}/{name}"
+        try:
+            self.write(f"{d}/cpu.uclamp.min", str(v))
+        except OSError as e:
+            self.uclamp[name] = None
+            if e.errno == errno.ENOENT:
+                return True
+            if name not in self.min_bad:
+                self.min_bad.add(name)
+                log(f"cannot write {d}/cpu.uclamp.min: {e.strerror}, trying again")
+            return False
+        self.uclamp[name] = v
+        self.min_bad.discard(name)
+        return True
+
+    def zero_mins(self):
+        ok = True
+        for name in ("payload", "top", "fg"):
+            ok = self.set_min(name, 0) and ok
+        return ok
+
+    def set_uclamp(self, top, fg):
+        pay = max(top, fg) if self.clean else 0
+        if pay >= (self.uclamp["payload"] or 0):
+            self.set_min("payload", pay)
+            self.set_min("top", top)
+            self.set_min("fg", fg)
+        else:
+            self.set_min("top", top)
+            self.set_min("fg", fg)
+            self.set_min("payload", pay)
+
+    def apply(self, now):
+        self.requests = [r for r in self.requests if r.until > now]
+        want = {k: 0 for k in KNOBS + ("top", "fg")}
+        for r in self.requests:
+            for k, v in r.values.items():
+                if not (r.skip and k in KNOBS):
+                    want[k] = max(want[k], v)
+        if self.ready:
+            self.set_uclamp(want["top"], want["fg"])
+        if self.lock_fd is not None:
+            for k in KNOBS:
+                self.set_knob(k, want[k] if want[k] > self.base(k) else None)
+        if not self.dirty and not any(not r.skip for r in self.requests):
+            self.unlock()
+
+    def restore(self, why):
+        self.requests = []
+        self.uclamp = {"payload": None, "top": None, "fg": None}
+        self.mins_failed = not self.zero_mins()
+        knobs = [k for k in KNOBS if self.applied[k] is not None]
+        if knobs and not self.lock():
+            self.perf_busy(f"{' '.join(knobs)} left for the next try")
+            return
+        for k in knobs:
+            self.set_knob(k, None)
+        if not self.dirty:
+            self.unlock()
+        if knobs:
+            log(f"restore on {why}: {' '.join(knobs)}")
+
+    def gate(self):
+        if self.perf != "policy" or not self.ready or self.frozen:
+            return False
+        try:
+            if self.read(self.p.current).split()[:1] != ["android"]:
+                return False
+            return int(self.read(self.p.backlight).strip() or 0) > 0
+        except (OSError, ValueError):
+            return False
+
+    def values(self, kind):
+        v = {"top": UCLAMP[kind], "gpu": GPU_KHZ[GPU_FLOOR[kind]]}
+        if kind == "touch":
+            v.update(self.touch)
+        else:
+            v.update(self.max)
+            v["ddr"] = DDR_FLOOR_KHZ
+        if kind == "boot":
+            v["fg"] = UCLAMP["boot"]
+        return v
+
+    def boost(self, kind, now):
+        if not self.gate():
+            return None
+        until = now + HOLD[kind]
+        for r in self.requests:
+            if r.kind == kind and r.until > now:
+                self.extend(r, until, now)
+                return r
+        skip = not self.lock()
+        if skip:
+            self.perf_busy(f"{kind} window without knob writes")
+        r = Req(kind, until, self.values(kind), skip)
+        self.requests.append(r)
+        self.apply(now)
+        return r
+
+    def extend(self, r, until, now):
+        r.until = max(r.until, until)
+        if r.skip and self.lock():
+            r.skip = False
+            self.apply(now)
+
+    def ping(self):
+        notify("WATCHDOG=1")
+        self.pinged = self.clock()
+
+    def events(self):
+        try:
+            if self.efd is not None:
+                os.lseek(self.efd, 0, os.SEEK_SET)
+                text = os.read(self.efd, 4096).decode()
+            else:
+                text = self.read(f"{self.p.payload}/cgroup.events")
+        except OSError:
+            return None
+        out = {}
+        for line in text.splitlines():
+            k, _, v = line.partition(" ")
+            out[k] = v.strip()
+        return out
+
+    def running(self):
+        self.ping()
+        r = self.run(["lxc-info", "-P", LXC, "-n", "waydroid", "-s"], RUN_TIMEOUT)
+        return r is not None and r[0] == 0 and re.search(r"^State:\s+RUNNING\s*$", r[1], re.M) is not None
+
+    def getprop(self, name):
+        self.ping()
+        r = self.run(["lxc-attach", "-P", LXC, "-n", "waydroid", "--clear-env", "--", "/system/bin/getprop", name],
+                     RUN_TIMEOUT)
+        if r is None or r[0] != 0:
+            return None
+        return r[1].strip()
+
+    def check_instance(self, now):
+        ev = self.events()
+        try:
+            ino = os.stat(self.p.payload).st_ino
+        except OSError:
+            ino = None
+        if ev is None or ino is None or ev.get("populated") != "1" or (self.instance not in (None, ino)):
+            if self.instance is not None:
+                log("container gone, waiting for the next one")
+                self.restore("stop")
+                self.drop_instance()
+            return False
+        frozen = ev.get("frozen") == "1"
+        if self.ready:
+            if frozen and not self.frozen:
+                self.frozen = True
+                self.restore("freeze")
+            elif not frozen and self.frozen:
+                self.frozen = False
+                self.fast(now, False)
+            return False
+        if self.perf != "policy":
+            if self.instance is None and self.adoptable():
+                log(f"{PERF_KEY} off with top, fg and bg in place")
+                self.flatten()
+                self.instance = ino
+            return False
+        if frozen or not self.running():
+            return False
+        if not self.setup():
+            return False
+        self.instance = ino
+        self.ready = True
+        self.frozen = False
+        self.baseline = True
+        self.boot_known = False
+        try:
+            self.efd = os.open(f"{self.p.payload}/cgroup.events", os.O_RDONLY | os.O_CLOEXEC)
+        except OSError:
+            self.efd = None
+        self.scan(now, True)
+        self.boot_check(now)
+        return True
+
+    def drop_instance(self, keep=False):
+        for pr in self.pids.values():
+            os.close(pr.dfd)
+        self.pids = {}
+        self.top_prev = set()
+        self.ready = False
+        self.clean = False
+        self.frozen = False
+        self.booting = False
+        self.boot_known = False
+        self.last_pid = None
+        if self.efd is not None:
+            os.close(self.efd)
+            self.efd = None
+        if not keep:
+            self.instance = None
+            self.fifo_ui = None
+
+    def boot_check(self, now):
+        if not self.boot_known:
+            v = self.getprop("sys.boot_completed")
+            if v is None:
+                return
+            self.boot_known = True
+            if v != "1":
+                self.booting = True
+                self.boost("boot", now)
+        elif self.booting:
+            boot = next((r for r in self.requests if r.kind == "boot"), None)
+            if boot is None:
+                self.booting = False
+            elif self.getprop("sys.boot_completed") == "1":
+                self.booting = False
+                self.requests.remove(boot)
+                self.apply(now)
+        if not self.booting and self.fifo_ui is None:
+            v = self.getprop("sys.use_fifo_ui")
+            if v is not None:
+                self.fifo_ui = v not in ("", "0", "false")
+                if self.fifo_ui:
+                    log("fifo_ui: sys.use_fifo_ui is set, top stays empty")
+
+    def make_groups(self):
+        for g in GROUPS:
+            self.mkdir(f"{self.p.payload}/{g}")
+
+    def evacuate(self):
+        left = []
+        for _ in range(EVAC_PASSES):
+            left = self.read_pids(self.p.payload)
+            if not left:
+                return True
+            for pid in left:
+                self.move_listed(pid, "", "fg")
+        left = self.read_pids(self.p.payload)
+        if not left:
+            return True
+        self.clean = False
+        self.set_min("payload", 0)
+        log(f"evacuation stopped after {EVAC_PASSES} passes with {len(left)} pids in the payload")
+        return False
+
+    def enable(self):
+        path = f"{self.p.payload}/cgroup.subtree_control"
+        for _ in range(BUSY_TRIES):
+            try:
+                self.write(path, "+cpuset +cpu")
+                return True
+            except OSError as e:
+                if e.errno != errno.EBUSY:
+                    log(f"cannot enable cpuset and cpu: {e.strerror}")
+                    return False
+            if not self.evacuate():
+                return False
+            self.sleep(BUSY_WAIT)
+        log(f"cannot enable cpuset and cpu: busy after {BUSY_TRIES} tries")
+        return False
+
+    def set_values(self):
+        for g in GROUPS:
+            d = f"{self.p.payload}/{g}"
+            for f, v in (("cpuset.cpus", CPUS[g]), ("cpu.weight", WEIGHT)):
+                try:
+                    if self.read(f"{d}/{f}").strip() == v:
+                        continue
+                except OSError:
+                    pass
+                try:
+                    self.write(f"{d}/{f}", v)
+                except OSError as e:
+                    log(f"cannot write {d}/{f}: {e.strerror}")
+
+    def adoptable(self):
+        try:
+            ctl = self.read(f"{self.p.payload}/cgroup.subtree_control").split()
+        except OSError:
+            return False
+        return "cpuset" in ctl and "cpu" in ctl and all(os.path.isdir(f"{self.p.payload}/{g}") for g in GROUPS)
+
+    def setup(self):
+        adopt = self.adoptable()
+        if not adopt:
+            self.make_groups()
+        if not self.evacuate():
+            return False
+        if not adopt and not self.enable():
+            return False
+        if self.read_pids(self.p.payload) and not self.evacuate():
+            return False
+        self.set_values()
+        self.clean = True
+        log(f"{'adopted' if adopt else 'set up'} top, fg and bg")
+        return True
+
+    def stat(self, pr):
+        try:
+            fd = os.open("stat", os.O_RDONLY | os.O_CLOEXEC, dir_fd=pr.dfd)
+            try:
+                return parse_stat(os.read(fd, 4096).decode(errors="replace"))
+            finally:
+                os.close(fd)
+        except (OSError, ValueError, IndexError):
+            return None
+
+    def pidfile(self, pr, name):
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_CLOEXEC, dir_fd=pr.dfd)
+            try:
+                return os.read(fd, 4096).decode(errors="replace")
+            finally:
+                os.close(fd)
+        except OSError:
+            return None
+
+    def adj(self, pr):
+        try:
+            return int(self.pidfile(pr, "oom_score_adj").strip())
+        except (AttributeError, ValueError):
+            return None
+
+    def uid(self, pr):
+        if pr.uid is None:
+            for line in (self.pidfile(pr, "status") or "").splitlines():
+                if line.startswith("Uid:"):
+                    pr.uid = int(line.split()[1])
+                    break
+        return pr.uid
+
+    def open_pid(self, pid, group):
+        try:
+            dfd = os.open(f"{self.p.proc}/{pid}", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        except OSError:
+            return None
+        pr = Proc(dfd, "", 0, 0, group)
+        st = self.stat(pr)
+        if st is None:
+            os.close(dfd)
+            return None
+        pr.comm, pr.ppid, _, pr.start = st
+        return pr
+
+    def forget(self, pid):
+        pr = self.pids.pop(pid, None)
+        if pr is not None:
+            os.close(pr.dfd)
+
+    def move_raw(self, pid, group):
+        try:
+            self.write(f"{self.p.payload}/{group}/cgroup.procs", str(pid))
+            return True
+        except OSError as e:
+            if e.errno != errno.ESRCH and e.errno not in self.move_errors:
+                self.move_errors.add(e.errno)
+                log(f"cannot move a pid to {group}: {e.strerror}")
+            return False
+
+    def cgroup(self, pr):
+        for line in (self.pidfile(pr, "cgroup") or "").splitlines():
+            if line.startswith("0::"):
+                return line[3:].strip()
+        return None
+
+    def move(self, pid, pr, group):
+        st = self.stat(pr)
+        if st is None or st[3] != pr.start or self.cgroup(pr) != cgpath(pr.group):
+            return False
+        if self.move_raw(pid, group):
+            pr.group = group
+            return True
+        return False
+
+    def move_listed(self, pid, src, dst):
+        pr = self.open_pid(pid, src)
+        if pr is None:
+            return False
+        try:
+            return self.move(pid, pr, dst)
+        finally:
+            os.close(pr.dfd)
+
+    def lists(self):
+        seen = {}
+        for g in GROUPS:
+            for pid in self.read_pids(f"{self.p.payload}/{g}"):
+                seen[pid] = g
+        new = False
+        for pid in list(self.pids):
+            if pid not in seen:
+                self.forget(pid)
+        for pid, g in seen.items():
+            pr = self.pids.get(pid)
+            if pr is not None:
+                pr.group = g
+                continue
+            pr = self.open_pid(pid, g)
+            if pr is not None:
+                self.pids[pid] = pr
+                new = True
+        return new
+
+    def last_pid_now(self):
+        try:
+            return self.read(f"{self.p.proc}/loadavg").split()[4]
+        except (OSError, IndexError):
+            return None
+
+    def classify(self, nice, adj):
+        if nice == TOP_NICE and adj == 0 and not self.fifo_ui:
+            return "top"
+        if adj is not None and adj >= BG_ADJ and nice >= 0:
+            return "bg"
+        return "fg"
+
+    def scan(self, now, slow):
+        if not self.ready or self.frozen:
+            return
+        if slow and self.read_pids(self.p.payload):
+            log("payload_tasks: tasks in the payload, payload min 0 and evacuating")
+            self.clean = False
+            self.uclamp["payload"] = None
+            self.set_min("payload", 0)
+            if self.evacuate():
+                self.clean = True
+        lp = self.last_pid_now()
+        new = False
+        if slow or lp != self.last_pid:
+            self.last_pid = lp
+            new = self.lists()
+        for pid, pr in list(self.pids.items()):
+            st = self.stat(pr)
+            if st is None or st[3] != pr.start:
+                self.forget(pid)
+                continue
+            pr.comm, pr.ppid, nice = st[0], st[1], st[2]
+            if slow or nice == TOP_NICE or pr.group == "top" or pr.adj is None:
+                pr.adj = self.adj(pr)
+            want = self.classify(nice, pr.adj)
+            if want != pr.group:
+                self.move(pid, pr, want)
+        top = {pid for pid, pr in self.pids.items() if pr.group == "top"}
+        fresh = top - self.top_prev
+        self.top_prev = top
+        if new:
+            self.fast(now, False)
+        if self.baseline:
+            self.baseline = False
+            return
+        kind = None
+        zyg = {pid for pid, pr in self.pids.items() if pr.comm in ZYGOTES}
+        for pid in fresh:
+            pr = self.pids[pid]
+            uid = self.uid(pr)
+            if pr.ppid not in zyg or uid is None or uid % 100000 in ISOLATED:
+                continue
+            k = "launch" if self.age(pr) < LAUNCH_AGE else "switch"
+            if kind != "launch":
+                kind = k
+        if kind:
+            log(f"window {kind}")
+            self.boost(kind, now)
+
+    def age(self, pr):
+        try:
+            up = float(self.read(f"{self.p.proc}/uptime").split()[0])
+        except (OSError, ValueError, IndexError):
+            return LAUNCH_AGE
+        return up - pr.start / CLK_TCK
+
+    def fast(self, now, extra):
+        self.fast_until = max(self.fast_until, now + FAST_FOR)
+        self.next_fast = min(self.next_fast, now + FAST) if self.next_fast > now else now + FAST
+        if extra:
+            self.extra = sorted(set(self.extra) | {now + x for x in EXTRA})
+
+    def caps(self, path, fd):
+        props = bytearray(4)
+        absbits = bytearray(8)
+        evbits = bytearray(4)
+        try:
+            fcntl.ioctl(fd, eviocg(0x09, len(props)), props)
+            fcntl.ioctl(fd, eviocg(0x20 + EV_ABS, len(absbits)), absbits)
+            fcntl.ioctl(fd, eviocg(0x20, len(evbits)), evbits)
+        except OSError:
+            return None
+        if bit(props, INPUT_PROP_DIRECT) and bit(absbits, ABS_MT_POSITION_X):
+            return "touch"
+        return "key" if bit(evbits, EV_KEY) else None
+
+    def rescan_input(self):
+        try:
+            names = sorted(n for n in os.listdir(self.p.input) if n.startswith("event"))
+        except OSError:
+            names = []
+        seen = set()
+        for n in names:
+            path = f"{self.p.input}/{n}"
+            try:
+                rdev = os.stat(path).st_rdev
+            except OSError:
+                continue
+            seen.add(path)
+            d = self.devices.get(path)
+            if d is not None and d.rdev == rdev:
+                continue
+            if d is not None:
+                self.close_dev(path)
+            if self.skipped.get(path) == rdev:
+                continue
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+            except OSError:
+                continue
+            kind = self.caps(path, fd)
+            if kind is None:
+                os.close(fd)
+                self.skipped[path] = rdev
+                continue
+            self.devices[path] = Dev(fd, kind, rdev)
+            log(f"{n}: {kind}")
+        for path in list(self.devices):
+            if path not in seen:
+                self.close_dev(path)
+        for path in list(self.skipped):
+            if path not in seen:
+                del self.skipped[path]
+
+    def close_dev(self, path):
+        d = self.devices.pop(path, None)
+        if d is not None:
+            os.close(d.fd)
+
+    def read_dev(self, path, now):
+        d = self.devices[path]
+        down = seen = False
+        while True:
+            try:
+                buf = os.read(d.fd, EVENT.size * 64)
+            except BlockingIOError:
+                break
+            except OSError:
+                self.close_dev(path)
+                break
+            if not buf:
+                self.close_dev(path)
+                break
+            seen = True
+            if d.kind != "touch":
+                continue
+            for i in range(len(buf) // EVENT.size):
+                _, _, t, c, v = EVENT.unpack_from(buf, i * EVENT.size)
+                if (t == EV_KEY and c == BTN_TOUCH and v == 1) or (t == EV_ABS and c == ABS_MT_TRACKING_ID and v >= 0):
+                    down = True
+        if not seen:
+            return
+        if d.kind != "touch":
+            self.fast(now, False)
+            d.park = now + PARK
+            return
+        if down:
+            self.fast(now, True)
+        touch = next((r for r in self.requests if r.kind == "touch" and r.until > now), None)
+        if touch is not None:
+            self.extend(touch, now + HOLD["touch"], now)
+        elif down:
+            touch = self.boost("touch", now)
+        if touch is not None and path in self.devices:
+            self.devices[path].park = now + PARK
+
+    def watch(self):
+        libc = ctypes.CDLL(None, use_errno=True)
+        self.libc = libc
+        fd = libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
+        if fd < 0:
+            log(f"inotify_init1: {os.strerror(ctypes.get_errno())}")
+            return
+        self.ino = fd
+        self.add_watch(self.p.input, IN_CREATE | IN_DELETE | IN_ATTRIB | IN_MOVED_TO, "input")
+        self.add_watch(os.path.dirname(self.p.store), IN_MOVED_TO | IN_CLOSE_WRITE | IN_DELETE, "store")
+
+    def add_watch(self, path, mask, what):
+        if self.ino is None or what in self.wds.values():
+            return
+        wd = self.libc.inotify_add_watch(self.ino, path.encode(), mask)
+        if wd >= 0:
+            self.wds[wd] = what
+
+    def read_ino(self, now):
+        try:
+            data = os.read(self.ino, 4096)
+        except BlockingIOError:
+            return
+        off = 0
+        kinds = set()
+        while off + 16 <= len(data):
+            wd, mask, _, n = struct.unpack_from("iIII", data, off)
+            kinds.add(self.wds.get(wd))
+            if mask & IN_Q_OVERFLOW:
+                kinds.update(("input", "store"))
+            off += 16 + n
+        if "input" in kinds:
+            self.rescan_input()
+        if "store" in kinds:
+            self.check_setting()
+            self.check_instance(now)
+
+    def fds(self, now):
+        out = []
+        if self.sig is not None:
+            out.append((self.sig, select.POLLIN))
+        if self.ino is not None:
+            out.append((self.ino, select.POLLIN))
+        if self.efd is not None:
+            out.append((self.efd, select.POLLPRI | select.POLLERR))
+        for d in self.devices.values():
+            if d.park <= now:
+                out.append((d.fd, select.POLLIN))
+        return out
+
+    def due(self, now):
+        t = [self.next_slow]
+        if self.ready and not self.frozen:
+            if self.fast_until > now:
+                t.append(self.next_fast)
+            t.extend(self.extra[:1])
+        t.extend(r.until for r in self.requests)
+        t.extend(d.park for d in self.devices.values() if d.park > now)
+        return min(t)
+
+    def wait(self, fds, timeout):
+        p = select.poll()
+        for fd, ev in fds:
+            p.register(fd, ev)
+        return p.poll(timeout * 1000)
+
+    def ready_fd(self, fd, ev, now):
+        if fd == self.sig:
+            try:
+                os.read(fd, 64)
+            except BlockingIOError:
+                pass
+            self.stopping = True
+        elif fd == self.ino:
+            self.read_ino(now)
+        elif fd == self.efd:
+            self.check_instance(now)
+        else:
+            for path, d in list(self.devices.items()):
+                if d.fd == fd:
+                    self.read_dev(path, now)
+                    break
+
+    def start(self):
+        self.check_setting()
+        self.uclamp = {"payload": None, "top": None, "fg": None}
+        self.mins_failed = not self.zero_mins()
+        if self.dirty:
+            self.restore("start")
+        self.watch()
+        self.rescan_input()
+
+    def step(self):
+        now = self.clock()
+        timeout = max(0.0, min(self.due(now), now + WAIT_MAX) - now)
+        for fd, ev in self.wait(self.fds(now), timeout):
+            self.ready_fd(fd, ev, self.clock())
+            if self.stopping:
+                return
+        now = self.clock()
+        if now >= self.next_slow:
+            self.next_slow = now + SLOW
+            self.next_fast = now + FAST
+            self.extra = [x for x in self.extra if x > now]
+            self.check_setting()
+            if self.ino is not None and "store" not in self.wds.values():
+                self.add_watch(os.path.dirname(self.p.store), IN_MOVED_TO | IN_CLOSE_WRITE | IN_DELETE, "store")
+            self.rescan_input()
+            if not self.check_instance(now):
+                self.scan(now, True)
+                if self.ready and not self.frozen:
+                    self.boot_check(now)
+            if self.dirty and self.lock_fd is None and not self.requests:
+                self.restore("retry")
+        elif self.ready and not self.frozen and ((self.fast_until > now and now >= self.next_fast)
+                                                 or (self.extra and now >= self.extra[0])):
+            self.next_fast = now + FAST
+            self.extra = [x for x in self.extra if x > now + 0.02]
+            self.check_instance(now)
+            self.scan(now, False)
+        if self.requests and not self.gate():
+            self.requests = []
+        self.apply(now)
+        if self.mins_failed and not self.ready:
+            self.mins_failed = not self.zero_mins()
+
+    def serve(self):
+        r, w = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+        self.sig = r
+        signal.set_wakeup_fd(w)
+        for s in (signal.SIGTERM, signal.SIGINT):
+            signal.signal(s, lambda *_: None)
+        self.start()
+        notify("READY=1")
+        log(f"{PERF_KEY} {self.perf}, {len(self.devices)} input nodes")
+        self.pinged = self.clock()
+        while not self.stopping:
+            self.step()
+            if self.clock() - self.pinged >= PING:
+                self.ping()
+        self.restore("stop")
+        for _ in range(STOP_TRIES):
+            if not self.mins_failed:
+                break
+            self.sleep(BUSY_WAIT)
+            self.mins_failed = not self.zero_mins()
+        if self.mins_failed or self.dirty:
+            log("stopping with writes left for blockie-android-sched-restore")
+        return 0
+
+
+def main(argv):
+    root = os.environ.get("BLOCKIE_SCHED_ROOT", "")
+    if argv[1:] == ["orig"]:
+        return write_orig(Paths(root))
+    if argv[1:]:
+        print(f"usage: {ME} [orig]", file=sys.stderr)
+        return 2
+    return Sched(root).serve()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

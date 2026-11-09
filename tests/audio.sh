@@ -101,7 +101,8 @@ done < <(cat /usr/lib/sysusers.d/*.conf 2> /dev/null || true)
 noalsa=(blockie-wifi.service blockie-regdom.service blockie-bt.service blockie-blobs.service blockie-boot-ok.service
   blockie-boot-state.service blockie-boot@.service blockie-boot-healthy.service blockie-session-ready.service
   blockie-data.service blockie-session-switch@.service blockie-session-appswitch@.service blockie-session-revive@.service blockie-session-switcher.service blockie-setd.service
-  blockie-android-prep.service blockie-android-freeze@.service blockie-android-music.service blockie-android-pad.service)
+  blockie-android-prep.service blockie-android-freeze@.service blockie-android-music.service blockie-android-pad.service
+  blockie-android-sched.service)
 
 clients=0
 for f in /usr/lib/systemd/system/*.service /etc/systemd/system/*.service; do

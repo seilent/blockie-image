@@ -8,6 +8,7 @@ ddr=/sys/class/devfreq/mtk-dvfsrc-devfreq/cur_freq
 big=/sys/devices/system/cpu/cpufreq/policy6/scaling_cur_freq
 zones=/sys/class/thermal
 wakelock=/sys/power
+lock=/run/blockie-perf.lock
 limit=50000
 period=0.2
 pid=
@@ -67,6 +68,9 @@ case ${1:-} in
     [[ $opp =~ ^[0-9]+$ ]] || { echo "$me: opp index must be a number" >&2; exit 2; }
     (( $# )) || { echo "$me: no command" >&2; exit 2; }
     find_zone || { echo "$me: no mtktscpu thermal zone" >&2; exit 2; }
+    [[ -e $lock ]] || (umask 077 && : >> "$lock")
+    exec 9>> "$lock" || { echo "$me: cannot open $lock" >&2; exit 2; }
+    flock -w 10 9 || { echo "$me: $lock is held, no pin" >&2; exit 6; }
     trap release EXIT
     trap 'stop 129' HUP
     trap 'stop 130' INT
@@ -75,7 +79,7 @@ case ${1:-} in
     echo "$opp" > "$fix"
     show > "$log"
     grep -q "fix OPP index: $opp\$" "$fix" || { echo "pin to $opp did not read back" >> "$log"; stop 3; }
-    "$@" &
+    "$@" 9>&- &
     pid=$!
     while kill -0 "$pid" 2> /dev/null; do
       sample >> "$log"

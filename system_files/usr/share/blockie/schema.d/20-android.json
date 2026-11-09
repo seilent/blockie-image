@@ -7,6 +7,13 @@
       "enum": ["mali", "soft"],
       "group": "android",
       "label": "Android GPU"
+    },
+    "android.perf": {
+      "type": "s",
+      "default": "policy",
+      "enum": ["policy", "off"],
+      "group": "android",
+      "label": "Android performance"
     }
   }
 }

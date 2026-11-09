@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+set -u
+
+me=blockie-android-sched-restore
+root=${BLOCKIE_SCHED_ROOT:-}
+state=$root/run/blockie-android-sched
+lock=$root/run/blockie-perf.lock
+payload=$root/sys/fs/cgroup/lxc.payload.waydroid
+cpufreq=$root/sys/devices/system/cpu/cpufreq
+wait=${BLOCKIE_SCHED_LOCK_WAIT:-2}
+declare -A path=([policy0]=$cpufreq/policy0/scaling_min_freq [policy6]=$cpufreq/policy6/scaling_min_freq
+  [gpu]=$root/sys/kernel/ged/hal/custom_boost_gpu_freq
+  [ddr]=$root/sys/devices/platform/10012000.dvfsrc/helio-dvfsrc/dvfsrc_req_ddr_opp)
+declare -A orig=([policy0]=500000 [policy6]=850000 [gpu]=29 [ddr]=255)
+
+for d in "$payload" "$payload/top" "$payload/fg"; do
+  [[ ! -e $d/cpu.uclamp.min ]] || echo 0 > "$d/cpu.uclamp.min" || echo "$me: cannot write $d/cpu.uclamp.min" >&2
+done
+
+knobs=()
+if [[ -r $state/dirty ]]; then
+  while read -r k || [[ -n $k ]]; do
+    [[ -n $k && -n ${path[$k]:-} ]] && knobs+=("$k")
+  done < "$state/dirty"
+fi
+(( ${#knobs[@]} )) || exit 0
+
+declare -A got=()
+good=1
+if [[ -r $state/orig ]]; then
+  while read -r k v extra || [[ -n $k ]]; do
+    if [[ -z $k || -z ${orig[$k]:-} || -n ${got[$k]:-} || -n $extra || ! $v =~ ^[0-9]+$ ]]; then
+      good=0
+      break
+    fi
+    got[$k]=$v
+  done < "$state/orig"
+else
+  good=0
+fi
+for k in policy0 policy6; do
+  [[ ${got[$k]:-0} =~ ^[0-9]+$ ]] && (( ${got[$k]:-0} >= 100000 && ${got[$k]:-0} <= 3000000 )) || good=0
+done
+[[ ${got[gpu]:-} == 29 && ${got[ddr]:-} == 255 ]] || good=0
+if (( good )); then
+  for k in "${!got[@]}"; do
+    orig[$k]=${got[$k]}
+  done
+else
+  echo "$me: $state/orig missing or bad, restoring to the built in values"
+fi
+
+[[ -e $lock ]] || (umask 077 && : >> "$lock")
+exec 9>> "$lock" || { echo "$me: cannot open $lock" >&2; exit 1; }
+if ! flock -w "$wait" 9; then
+  echo "$me: $lock still held after $wait s, left ${knobs[*]} as they are"
+  exit 0
+fi
+failed=()
+for k in "${knobs[@]}"; do
+  echo "${orig[$k]}" > "${path[$k]}" || { echo "$me: cannot write ${path[$k]}" >&2; failed+=("$k"); }
+done
+if (( ${#failed[@]} )); then
+  printf '%s\n' "${failed[@]}" > "$state/dirty.tmp"
+else
+  : > "$state/dirty.tmp"
+fi
+mv -f "$state/dirty.tmp" "$state/dirty" || { echo "$me: cannot rewrite $state/dirty" >&2; exit 1; }
+if (( ${#failed[@]} )); then
+  echo "$me: left ${failed[*]} in $state/dirty"
+  exit 1
+fi
+echo "$me: restored ${knobs[*]}"
+exit 0

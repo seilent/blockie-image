@@ -67,7 +67,7 @@ res $? "the installed gpufreq reads no path from the environment"
 gft=$top/blockie-gpufreq
 cp "$gpufreq" "$gft"
 bad=0
-for kv in 'fix=$T_DIR/fix' 'status=$T_DIR/status' 'ddr=$T_DIR/none' 'big=$T_DIR/none' 'zones=$T_DIR/thermal' 'wakelock=$T_DIR/power'; do
+for kv in 'fix=$T_DIR/fix' 'status=$T_DIR/status' 'ddr=$T_DIR/none' 'big=$T_DIR/none' 'zones=$T_DIR/thermal' 'wakelock=$T_DIR/power' 'lock=$T_DIR/perf.lock'; do
   k=${kv%%=*}
   [[ $(grep -c "^$k=" "$gft") == 1 ]] || bad=1
   sed -i "s|^$k=.*\$|$kv|" "$gft"
@@ -108,6 +108,19 @@ gf run 0 "$d/log" true
 rc=$?
 [[ $rc == 3 && $(cat "$d/fix") == -1 && $(cat "$d/power/wake_unlock") == blockie-gpu ]] && grep -q 'did not read back' "$d/log"
 res $? "a pin that does not read back releases and exits 3"
+[[ $(stat -c %a "$d/perf.lock") == 600 ]]
+res $? "the perf lock is created 0600"
+
+fake f
+exec 8>> "$d/perf.lock"
+flock 8
+sed -i 's/flock -w 10 9/flock -w 1 9/' "$gft"
+gf run 0 "$d/log" true
+rc=$?
+exec 8>&-
+sed -i 's/flock -w 1 9/flock -w 10 9/' "$gft"
+[[ $rc == 6 && $(cat "$d/fix") == '[GPUFREQ-DEBUG] fixed OPP index is disabled' && ! -s $d/power/wake_lock ]]
+res $? "a held perf lock is refused before any write"
 
 fake d
 gf unpin
