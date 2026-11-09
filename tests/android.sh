@@ -315,7 +315,8 @@ ln -sfn "$p/zoneinfo/Asia/Tokyo" "$p/localtime"
 prun
 [[ $rc == 0 && $st == ok && $(cat "$p/calls") == '--details-to-stdout init' ]] || { ok=1; echo "  first: rc $rc '$st' $(cat "$p/calls")"; }
 for kv in properties:persist.waydroid.width:960 properties:persist.waydroid.height:720 properties:persist.waydroid.uevent:false \
-  properties:persist.waydroid.suspend:false properties:persist.sys.timezone:Asia/Tokyo waydroid:suspend_action:freeze \
+  properties:persist.waydroid.suspend:false properties:ro.sf.lcd_density:240 properties:persist.sys.timezone:Asia/Tokyo \
+  waydroid:suspend_action:freeze \
   waydroid:mount_overlays:True; do
   IFS=: read -r sec key val <<< "$kv"
   [[ $(cfgget "$sec" "$key") == "$val" ]] || { ok=1; echo "  $sec $key: $(cfgget "$sec" "$key")"; }
@@ -542,10 +543,10 @@ grun
 [[ $(gcfg ro.hardware.egl) == mali ]] || { ok=1; echo "  re-mali before removal"; }
 echo '0 0' > "$g/armed"
 grun
-[[ $rc == 0 && $(gcfg ro.hardware.egl) == - && $(gcfg ro.sf.lcd_density) == - && $(gcfg ro.hardware.vulkan) == - ]] ||
+[[ $rc == 0 && $(gcfg ro.hardware.egl) == - && $(gcfg ro.sf.lcd_density) == 240 && $(gcfg ro.hardware.vulkan) == - ]] ||
   { ok=1; echo "  props not removed in soft"; }
 echo '1 0' > "$g/armed"
-res $ok "prep gpu: a switch to soft removes every hardware prop (egl, gralloc, vulkan, density) from waydroid.cfg"
+res $ok "prep gpu: a switch to soft removes the hardware props (egl, gralloc, vulkan) from waydroid.cfg and keeps the density"
 
 ok=0
 echo gpu-boot-six > "$g/bootid"

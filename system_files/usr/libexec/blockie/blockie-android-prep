@@ -43,16 +43,15 @@ PROPERTIES = {
     "persist.waydroid.height": "720",
     "persist.waydroid.uevent": "false",
     "persist.waydroid.suspend": "false",
+    "ro.sf.lcd_density": "240",
 }
 PINNED = {"suspend_action": "freeze", "mount_overlays": "True"}
 GPU_PROPS = {
     "ro.hardware.egl": "mali",
     "ro.hardware.gralloc": "mediatek",
     "ro.hardware.vulkan": "mt6768",
-    "ro.sf.lcd_density": "240",
 }
-GPU_KEYS = ("ro.hardware.egl", "ro.hardware.gralloc", "ro.hardware.vulkan", "ro.hardware.hwcomposer",
-            "ro.sf.lcd_density")
+GPU_KEYS = ("ro.hardware.egl", "ro.hardware.gralloc", "ro.hardware.vulkan", "ro.hardware.hwcomposer")
 
 
 def properties():
