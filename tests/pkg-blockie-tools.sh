@@ -6,8 +6,8 @@ shopt -s nullglob
 rpms=("$out"/blockie-tools-*.rpm)
 (( ${#rpms[@]} == 1 )) || { echo "pkg-blockie-tools: expected one blockie-tools RPM, found ${#rpms[@]}" >&2; exit 1; }
 [[ $(rpm -qp --qf '%{NAME} %{ARCH}' "${rpms[0]}") == "blockie-tools $(uname -m)" ]] || { echo "pkg-blockie-tools: name or arch" >&2; exit 1; }
-want=$(printf '%s\n' /usr/bin/abctl /usr/libexec/blockie/blockie-blobs /usr/libexec/blockie/blockie-boot-ok \
-  /usr/libexec/blockie/blockie-bt /usr/libexec/blockie/blockie-wifi \
+want=$(printf '%s\n' /usr/bin/abctl /usr/bin/blockie-bootctl /usr/libexec/blockie/blockie-blobs \
+  /usr/libexec/blockie/blockie-boot-ok /usr/libexec/blockie/blockie-bt /usr/libexec/blockie/blockie-wifi \
   /usr/share/blockie /usr/share/blockie/blobs.d)
 [[ $(rpm -qpl "${rpms[0]}" | sort) == "$want" ]] || { echo "pkg-blockie-tools: file list" >&2; exit 1; }
 for r in blk-wmt blk-bt kmod util-linux-core; do

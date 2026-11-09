@@ -43,6 +43,11 @@ activating | active | deactivating | reloading)
     exit 0
     ;;
 esac
+if [ -n "$(timeout 2 systemctl --user list-units --plain --no-legend --state=activating,active,deactivating,reloading \
+    'blockie-reboot@*' 2> /dev/null)" ]; then
+    echo "refused reboot"
+    exit 0
+fi
 inh=$(timeout 1 busctl get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager \
     BlockInhibited 2> /dev/null)
 inh=${inh#s \"}

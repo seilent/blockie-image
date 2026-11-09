@@ -1,0 +1,8 @@
+[Unit]
+Description=Write the %i boot target and reboot
+CollectMode=inactive-or-failed
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/blockie-bootctl boot %i
+TimeoutStartSec=15s

@@ -205,7 +205,7 @@ jobs:
             esac
             return "$rc"
           }
-          for t in image units blobs audio wifi bt boot-ok data session hotkeyd power game game-cmd android; do
+          for t in image units blobs audio wifi bt boot-ok bootctl data session hotkeyd power game game-cmd android; do
             suite podman run --rm -v "$PWD/tests:/tests:ro" -v "$PWD/boot:/repo-boot:ro" "$IMAGE:$TAG" "/tests/$t.sh"
           done
           t=android-polkit
@@ -215,6 +215,8 @@ jobs:
           suite env SETD_RULES="$PWD/system_files/usr/share/polkit-1/rules.d/50-blockie-timezone.rules" tests/setd.sh polkit
           t=session-polkit
           suite env SESSION_RULES="$PWD/system_files/usr/share/polkit-1/rules.d/50-blockie-session.rules" tests/session.sh polkit
+          t=bootctl-polkit
+          suite env BOOT_RULES="$PWD/system_files/usr/share/polkit-1/rules.d/50-blockie-boot.rules" tests/bootctl.sh polkit
           t=setd
           suite podman run --rm -v "$PWD/tests:/tests:ro" "$IMAGE:$TAG" \
             bash -c 'dnf -y -q install dbus-daemon > /dev/null && /tests/setd.sh'

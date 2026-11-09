@@ -1,0 +1,8 @@
+[Unit]
+Description=Quit the game and reboot to %i
+Conflicts=blockie-poweroff.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/blockie/blockie-poweroff --reboot %i
+TimeoutStartSec=45s

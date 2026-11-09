@@ -1,0 +1,14 @@
+[Unit]
+Description=Write the Blockie boot gates
+DefaultDependencies=no
+After=local-fs.target
+Before=sysinit.target
+ConditionPathIsDirectory=/run/blockie
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/blockie-bootctl gates
+
+[Install]
+WantedBy=sysinit.target

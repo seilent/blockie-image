@@ -1,0 +1,319 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+me=blockie-bootctl
+run=${BLOCKIE_RUN:-/run/blockie}
+dir=$run/boot
+gate=$dir/state
+statedir=${BLOCKIE_BOOT_STATE:-/var/lib/blockie/boot}
+etc=${BLOCKIE_ETC:-/blockie/etc}
+sys=${BLOCKIE_SYSFS:-/sys}
+dev=${BLOCKIE_DEV:-/dev}
+abctl=${BLOCKIE_ABCTL:-/usr/bin/abctl}
+bootid=${BLOCKIE_BOOT_ID:-/proc/sys/kernel/random/boot_id}
+wait=${BLOCKIE_BOOT_LOCK_WAIT:-20}
+bwait=${BLOCKIE_BOOT_LOCK_WAIT:-5}
+
+die() { echo "$me: $*" >&2; exit 1; }
+
+usage() {
+  echo "usage: $me status | gates | healthy | android | recovery | test-b | fastboot | boot reboot|android|recovery|fastboot" >&2
+  exit 2
+}
+
+misc() {
+  local d p
+  read -r d < "$run/emmc" 2> /dev/null || return 1
+  [[ $d =~ ^mmcblk[0-9]+$ ]] || return 1
+  for p in "$sys/block/$d/$d"p*; do
+    if grep -qx PARTNAME=misc "$p/uevent" 2> /dev/null; then
+      echo "$dev/${p##*/}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+slotof() { sed -n "s/^slot $1 priority \([0-9]*\) tries \([0-9]*\) successful \([0-9]*\) .*/\1 \2 \3/p" <<< "$2"; }
+
+look() {
+  local out=""
+  class=unreadable suffix="" reason="" ap="" at="" as="" bp="" bt="" bs=""
+  m=$(misc) || return 0
+  out=$("$abctl" -d "$m" show 2> /dev/null) || true
+  class=$(sed -n 's/^class //p' <<< "$out")
+  [[ -n $class ]] || { class=unreadable; return 0; }
+  suffix=$(sed -n 's/^suffix //p' <<< "$out")
+  reason=$(sed -n 's/^message reason //p' <<< "$out")
+  read -r ap at as <<< "$(slotof a "$out")" || true
+  read -r bp bt bs <<< "$(slotof b "$out")" || true
+}
+
+up() { (( $1 > 0 && ($2 > 0 || $3 == 1) )); }
+
+android_gate() {
+  aw=""
+  if [[ $class != ours ]]; then
+    aw="misc $class"
+  elif ! up "$bp" "$bt" "$bs"; then
+    aw="slot b unbootable"
+  elif (( bs != 1 )); then
+    aw="slot b untested"
+  elif ! up "$ap" "$at" "$as" || (( at == 0 )); then
+    aw="slot a has no tries left"
+  fi
+}
+
+base() {
+  if [[ -e $etc/recovery ]]; then
+    sha256sum < "$etc/recovery" | cut -d' ' -f1
+  else
+    echo none
+  fi
+}
+
+recovery_gate() {
+  rec=no
+  [[ ! -e $etc/recovery ]] || rec=yes
+  ! grep -qsx recovery=no "$statedir/recovery.state" || ! grep -qsx "base=$(base)" "$statedir/recovery.state" || rec=no
+}
+
+armof() {
+  case $class in
+    reset) echo default; return 0 ;;
+    ours) ;;
+    *) echo other; return 0 ;;
+  esac
+  case $bp in
+    12 | 13) echo default ;;
+    14) echo test ;;
+    *) echo other ;;
+  esac
+}
+
+put() {
+  local f=$1 t
+  shift
+  t=$(mktemp "$f.XXXXXX")
+  printf '%s\n' "$@" > "$t"
+  chmod 0644 "$t"
+  mv -fT "$t" "$f"
+}
+
+keep() {
+  local f=$1 t
+  shift
+  install -d -m 0755 "$statedir"
+  t=$(mktemp "$f.XXXXXX")
+  "$@" > "$t"
+  chmod 0644 "$t"
+  sync "$t"
+  mv -fT "$t" "$f"
+  sync -f "$f"
+}
+
+gates() {
+  local st=$1 why=${2:-} arm lines=()
+  arm=$(sed -n 's/^arm=//p' "$gate" 2> /dev/null | head -n 1 || true)
+  look
+  [[ -n $arm ]] || arm=$(armof)
+  android_gate
+  recovery_gate
+  lines=("state=$st" "arm=$arm")
+  if [[ -n $aw ]]; then
+    lines+=(android=unavailable)
+  else
+    lines+=(android=bootable)
+  fi
+  if [[ $st == default && -n $aw ]]; then
+    lines+=("reason=$aw")
+  elif [[ -n $why ]]; then
+    lines+=("reason=$why")
+  fi
+  if [[ -e $etc/return ]]; then lines+=(return=keys); else lines+=(return=host); fi
+  lines+=("recovery=$rec")
+  if [[ -e $etc/fastboot ]]; then lines+=(fastboot=yes); else lines+=(fastboot=no); fi
+  put "$gate" "${lines[@]}"
+}
+
+current() { sed -n 's/^state=//p' "$gate" 2> /dev/null | head -n 1 || true; }
+
+lock() {
+  install -d -m 0755 "$dir"
+  umask 077
+  exec 9>> "$dir/lock"
+  flock -w "${2:-$wait}" 9 || die "$1 refused: the boot lock is busy"
+}
+
+ab() { "$abctl" -d "$m" "$@"; }
+
+write() {
+  local verb=$1 rc=0
+  shift
+  : > "$dir/$verb"
+  ab "$@" || rc=$?
+  (( rc )) || return 0
+  rm -f "$dir/$verb"
+  (( rc == 1 )) || gates error "$1 failed"
+  die "$verb: abctl $1 exited $rc"
+}
+
+need_default() {
+  local st
+  st=$(current)
+  [[ $st == default ]] || die "$1 refused: state=${st:-none}"
+}
+
+do_android() {
+  need_default android
+  look
+  android_gate
+  [[ -z $aw ]] || die "android refused: $aw"
+  write android hold-b
+  gates android
+  echo "$me: android: hold-b written, Android boots next"
+}
+
+do_recovery() {
+  need_default recovery
+  recovery_gate
+  [[ $rec == yes ]] || die "recovery refused: not proven on this base"
+  look
+  [[ $class == ours ]] || die "recovery refused: misc $class"
+  write recovery bcb-recovery menu
+  gates recovery
+  echo "$me: recovery: bcb-recovery menu written, the recovery boots next"
+}
+
+do_testb() {
+  need_default test-b
+  look
+  [[ $class == ours ]] || die "test-b refused: misc $class"
+  write test-b test-b
+  gates pending "test b"
+  echo "$me: test-b: slot b armed for one boot"
+}
+
+do_fastboot() {
+  [[ -e $etc/fastboot ]] || die "fastboot refused: not proven on this base"
+  systemctl reboot bootloader || die "fastboot: systemctl reboot bootloader failed"
+}
+
+undo() {
+  local ok=1
+  look
+  if [[ $1 == recovery || -n $reason ]]; then
+    ab bcb-clear || ok=0
+  fi
+  [[ $1 != android ]] || ab default-a || ok=0
+  rm -f "$dir/$1"
+  if (( ok )); then
+    gates default
+    die "$1: the reboot call failed, the write is undone"
+  fi
+  gates error "undo failed"
+  die "$1: the reboot call failed and so did the undo"
+}
+
+healthy() {
+  local x why="" r
+  [[ -e $run/product ]] || die "healthy refused: not a product boot"
+  lock healthy
+  for x in android recovery test-b; do
+    if [[ -e $dir/$x ]]; then
+      echo "$me: healthy: the $x marker is set, nothing written"
+      return 0
+    fi
+  done
+  if [[ -e $dir/healthy ]]; then
+    echo "$me: healthy already ran in this boot"
+    return 0
+  fi
+  look
+  case $class in
+    ours)
+      case $bp in
+        12 | 13) ;;
+        14)
+          gates pending "test arm"
+          echo "$me: healthy: a test arm (slot b priority 14), no re-arm"
+          return 0
+          ;;
+        *)
+          gates error "slot b priority $bp"
+          die "healthy: slot b reads priority $bp, not a default arm: nothing written"
+          ;;
+      esac
+      ;;
+    reset) why=reset ;;
+    *)
+      gates error "misc $class"
+      die "healthy: misc reads $class: nothing written"
+      ;;
+  esac
+  if [[ $class == reset || $suffix != _a || $ap/$at/$as/$bp/$bt/$bs != 15/3/0/13/1/1 ]]; then
+    write healthy default-a
+  fi
+  r=$reason
+  if [[ -n $r ]]; then
+    if [[ $r == menu ]]; then
+      keep "$statedir/recovery.state" printf '%s\n' recovery=no "base=$(base)" "boot=$(cat "$bootid")"
+    fi
+    write healthy bcb-clear
+  fi
+  : > "$dir/healthy"
+  cmp -s <(head -c 4096 "$m") "$statedir/misc.last" 2> /dev/null || keep "$statedir/misc.last" head -c 4096 "$m"
+  gates default "$why"
+  echo "$me: healthy: slot a re-armed${why:+ ($why)}${r:+, the $r bcb cleared}"
+}
+
+boot() {
+  case ${1:-} in
+    reboot)
+      lock reboot "$bwait"
+      systemctl reboot || die "reboot: systemctl reboot failed"
+      ;;
+    android | recovery)
+      lock "$1" "$bwait"
+      "do_$1"
+      systemctl reboot || undo "$1"
+      ;;
+    fastboot)
+      lock fastboot "$bwait"
+      do_fastboot
+      ;;
+    *) usage ;;
+  esac
+}
+
+status() {
+  if [[ -f $gate ]]; then
+    cat "$gate"
+  else
+    echo "no gate file"
+  fi
+  if m=$(misc); then
+    echo "misc $m"
+    "$abctl" -d "$m" show || true
+  else
+    echo "misc not found"
+  fi
+}
+
+case ${1:-} in
+  status) (( $# == 1 )) || usage; status ;;
+  gates)
+    (( $# == 1 )) || usage
+    lock gates
+    if [[ ! -f $gate ]]; then
+      if [[ -e $run/product ]]; then gates pending; else gates pending "not a product boot"; fi
+    fi
+    ;;
+  healthy) (( $# == 1 )) || usage; healthy ;;
+  android) (( $# == 1 )) || usage; lock android; do_android ;;
+  recovery) (( $# == 1 )) || usage; lock recovery; do_recovery ;;
+  test-b) (( $# == 1 )) || usage; lock test-b; do_testb ;;
+  fastboot) (( $# == 1 )) || usage; lock fastboot; do_fastboot ;;
+  boot) (( $# == 2 )) || usage; boot "$2" ;;
+  *) usage ;;
+esac

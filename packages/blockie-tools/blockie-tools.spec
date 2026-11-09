@@ -23,7 +23,8 @@ blockie-wifi loads the MT6768 Wi-Fi modules, runs blk-wmt and waits for wlan0.
 blockie-bt loads the MT6768 Bluetooth module and waits for /dev/stpbt.
 blockie-boot-ok confirms the booted deployment; blockie-blobs checks the pinned blobs
 and links them for the GPU. abctl reads and writes the slot table and the bootloader
-message in misc.
+message in misc; blockie-bootctl re-arms slot a at the healthy point and writes the
+reboot targets and their gates.
 
 %prep
 %setup -q -c -n blockie-tools
@@ -51,6 +52,7 @@ install -Dm0755 files/usr/libexec/blockie/blockie-bt %{buildroot}%{_libexecdir}/
 install -Dm0755 files/usr/libexec/blockie/blockie-boot-ok %{buildroot}%{_libexecdir}/blockie/blockie-boot-ok
 install -Dm0755 files/usr/libexec/blockie/blockie-blobs %{buildroot}%{_libexecdir}/blockie/blockie-blobs
 install -Dm0755 abctl %{buildroot}%{_bindir}/abctl
+install -Dm0755 files/usr/bin/blockie-bootctl %{buildroot}%{_bindir}/blockie-bootctl
 install -dm0755 %{buildroot}%{_datadir}/blockie/blobs.d
 
 %files
@@ -59,5 +61,6 @@ install -dm0755 %{buildroot}%{_datadir}/blockie/blobs.d
 %{_libexecdir}/blockie/blockie-boot-ok
 %{_libexecdir}/blockie/blockie-blobs
 %{_bindir}/abctl
+%{_bindir}/blockie-bootctl
 %dir %{_datadir}/blockie
 %dir %{_datadir}/blockie/blobs.d

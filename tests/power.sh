@@ -53,6 +53,13 @@ case "\$*" in
   is-system-running) cat "$s/sysrun" 2> /dev/null || echo running ;;
   '--user show -P ActiveState blockie-poweroff.service') cat "$s/po.state" 2> /dev/null || echo inactive ;;
   '--user show -P FreezerState blockie-emulation.slice') cat "$s/slice" 2> /dev/null || echo running ;;
+  'start blockie-boot@'*)
+    echo "systemctl \$*" >> "$t/log"
+    exit \$(cat "$s/boot.rc" 2> /dev/null || echo 0)
+    ;;
+  '--user list-units --plain --no-legend --state=activating,active,deactivating,reloading blockie-reboot@*')
+    cat "$s/rb.units" 2> /dev/null
+    ;;
   *) echo "systemctl \$*" >> "$t/log" ;;
 esac
 EOF
@@ -108,7 +115,8 @@ state() {
 }
 run() {
   local t0=${EPOCHREALTIME//[!0-9]/}
-  BLOCKIE_SYSFS=$t/sys BLOCKIE_SLEEP_KNOB=$t/knob XDG_RUNTIME_DIR=$t/run PATH=$t/bin:$PATH timeout -k 2 20 "$@" > "$t/out" 2> "$t/err"
+  BLOCKIE_SYSFS=$t/sys BLOCKIE_SLEEP_KNOB=$t/knob XDG_RUNTIME_DIR=$t/run BLOCKIE_BOOT_GATES=$s/gates PATH=$t/bin:$PATH \
+    timeout -k 2 20 "$@" > "$t/out" 2> "$t/err"
   rc=$?
   ms=$(((${EPOCHREALTIME//[!0-9]/} - t0) / 1000))
   touch "$t/log"
@@ -396,6 +404,81 @@ read -r -t 1 line <&4
 [[ $rc == 0 && $line == QUIT ]] && logis $'wlopm --on *\n'"$cont_line"$'\n'"$bl102"$'\nsync\n'"$off_line" &&
   grep -q 'wlopm --on failed' "$t/err" && ((ms >= 7000 && ms < 15000))
 res $? "blockie-poweroff with a hanging wlopm and a game that never ends: PowerOff still called inside 15 s ($ms ms)"
+
+open_gates() { printf '%s\n' state=default arm=default android=bootable return=host recovery=yes fastboot=yes > "$s/gates"; }
+ok=0
+for x in reboot android recovery fastboot; do
+  dark 1 stopped
+  open_gates
+  run "$off" --reboot "$x"
+  line=
+  read -r -t 1 line <&4
+  [[ $rc == 0 && $line == QUIT ]] &&
+    logis $'wlopm --on *\n'"$cont_line"$'\n'"$bl102"$'\nsync\n'"systemctl start blockie-boot@$x.service" || { ok=1; echo "  $x: rc $rc line '$line'"; }
+done
+res $ok "blockie-poweroff --reboot <t>: the power off sequence, then systemctl start blockie-boot@<t>.service in place of PowerOff"
+
+dark 0 running
+open_gates
+echo 1 > "$s/boot.rc"
+run "$off" --reboot android
+[[ $rc == 1 ]] && logis $'wlopm --on *\n'"$cont_line"$'\n'"$bl102"$'\nsync\nsystemctl start blockie-boot@android.service' &&
+  grep -q 'start of blockie-boot@android.service failed (rc 1)' "$t/err"
+r1=$?
+dark 0 running
+open_gates
+echo 1 > "$s/boot.rc"
+echo stopping > "$s/sysrun"
+run "$off" --reboot android
+[[ $rc == 0 ]] && grep -q 'exited 1 while the system stops' "$t/err"
+res $((r1 || $?)) "blockie-poweroff --reboot: a failed blockie-boot@ start exits 1, or 0 while is-system-running prints stopping"
+
+ok=0
+for a in '--reboot' '--reboot test-b' '--reboot android x' '--now' '--reboot ../x'; do
+  dark 1 stopped
+  read -ra args <<< "$a"
+  run "$off" "${args[@]}"
+  line=
+  read -r -t 0.3 line <&4
+  [[ $rc == 2 && -z $line && ! -s $t/log ]] && stopped || { ok=1; echo "  '$a': rc $rc"; }
+done
+res $ok "blockie-poweroff takes only --reboot reboot, android, recovery or fastboot, and refuses anything else before any step"
+
+ok=0
+pay=$t/payload
+mkdir -p "$pay"
+gcase() {
+  dark 1 stopped
+  [[ $1 == - ]] || printf '%s\n' "${@:3}" > "$s/gates"
+  line=
+  BLOCKIE_ANDROID_PAYLOAD=$pay run "$off" --reboot "$2"
+  read -r -t 0.3 line <&4
+  [[ $rc == 1 && -z $line && ! -s $t/log ]] && stopped || { ok=1; echo "  $2 $1: rc $rc line '$line' $(tr '\n' '|' < "$t/log")"; }
+}
+gcase - android
+grep -qx 'blockie-poweroff: android refused: no gate file' "$t/err" || { ok=1; echo "  no gate file: $(< "$t/err")"; }
+gcase pending android state=pending arm=test android=unavailable 'reason=test arm' recovery=yes fastboot=no
+grep -qx 'blockie-poweroff: android refused: state=pending (test arm)' "$t/err" || { ok=1; echo "  pending: $(< "$t/err")"; }
+gcase noandroid android state=default arm=default android=unavailable 'reason=slot b unbootable' recovery=yes fastboot=no
+grep -qx 'blockie-poweroff: android refused: android=unavailable (slot b unbootable)' "$t/err" || ok=1
+gcase norecovery recovery state=default arm=default android=bootable recovery=no fastboot=no
+grep -qx 'blockie-poweroff: recovery refused: recovery=no' "$t/err" || ok=1
+gcase recpending recovery state=android arm=default android=bootable recovery=yes fastboot=yes
+grep -qx 'blockie-poweroff: recovery refused: state=android' "$t/err" || ok=1
+gcase nofastboot fastboot state=default arm=default android=bootable recovery=yes fastboot=no
+grep -qx 'blockie-poweroff: fastboot refused: fastboot=no' "$t/err" || ok=1
+dark 1 stopped
+printf '%s\n' state=pending arm=other android=unavailable recovery=no fastboot=no > "$s/gates"
+run "$off" --reboot reboot
+line=
+read -r -t 1 line <&4
+[[ $rc == 0 && $line == QUIT ]] && grep -qx 'systemctl start blockie-boot@reboot.service' "$t/log" || { ok=1; echo "  reboot: rc $rc"; }
+dark 1 stopped
+rm -f "$s/gates"
+run "$off" --reboot reboot
+read -r -t 1 line <&4
+[[ $rc == 0 ]] && grep -qx 'systemctl start blockie-boot@reboot.service' "$t/log" || { ok=1; echo "  reboot without gates: rc $rc"; }
+res $ok "blockie-poweroff --reboot reads the gate file first: a closed target exits 1 with the reason, game stopped and Android untouched; reboot has no gate"
 exec 4>&-
 
 P=$t/sys/power
@@ -528,6 +611,10 @@ echo activating > "$s/po.state"
 run "$sl" first
 [[ $(< "$t/out") == "refused poweroff" ]] && untouched || { ok=1; echo "  poweroff: $(< "$t/out")"; }
 sfix
+echo 'blockie-reboot@android.service loaded activating start Quit the game and reboot to android' > "$s/rb.units"
+run "$sl" first
+[[ $(< "$t/out") == "refused reboot" ]] && untouched || { ok=1; echo "  reboot: $(< "$t/out")"; }
+sfix
 echo handle-power-key:sleep > "$s/inhibit"
 run "$sl" first
 [[ $(< "$t/out") == "refused inhibited" ]] && untouched || { ok=1; echo "  inhibited: $(< "$t/out")"; }
@@ -535,7 +622,7 @@ sfix
 echo shutdown > "$s/inhibit"
 run "$sl"
 [[ $(< "$t/out") == "slept power 10.250000000" ]] || { ok=1; echo "  shutdown inhibitor: $(< "$t/out")"; }
-res $ok "blockie-sleep refuses while stopping, under the deadman, during blockie-poweroff and under a sleep block inhibitor, with no sync and no mem write"
+res $ok "blockie-sleep refuses while stopping, under the deadman, during blockie-poweroff or a blockie-reboot@ unit and under a sleep block inhibitor, with no sync and no mem write"
 
 sfix
 rm -f "$P/wakeup_count"

@@ -1,6 +1,34 @@
 #!/bin/sh
 set -u
 me=blockie-poweroff
+target=
+case $#:${1:-}:${2:-} in
+0::) ;;
+2:--reboot:reboot | 2:--reboot:android | 2:--reboot:recovery | 2:--reboot:fastboot) target=$2 ;;
+*)
+    echo "usage: $me [--reboot reboot|android|recovery|fastboot]" >&2
+    exit 2
+    ;;
+esac
+gates=${BLOCKIE_BOOT_GATES:-/run/blockie/boot/state}
+gate() { sed -n "s/^$1=//p" "$gates" 2> /dev/null | head -n 1; }
+closed() {
+    [ -r "$gates" ] || { echo "no gate file"; return 0; }
+    case $1 in
+    android | recovery) [ "$(gate state)" = default ] || { echo "state=$(gate state)"; return 0; } ;;
+    esac
+    case $1 in
+    android) [ "$(gate android)" = bootable ] || { echo "android=$(gate android)"; return 0; } ;;
+    recovery) [ "$(gate recovery)" = yes ] || { echo "recovery=$(gate recovery)"; return 0; } ;;
+    fastboot) [ "$(gate fastboot)" = yes ] || { echo "fastboot=$(gate fastboot)"; return 0; } ;;
+    esac
+    return 1
+}
+if [ -n "$target" ] && [ "$target" != reboot ] && why=$(closed "$target"); then
+    r=$(gate reason)
+    echo "$me: $target refused: $why${r:+ ($r)}" >&2
+    exit 1
+fi
 scope=blockie-game.scope
 cur=
 led=${BLOCKIE_SYSFS:-/sys}/class/leds/lcd-backlight
@@ -41,4 +69,14 @@ if [ -e "${BLOCKIE_ANDROID_PAYLOAD:-/sys/fs/cgroup/lxc.payload.waydroid}" ]; the
 fi
 sync
 echo "$me: sync done" >&2
+if [ -n "$target" ]; then
+    systemctl start "blockie-boot@$target.service" && exit 0
+    rc=$?
+    if [ "$(systemctl is-system-running)" = stopping ]; then
+        echo "$me: start of blockie-boot@$target.service exited $rc while the system stops" >&2
+        exit 0
+    fi
+    echo "$me: start of blockie-boot@$target.service failed (rc $rc)" >&2
+    exit 1
+fi
 exec busctl call org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager PowerOff b false
