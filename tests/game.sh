@@ -446,6 +446,23 @@ play ps1 "$rom" --theme light
 rm -rf "${share:?}/rgui"
 res $ok "theme: the run append file names rgui/<theme>.cfg only when it exists, dark without --theme"
 
+placed() {
+  play ps1 "$rom" "$@"
+  [[ $rc == 0 && $(cat "$FAKE/retroarch.argv") == *" -L /usr/lib64/libretro/snes9x_libretro.so $rom" ]] &&
+    appended 'rewind_enable = "true"' "rgui_menu_theme_preset = \"$share/rgui/light.cfg\""
+}
+mkdir "$share/rgui"
+printf 'invented preset\n' > "$share/rgui/light.cfg"
+printf 'rewind_enable = "true"\n' > "$t/game.cfg"
+ok=0
+placed --theme light --core snes9x --config "$t/game.cfg" || { ok=1; echo "  --theme first: rc $rc"; }
+placed --core snes9x --theme light --config "$t/game.cfg" || { ok=1; echo "  --theme between: rc $rc"; }
+placed --core snes9x --config "$t/game.cfg" --theme light || { ok=1; echo "  --theme last: rc $rc"; }
+refused ps1 "$rom" --theme light --core snes9x --theme light || ok=1
+refused --theme light ps1 "$rom" || ok=1
+rm -rf "${share:?}/rgui"
+res $ok "theme: --theme before, between or after --core and --config takes effect, a second one or one before the positionals exits 64"
+
 mv /usr/lib64/libretro/mgba_libretro.so "$t/mgba.so"
 play gba "$rom"
 [[ $rc == 69 ]] && ! ran
