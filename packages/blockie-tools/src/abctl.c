@@ -163,6 +163,16 @@ static int refreshes(const uint8_t* msg)
     return -1;
 }
 
+static void print_escaped(const uint8_t* s, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        if (s[i] < 0x20 || s[i] > 0x7e || s[i] == '"' || s[i] == '\\')
+            printf("\\x%02x", s[i]);
+        else
+            putchar(s[i]);
+    }
+}
+
 static void print_msg(const uint8_t* msg)
 {
     int n;
@@ -173,9 +183,14 @@ static void print_msg(const uint8_t* msg)
         printf("message zero\n");
         return;
     }
-    printf("message command \"%.*s\"\n", (int)strnlen((const char*)msg, 32), (const char*)msg);
-    if ((i = reason_len(msg)))
-        printf("message reason %.*s\n", (int)i, (const char*)msg + RECOVERY_OFF + strlen(OURS));
+    printf("message command \"");
+    print_escaped(msg, strnlen((const char*)msg, 32));
+    printf("\"\n");
+    if ((i = reason_len(msg))) {
+        printf("message reason ");
+        print_escaped(msg + RECOVERY_OFF + strlen(OURS), i);
+        printf("\n");
+    }
     if ((n = refreshes(msg)) > 0)
         printf("message refresh %d\n", n);
 }
@@ -230,6 +245,7 @@ static int show(long off)
         print_msg(buf);
     }
     close(fd);
+    printf("bproof 1\n");
     return valid(bc) ? 0 : 1;
 }
 

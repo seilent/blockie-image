@@ -133,6 +133,7 @@ def main():
         print(out, end="")
         check(rc == 0 and "crc32" in out and " ok" in out.split("crc32")[1].splitlines()[0], f"{f}: show exit 0, crc ok")
         check(slots(out) == lines, f"{f}: decodes to {lines}")
+        check(out.splitlines()[-1] == "bproof 1", f"{f}: show -o 0 ends with bproof 1")
 
     os.makedirs(a.tmp, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=a.tmp) as d:
@@ -196,7 +197,8 @@ def main():
         bad[0x81c] ^= 1
         open(m, "wb").write(bad)
         rc, out, err = abctl("-d", m, "show")
-        check(rc == 1 and "bad" in out.split("crc32")[1].splitlines()[0], "show on bad crc: exit 1, crc bad")
+        check(rc == 1 and "bad" in out.split("crc32")[1].splitlines()[0] and out.splitlines()[-1] == "bproof 1",
+              "show on bad crc: exit 1, crc bad, bproof 1 last")
         rc, out, err = abctl("-d", m, "arm-a")
         check(rc == 1 and cur() == bytes(bad), "arm-a refused on bad crc, file unchanged")
         rc, out, err = abctl("-d", m, "clear-msg")
@@ -502,8 +504,35 @@ def main():
             msg_is(bcb(b"boot-recovery", b"blockie-attempt=3", ours), f"bcb-attempt on a {what} status writes =3")
         put_msg(bcb(b"boot-recovery", b"", ours))
         rc, out, err = abctl("-d", m, "show")
-        check(rc == 0 and out.splitlines()[-2:] == ['message command "boot-recovery"', "message reason menu"],
-              "show of our menu command: the command line, then 'message reason menu'")
+        check(rc == 0 and out.splitlines()[-3:] == ['message command "boot-recovery"', "message reason menu",
+                                                    "bproof 1"],
+              "show of our menu command: the command line, then 'message reason menu', then 'bproof 1'")
+        head = ("suffix _a\nmagic 0x42414342 ok\nversion 1\nnb_slot 2\nrecovery_tries 0\nmerge_status 0\n"
+                f"crc32 0x{zlib.crc32(D[:28]):08x} ok\n{slot('a', 15, 3, 0)}\n{slot('b', 13, 1, 1)}\nclass ours\n")
+        open(m, "wb").write(bytes(0x800) + D + orig[0x820:])
+        rc, out, err = abctl("-d", m, "show")
+        check(rc == 0 and out == head + "message zero\nbproof 1\n",
+              "show on a zero message: the lines of abctl 1edfdc8 byte for byte, then bproof 1 last")
+        for args, old, what in (((b"boot-recovery", b"blockie-attempt=2", ours),
+                                 'message command "boot-recovery"\nmessage reason menu\n', "our menu command"),
+                                ((b"bootonce-bootloader",), 'message command "bootonce-bootloader"\n',
+                                 "a foreign command")):
+            for ref, new in ((b"", ""), (b"blockie-refresh=3", "message refresh 3\n")):
+                put_msg(bcb(*args, refresh=ref))
+                rc, out, err = abctl("-d", m, "show")
+                check(rc == 0 and out == head + old + new + "bproof 1\n",
+                      f"show on {what}{' with a refresh counter' if ref else ''}: the lines of abctl 1edfdc8 byte for "
+                      f"byte, then {new.strip() + ', then ' if new else ''}bproof 1 last")
+        for cmd, shown, what in ((b"x\nbproof 1\n", "x\\x0abproof 1\\x0a", "a newline"), (b'a"b', "a\\x22b", "a quote"),
+                                 (b"a\\b", "a\\x5cb", "a backslash"), (b"\xff\x7f\x01\t~ ", "\\xff\\x7f\\x01\\x09~ ",
+                                 "a high byte, DEL, a control byte, a tab")):
+            put_msg(bcb(cmd, b"", ours))
+            rc, out, err = abctl("-d", m, "show")
+            lines = out.splitlines()
+            check(rc == 0 and out == head + f'message command "{shown}"\nbproof 1\n' and
+                  len([x for x in lines if x.startswith("bproof")]) == 1,
+                  f"show on a command holding {what}: one message command line with \\xNN, bproof 1 the only and last "
+                  f"bproof line: {lines[10:]}")
         for sec, why, what in ((bcb(b"boot-recovery", b"blockie-attempt=2", ours), "menu", "our command with a count"),
                                (bcb(b"boot-recovery", b"", b"recovery\n--blockie=" + b"x" * 32), "x" * 32,
                                 "a 32 character reason"),
