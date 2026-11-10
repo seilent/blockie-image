@@ -38,11 +38,12 @@ slotof() { sed -n "s/^slot $1 priority \([0-9]*\) tries \([0-9]*\) successful \(
 
 look() {
   local out=""
-  class=unreadable suffix="" reason="" ap="" at="" as="" bp="" bt="" bs=""
+  class=unreadable suffix="" reason="" proof=no ap="" at="" as="" bp="" bt="" bs=""
   m=$(misc) || return 0
   out=$("$abctl" -d "$m" show 2> /dev/null) || true
   class=$(sed -n 's/^class //p' <<< "$out")
   [[ -n $class ]] || { class=unreadable; return 0; }
+  [[ ${out##*$'\n'} != "bproof 1" ]] || proof=yes
   suffix=$(sed -n 's/^suffix //p' <<< "$out")
   reason=$(sed -n 's/^message reason //p' <<< "$out")
   read -r ap at as <<< "$(slotof a "$out")" || true
@@ -145,7 +146,14 @@ lock() {
   flock -w "${2:-$wait}" 9 || die "$1 refused: the boot lock is busy"
 }
 
-ab() { "$abctl" -d "$m" "$@"; }
+ab() {
+  if [[ $proof != yes ]]; then
+    echo "$me: $abctl show prints no bproof 1: abctl $1 refused" >&2
+    gates error "abctl without bproof"
+    return 1
+  fi
+  "$abctl" -d "$m" "$@"
+}
 
 write() {
   local verb=$1 rc=0

@@ -133,7 +133,11 @@ setup() {
 #!/bin/sh
 echo "abctl \$3" >> "$d/calls"
 [ ! -f "$d/fail.\$3" ] || exit "\$(cat "$d/fail.\$3")"
-exec "$ab" "\$@"
+[ -f "$d/old" ] || exec "$ab" "\$@"
+"$ab" "\$@" > "$d/old.out"
+rc=\$?
+grep -vx 'bproof 1' "$d/old.out"
+exit \$rc
 EOF
   cat > "$d/bin/systemctl" << EOF
 #!/bin/sh
@@ -398,6 +402,23 @@ printf 'state=default\n' > "$d/run/boot/state"
 run android
 [[ $rc == 1 && -z $(writes) && ! -e $d/run/boot/android ]] && grep -q 'slot b untested' "$d/out"
 res $((r1 || $?)) "android on an unproven b after healthy (a 15/3/0): hold-b gives b 15/1/0, one try; refused with no marker while a reads 15/2/0, as abctl's hold-b rule"
+
+setup noproof _a 15/2/0 13/1/1
+: > "$d/old"
+: > "$d/etc/recovery"
+run healthy
+[[ $rc == 1 && -z $(writes) && ! -e $d/run/boot/healthy ]] && grep -q 'no bproof 1' "$d/out" &&
+  grep -qx state=error "$d/run/boot/state" && grep -qx 'reason=abctl without bproof' "$d/run/boot/state"
+ok=$?
+for x in android recovery test-b; do
+  printf 'state=default\n' > "$d/run/boot/state"
+  run "$x"
+  [[ $rc == 1 && -z $(writes) && ! -e $d/run/boot/$x ]] && grep -q 'no bproof 1' "$d/out" &&
+    grep -qx state=error "$d/run/boot/state" && grep -qx 'reason=abctl without bproof' "$d/run/boot/state" ||
+    { ok=1; echo "  $x: rc $rc"; }
+done
+[[ $(st) == '_a 15/2/0 13/1/1 zero' ]] || ok=1
+res $ok "an abctl whose show prints no bproof 1: healthy, android, recovery and test-b refuse before any write, no marker, misc unchanged, state=error reason=abctl without bproof"
 
 setup holdfail _a 15/2/0 13/1/1
 run healthy
