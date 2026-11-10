@@ -16,6 +16,7 @@
 #define FIELD 32
 #define STATUS_OFF 32
 #define RECOVERY_OFF 64
+#define REFRESH_OFF 448
 #define EMPTY 3
 #define WRITE_FAILED 4
 #define BC_OFF 0x800
@@ -34,15 +35,16 @@ static const char* dev = "/dev/block/by-name/misc";
 static int attempt;
 
 static const char* const writes[] = { "default-a", "hold-b", "fix-b", "unprove-b", "refund-a", "test-b", "arm-a",
-                                      "arm-b-once", "rearm", "bcb-recovery", "bcb-attempt", "bcb-input", "bcb-clear",
-                                      "clear-msg", "restore", NULL };
+                                      "arm-b-once", "rearm", "bcb-recovery", "bcb-attempt", "bcb-input", "bcb-refresh",
+                                      "bcb-clear", "clear-msg", "restore", NULL };
 
 static void usage(void)
 {
     fprintf(stderr, "usage: abctl [-d device] [-o offset] show\n"
                     "       abctl [-d device] default-a | hold-b | fix-b | unprove-b | refund-a | test-b\n"
                     "       abctl [-d device] arm-a | arm-b-once | rearm | clear-msg | restore <file>\n"
-                    "       abctl [-d device] bcb-recovery <reason> | bcb-attempt | bcb-input | bcb-clear\n");
+                    "       abctl [-d device] bcb-recovery <reason> | bcb-attempt | bcb-input | bcb-refresh <cap>\n"
+                    "       abctl [-d device] bcb-clear\n");
     exit(2);
 }
 
@@ -145,8 +147,25 @@ static size_t reason_len(const uint8_t* msg)
     return n && n <= FIELD && !r[n] ? n : 0;
 }
 
+static int is_count(const uint8_t* s, const char* key, int n)
+{
+    char want[FIELD] = { 0 };
+    if (n)
+        snprintf(want, sizeof want, "%s=%d", key, n);
+    return !memcmp(s, want, FIELD);
+}
+
+static int refreshes(const uint8_t* msg)
+{
+    for (int n = 0; n < 100; n++)
+        if (is_count(msg + REFRESH_OFF, "blockie-refresh", n))
+            return n;
+    return -1;
+}
+
 static void print_msg(const uint8_t* msg)
 {
+    int n;
     size_t i = 0;
     while (i < MSG_SIZE && !msg[i])
         i++;
@@ -157,6 +176,8 @@ static void print_msg(const uint8_t* msg)
     printf("message command \"%.*s\"\n", (int)strnlen((const char*)msg, 32), (const char*)msg);
     if ((i = reason_len(msg)))
         printf("message reason %.*s\n", (int)i, (const char*)msg + RECOVERY_OFF + strlen(OURS));
+    if ((n = refreshes(msg)) > 0)
+        printf("message refresh %d\n", n);
 }
 
 static int read_at(int fd, const char* name, void* buf, size_t n, long off, const char* what)
@@ -268,15 +289,7 @@ static int rules(const char* cmd, const uint8_t* old, const uint8_t* bc)
     return 0;
 }
 
-static int is_status(const uint8_t* s, int n)
-{
-    char want[FIELD] = { 0 };
-    if (n)
-        snprintf(want, sizeof want, "blockie-attempt=%d", n);
-    return !memcmp(s, want, FIELD);
-}
-
-static int count(const char* cmd, uint8_t* blk)
+static int count(const char* cmd, uint8_t* blk, const char* arg)
 {
     uint8_t* status = blk + STATUS_OFF;
     int n = 0;
@@ -288,7 +301,26 @@ static int count(const char* cmd, uint8_t* blk)
         memset(status, 0, FIELD);
         return 0;
     }
-    while (n < 3 && !is_status(status, n))
+    if (!strcmp(cmd, "bcb-refresh")) {
+        int cap = atoi(arg);
+        if (!reason_len(blk)) {
+            fprintf(stderr, "abctl: bcb-refresh refused: the bootloader message is not ours\n");
+            return 1;
+        }
+        if ((n = refreshes(blk)) < 0) {
+            fprintf(stderr, "abctl: bcb-refresh refused: the counter at misc+%d does not parse, counted as the cap\n",
+                    REFRESH_OFF);
+            return 1;
+        }
+        if (n >= cap) {
+            fprintf(stderr, "abctl: bcb-refresh refused: blockie-refresh=%d, the cap is %d\n", n, cap);
+            return 1;
+        }
+        memset(blk + REFRESH_OFF, 0, FIELD);
+        snprintf((char*)blk + REFRESH_OFF, FIELD, "blockie-refresh=%d", n + 1);
+        return 0;
+    }
+    while (n < 3 && !is_count(status, "blockie-attempt", n))
         n++;
     if (n == 3)
         fprintf(stderr, "abctl: bcb-attempt: status neither empty nor blockie-attempt=1 or 2, counted as the bound\n");
@@ -330,7 +362,7 @@ static int change(const char* cmd, uint8_t* blk, uint8_t* file, const char* arg)
             memcpy(blk, "boot-recovery", 13);
             snprintf((char*)blk + RECOVERY_OFF, SECTOR - RECOVERY_OFF, OURS "%s", arg);
         } else {
-            return count(cmd, blk);
+            return count(cmd, blk, arg);
         }
         return 0;
     }
@@ -528,7 +560,7 @@ int main(int argc, char** argv)
     if (optind >= argc)
         usage();
     const char* cmd = argv[optind];
-    int takes_arg = !strcmp(cmd, "restore") || !strcmp(cmd, "bcb-recovery");
+    int takes_arg = !strcmp(cmd, "restore") || !strcmp(cmd, "bcb-recovery") || !strcmp(cmd, "bcb-refresh");
     if (argc - optind != 1 + takes_arg)
         usage();
     if (!strcmp(cmd, "show"))
@@ -544,6 +576,11 @@ int main(int argc, char** argv)
     if (!strcmp(cmd, "bcb-recovery")) {
         size_t n = strspn(arg, "abcdefghijklmnopqrstuvwxyz0123456789_");
         if (!n || n > FIELD || arg[n])
+            usage();
+    }
+    if (!strcmp(cmd, "bcb-refresh")) {
+        size_t n = strspn(arg, "0123456789");
+        if (!n || n > 2 || arg[n] || !atoi(arg))
             usage();
     }
     return update(cmd, arg);

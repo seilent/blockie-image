@@ -56,11 +56,12 @@ def bc_of(suffix, a, b):
     return fix_crc(bc)
 
 
-def bcb(command=b"", status=b"", recovery=b""):
+def bcb(command=b"", status=b"", recovery=b"", refresh=b""):
     s = bytearray(512)
     s[0:len(command)] = command
     s[32:32 + len(status)] = status
     s[64:64 + len(recovery)] = recovery
+    s[448:448 + len(refresh)] = refresh
     return bytes(s)
 
 
@@ -535,7 +536,7 @@ def main():
         nomagic = bytearray(D)
         nomagic[4] = 0x43
         nomagic = fix_crc(nomagic)
-        for args in (["bcb-recovery", "menu"], ["bcb-attempt"], ["bcb-clear"]):
+        for args in (["bcb-recovery", "menu"], ["bcb-attempt"], ["bcb-clear"], ["bcb-refresh", "8"]):
             put_msg(bcb(b"boot-recovery", b"", ours), nomagic)
             rc, out, err = abctl("-d", m, *args)
             check(rc == 1 and "magic" in err, f"{' '.join(args)} refused without BCAB at 0x804")
@@ -558,6 +559,65 @@ def main():
         rc, out, err = abctl("-d", m, "bcb-input")
         check(rc == 1 and "magic" in err, "bcb-input refused without BCAB at 0x804")
         msg_is(bcb(b"boot-recovery", b"blockie-attempt=1", ours), "bcb-input without magic: file unchanged", nomagic)
+
+        inst = b"recovery\n--blockie=install"
+        put_msg(bcb(b"boot-recovery", b"blockie-attempt=1", inst))
+        for n in range(1, 9):
+            rc, out, err = abctl("-d", m, "bcb-refresh", "8")
+            msg_is(bcb(b"boot-recovery", b"blockie-attempt=1", inst, f"blockie-refresh={n}".encode()),
+                   f"bcb-refresh 8, refresh {n}: blockie-refresh={n} at misc+448, the rest of sector 0 kept")
+            rc2, out2, err2 = abctl("-d", m, "show")
+            lines = out2.splitlines()
+            check(rc == 0 and rc2 == 0 and "message reason install" in lines and f"message refresh {n}" in lines,
+                  f"show after refresh {n}: message reason install and message refresh {n}")
+        before = cur()
+        rc, out, err = abctl("-d", m, "bcb-refresh", "8")
+        check(rc == 1 and "the cap is 8" in err and cur() == before,
+              "bcb-refresh 8 after 8 refreshes: refused at the cap, nothing written")
+        rc, out, err = abctl("-d", m, "bcb-refresh", "9")
+        msg_is(bcb(b"boot-recovery", b"blockie-attempt=1", inst, b"blockie-refresh=9"), "bcb-refresh 9 after 8: 9")
+        for torn, what in ((b"blockie-refresh=x", "a letter"), (b"blockie-refresh=3\x00\xff", "a torn tail"),
+                           (b"blockie-refresh=0", "=0"), (b"blockie-refresh=100", "=100"), (b"\xff", "one byte")):
+            sec = bcb(b"boot-recovery", b"", inst, torn)
+            put_msg(sec)
+            rc, out, err = abctl("-d", m, "bcb-refresh", "8")
+            check(rc == 1 and "counted as the cap" in err, f"bcb-refresh on a torn counter ({what}): refused")
+            msg_is(sec, f"bcb-refresh on a torn counter ({what}): nothing written")
+            rc, out, err = abctl("-d", m, "show")
+            check(rc == 0 and not [x for x in out.splitlines() if x.startswith("message refresh")],
+                  f"show on a torn counter ({what}): no message refresh line")
+        for sec, what in ((bytes(512), "zero sector 0"), (bcb(b"", b"", inst), "no command, our recovery field")):
+            put_msg(sec)
+            rc, out, err = abctl("-d", m, "bcb-refresh", "8")
+            check(rc == 3 and out == "empty\n", f"bcb-refresh on {what}: exit 3, empty")
+            msg_is(sec, f"bcb-refresh on {what}: nothing written")
+        for sec, what in ((bcb(b"boot-recovery", b"", wipe), "Android's --wipe_data"),
+                          (bcb(b"bootonce-bootloader"), "bootonce-bootloader"),
+                          (bcb(b"boot-recovery", b"", b"recovery\n--blockie=Menu"), "an upper case reason")):
+            put_msg(sec)
+            rc, out, err = abctl("-d", m, "bcb-refresh", "8")
+            check(rc == 1 and "not ours" in err, f"bcb-refresh on {what}: refused")
+            msg_is(sec, f"bcb-refresh on {what}: nothing written")
+        put_msg(bcb(b"boot-recovery", b"blockie-attempt=2", inst, b"blockie-refresh=3"))
+        rc, out, err = abctl("-d", m, "bcb-input")
+        msg_is(bcb(b"boot-recovery", b"", inst, b"blockie-refresh=3"), "bcb-input keeps the refresh counter")
+        rc, out, err = abctl("-d", m, "bcb-attempt")
+        msg_is(bcb(b"boot-recovery", b"blockie-attempt=1", inst, b"blockie-refresh=3"),
+               "bcb-attempt keeps the refresh counter")
+        rc, out, err = abctl("-d", m, "bcb-recovery", "install")
+        msg_is(bcb(b"boot-recovery", b"", inst), "bcb-recovery zeroes the refresh counter with sector 0")
+        put_msg(bcb(b"boot-recovery", b"", inst, b"blockie-refresh=3"))
+        rc, out, err = abctl("-d", m, "bcb-clear")
+        msg_is(bytes(512), "bcb-clear zeroes the refresh counter with sector 0")
+        put_msg(bcb(b"boot-recovery", b"", inst))
+        for args in (["bcb-refresh"], ["bcb-refresh", "0"], ["bcb-refresh", "x"], ["bcb-refresh", "100"],
+                     ["bcb-refresh", "-1"], ["bcb-refresh", "8", "x"], ["bcb-refresh", ""]):
+            rc, out, err = abctl("-d", m, *args)
+            check(rc == 2, f"abctl {' '.join(args)} is a usage error")
+            msg_is(bcb(b"boot-recovery", b"", inst), f"abctl {' '.join(args)}: nothing written")
+        rc, opens, pw = traced(["-d", m, "bcb-refresh", "8"])
+        check(rc == 0 and pw == [("512", "0", "512")] and len(opens) == 1 and "O_DIRECT" in opens[0],
+              f"abctl bcb-refresh 8: one O_DIRECT open, one 512 byte write at 0: {pw}")
 
         put(F)
         rc, opens, pw = traced(["-d", m, "hold-b"])

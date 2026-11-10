@@ -108,6 +108,8 @@ cmd = kw.get("cmd", "").encode()
 m[0:len(cmd)] = cmd
 rec = kw.get("rec", "").replace("\\n", "\n").encode()
 m[64:64 + len(rec)] = rec
+ref = kw.get("refresh", "").encode()
+m[448:448 + len(ref)] = ref
 m[0x800:0x820] = bc
 with open(path, "wb") as f:
     f.write(m)
@@ -221,6 +223,16 @@ run healthy
   [[ $(cat "$d/state/recovery.state") == "$(gw recovery=no "base=$(sha256sum < "$d/etc/recovery" | cut -d' ' -f1)" "boot=$ID")" ]] &&
   [[ $(gate) == "$(gw state=default arm=default android=bootable return=host recovery=no fastboot=no)" ]]
 res $? "healthy with a menu bcb: default-a before bcb-clear, recovery=no recorded with the base's sha256 and the boot id, recovery=no despite the base file"
+
+setup menurefresh _a 15/2/0 13/1/1 cmd=boot-recovery 'rec=recovery\n--blockie=menu' refresh=blockie-refresh=3
+: > "$d/etc/recovery"
+[[ $(st) == '_a 15/2/0 13/1/1 command "boot-recovery" reason menu refresh 3' ]]
+r1=$?
+run healthy
+[[ $rc == 0 && $(st) == "$D" && $(writes) == "abctl default-a|abctl bcb-clear" ]] &&
+  [[ $(cat "$d/state/recovery.state") == "$(gw recovery=no "base=$(sha256sum < "$d/etc/recovery" | cut -d' ' -f1)" "boot=$ID")" ]] &&
+  cmp -s <(head -c 512 "$m") <(head -c 512 /dev/zero)
+res $((r1 || $?)) "healthy with a menu bcb and a refresh counter at misc+448: recovery=no recorded, bcb-clear zeroes sector 0 with the counter"
 
 setup fallback _a 15/0/0 13/1/1 cmd=boot-recovery 'rec=recovery\n--blockie=fallback'
 : > "$d/etc/recovery"
