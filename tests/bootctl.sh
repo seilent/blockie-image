@@ -245,10 +245,79 @@ run healthy
   [[ $(gate) == "$(gw state=default arm=default android=bootable return=host recovery=yes fastboot=no)" ]]
 res $? "healthy with a fallback bcb: re-armed and cleared, recovery stays yes"
 
-setup foreign _a 15/2/0 13/1/1 cmd=boot-recovery 'rec=recovery\n--wipe_data\n'
+ok=0
+for c in 'boot-recovery boot-recovery rec=recovery\n--wipe_data\n' 'boot-fastboot boot-fastboot' 'boot"x boot\x22x'; do
+  read -r k e kw <<< "$c"
+  setup "foreign-${k//[^a-z-]/}" _a 15/2/0 13/1/1 "cmd=$k" ${kw:+"$kw"}
+  GF=$(gw state=default arm=default android=unavailable "reason=bcb $e" return=host recovery=no fastboot=no)
+  run healthy
+  [[ $rc == 0 && $(st) == "_a 15/3/0 13/1/1 command \"$e\"" && $(writes) == "abctl default-a" && $(gate) == "$GF" ]] ||
+    { ok=1; echo "  $e healthy: rc $rc $(st)"; }
+  for x in android 'boot android' test-b; do
+    read -ra args <<< "$x"
+    : > "$d/calls"
+    run "${args[@]}"
+    [[ $rc == 1 && -z $(writes) && ! -e $d/run/boot/${args[-1]} && $(gate) == "$GF" ]] &&
+      [[ $(st) == "_a 15/3/0 13/1/1 command \"$e\"" ]] && grep -qF "${args[-1]} refused: bcb $e" "$d/out" ||
+      { ok=1; echo "  $e $x: rc $rc $(writes)"; }
+  done
+done
+res $ok "healthy leaves a bcb that is not ours (Android's --wipe_data, boot-fastboot, an escaped boot\"x) in place with android=unavailable reason=bcb <command as show prints it>; android, boot android and test-b refuse it, nothing written, no marker, no reboot call"
+
+ok=0
+for c in 'foreign cmd=boot-recovery rec=recovery\n--wipe_data\n' 'bootonce cmd=bootonce-bootloader' 'zero'; do
+  read -r n kw1 kw2 <<< "$c"
+  setup "recrepl-$n" _a 15/2/0 13/1/1 ${kw1:+"$kw1"} ${kw2:+"$kw2"}
+  : > "$d/etc/recovery"
+  run healthy
+  : > "$d/calls"
+  run recovery
+  [[ $rc == 0 && $(writes) == "abctl bcb-recovery" && $(st) == '_a 15/3/0 13/1/1 command "boot-recovery" reason menu' ]] ||
+    { ok=1; echo "  $n: rc $rc $(st)"; }
+  if [[ $n == foreign ]]; then
+    grep -qx 'blockie-bootctl: recovery: replaced bcb boot-recovery' "$d/out" || { ok=1; echo "  $n: no replaced line"; }
+  elif grep -q replaced "$d/out"; then
+    ok=1
+    echo "  $n: a replaced line"
+  fi
+done
+res $ok "recovery over a foreign bcb writes bcb-recovery menu and logs recovery: replaced bcb <command>; over bootonce-bootloader or message zero no such line"
+
+setup noproofgate _a 15/3/0 13/1/1
+: > "$d/old"
 run healthy
-[[ $rc == 0 && $(st) == '_a 15/3/0 13/1/1 command "boot-recovery"' && $(writes) == "abctl default-a" ]]
-res $? "healthy leaves a bcb that is not ours (Android's --wipe_data) in place"
+[[ $rc == 0 && -z $(writes) ]] &&
+  [[ $(gate) == "$(gw state=default arm=default android=unavailable 'reason=abctl without bproof' return=host recovery=no fastboot=no)" ]]
+r1=$?
+for x in android 'boot android'; do
+  read -ra args <<< "$x"
+  : > "$d/calls"
+  run "${args[@]}"
+  [[ $rc == 1 && -z $(writes) && ! -e $d/run/boot/android ]] && grep -q 'android refused: abctl without bproof' "$d/out" ||
+    r1=1
+done
+res $r1 "an abctl whose show prints no bproof 1: healthy with nothing to write gives android=unavailable reason=abctl without bproof; android and boot android refuse, nothing written, no marker"
+
+ok=0
+for c in 'bootonce-bootloader cmd=bootonce-bootloader' 'empty rec=recovery\n--wipe_data\n'; do
+  read -r n kw <<< "$c"
+  w=\"$n\"
+  [[ $n != empty ]] || w='""'
+  setup "msg-$n" _a 15/2/0 13/1/1 "$kw"
+  run healthy
+  [[ $rc == 0 && $(writes) == "abctl default-a" && $(gate) == "$G0" ]] || { ok=1; echo "  $n healthy: rc $rc $(gate)"; }
+  : > "$d/calls"
+  run android
+  [[ $rc == 0 && $(writes) == "abctl hold-b" && $(st) == "_b 14/3/0 15/1/1 command $w" && -e $d/run/boot/android ]] ||
+    { ok=1; echo "  $n android: rc $rc $(st)"; }
+  setup "msgtb-$n" _a 15/2/0 13/1/1 "$kw"
+  run healthy
+  : > "$d/calls"
+  run test-b
+  [[ $rc == 0 && $(writes) == "abctl test-b" && $(st) == "_b 14/3/0 15/1/0 command $w" && -e $d/run/boot/test-b ]] ||
+    { ok=1; echo "  $n test-b: rc $rc $(st)"; }
+done
+res $ok "a bootonce-bootloader (LK ignores it) or an empty command in sector 0: android=bootable, android and test-b write as on message zero, the message kept"
 
 setup reset _a 15/7/0 15/7/0
 run healthy
@@ -410,15 +479,19 @@ run healthy
 [[ $rc == 1 && -z $(writes) && ! -e $d/run/boot/healthy ]] && grep -q 'no bproof 1' "$d/out" &&
   grep -qx state=error "$d/run/boot/state" && grep -qx 'reason=abctl without bproof' "$d/run/boot/state"
 ok=$?
-for x in android recovery test-b; do
+for x in recovery test-b; do
   printf 'state=default\n' > "$d/run/boot/state"
   run "$x"
   [[ $rc == 1 && -z $(writes) && ! -e $d/run/boot/$x ]] && grep -q 'no bproof 1' "$d/out" &&
     grep -qx state=error "$d/run/boot/state" && grep -qx 'reason=abctl without bproof' "$d/run/boot/state" ||
     { ok=1; echo "  $x: rc $rc"; }
 done
+printf 'state=default\n' > "$d/run/boot/state"
+run android
+[[ $rc == 1 && -z $(writes) && ! -e $d/run/boot/android ]] && grep -q 'android refused: abctl without bproof' "$d/out" ||
+  { ok=1; echo "  android: rc $rc"; }
 [[ $(st) == '_a 15/2/0 13/1/1 zero' ]] || ok=1
-res $ok "an abctl whose show prints no bproof 1: healthy, android, recovery and test-b refuse before any write, no marker, misc unchanged, state=error reason=abctl without bproof"
+res $ok "an abctl whose show prints no bproof 1: healthy, recovery and test-b refuse before any write, no marker, misc unchanged, state=error reason=abctl without bproof; android refuses at its gate with that reason"
 
 setup holdfail _a 15/2/0 13/1/1
 run healthy
@@ -481,13 +554,14 @@ run boot android
 [[ $rc == 1 && $(writes) == "abctl hold-b|systemctl reboot|abctl default-a" && $(st) == "$D" ]] &&
   [[ ! -e $d/run/boot/android && $(gate) == "$G0" ]] && grep -q 'write is undone' "$d/out"
 r2=$?
-setup undoforeign _a 15/2/0 13/1/1 cmd=boot-recovery 'rec=recovery\n--wipe_data\n'
+setup undobootonce _a 15/2/0 13/1/1 cmd=bootonce-bootloader
 run healthy
 : > "$d/calls"
 echo 1 > "$d/systemctl.rc"
 run boot android
-[[ $rc == 1 && $(writes) == "abctl hold-b|systemctl reboot|abctl default-a" && $(st) == '_a 15/3/0 13/1/1 command "boot-recovery"' ]]
-res $((r1 || r2 || $?)) "boot android: hold-b, then the reboot; a failed reboot call runs default-a, no bcb-clear when sector 0 holds nothing of ours (a foreign bcb stays)"
+[[ $rc == 1 && $(writes) == "abctl hold-b|systemctl reboot|abctl default-a" ]] &&
+  [[ $(st) == '_a 15/3/0 13/1/1 command "bootonce-bootloader"' && $(gate) == "$G0" ]]
+res $((r1 || r2 || $?)) "boot android: hold-b, then the reboot; a failed reboot call runs default-a, no bcb-clear when sector 0 holds nothing of ours (a bootonce-bootloader stays)"
 
 setup undorec _a 15/2/0 13/1/1
 : > "$d/etc/recovery"

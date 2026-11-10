@@ -38,7 +38,7 @@ slotof() { sed -n "s/^slot $1 priority \([0-9]*\) tries \([0-9]*\) successful \(
 
 look() {
   local out=""
-  class=unreadable suffix="" reason="" proof=no ap="" at="" as="" bp="" bt="" bs=""
+  class=unreadable suffix="" reason="" msg="" proof=no ap="" at="" as="" bp="" bt="" bs=""
   m=$(misc) || return 0
   out=$("$abctl" -d "$m" show 2> /dev/null) || true
   class=$(sed -n 's/^class //p' <<< "$out")
@@ -46,16 +46,23 @@ look() {
   [[ ${out##*$'\n'} != "bproof 1" ]] || proof=yes
   suffix=$(sed -n 's/^suffix //p' <<< "$out")
   reason=$(sed -n 's/^message reason //p' <<< "$out")
+  msg=$(sed -n 's/^message command "\(.*\)"$/\1/p' <<< "$out")
   read -r ap at as <<< "$(slotof a "$out")" || true
   read -r bp bt bs <<< "$(slotof b "$out")" || true
 }
 
 up() { (( $1 > 0 && ($2 > 0 || $3 == 1) )); }
 
+bcb() { [[ -n $msg && $msg != bootonce-bootloader ]]; }
+
 android_gate() {
   aw=""
   if [[ $class != ours ]]; then
     aw="misc $class"
+  elif [[ $proof != yes ]]; then
+    aw="abctl without bproof"
+  elif bcb; then
+    aw="bcb $msg"
   elif ! up "$bp" "$bt" "$bs"; then
     aw="slot b unbootable"
   elif (( bs != 1 )) && [[ $ap/$at/$as != 15/3/0 ]]; then
@@ -176,7 +183,10 @@ do_android() {
   need_default android
   look
   android_gate
-  [[ -z $aw ]] || die "android refused: $aw"
+  if [[ -n $aw ]]; then
+    gates "$(current)"
+    die "android refused: $aw"
+  fi
   write android hold-b
   gates android
   echo "$me: android: hold-b written, Android boots next"
@@ -189,6 +199,7 @@ do_recovery() {
   look
   [[ $class == ours ]] || die "recovery refused: misc $class"
   write recovery bcb-recovery menu
+  ! bcb || echo "$me: recovery: replaced bcb $msg" >&2
   gates recovery
   echo "$me: recovery: bcb-recovery menu written, the recovery boots next"
 }
@@ -197,6 +208,7 @@ do_testb() {
   need_default test-b
   look
   [[ $class == ours ]] || die "test-b refused: misc $class"
+  ! bcb || die "test-b refused: bcb $msg"
   write test-b test-b
   gates pending "test b"
   echo "$me: test-b: slot b armed for one boot"
