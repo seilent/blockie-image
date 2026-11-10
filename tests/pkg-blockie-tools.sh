@@ -10,7 +10,7 @@ want=$(printf '%s\n' /usr/bin/abctl /usr/bin/blockie-bootctl /usr/libexec/blocki
   /usr/libexec/blockie/blockie-boot-ok /usr/libexec/blockie/blockie-bt /usr/libexec/blockie/blockie-wifi \
   /usr/share/blockie /usr/share/blockie/blobs.d)
 [[ $(rpm -qpl "${rpms[0]}" | sort) == "$want" ]] || { echo "pkg-blockie-tools: file list" >&2; exit 1; }
-for r in blk-wmt blk-bt kmod util-linux-core; do
+for r in blk-wmt blk-bt kmod util-linux-core util-linux; do
   rpm -qpR "${rpms[0]}" | grep -qx "$r" || { echo "pkg-blockie-tools: no Requires $r" >&2; exit 1; }
 done
 t=$(mktemp -d)

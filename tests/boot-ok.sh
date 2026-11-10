@@ -9,6 +9,8 @@ fails=0
 A=$(printf 'a%.0s' {1..64}).0
 B=$(printf 'b%.0s' {1..64}).1
 C=$(printf 'c%.0s' {1..64}).0
+I=$(printf '1%.0s' {1..32})
+J=$(printf '2%.0s' {1..32})
 
 res() {
   if [[ $1 == 0 ]]; then
@@ -54,8 +56,17 @@ case "\$1" in
 is-failed) grep -qxF "\$3" "$d/failed" ;;
 is-active) grep -qxF "\$3" "$d/active" ;;
 show) cat "$d/exit.\$5" 2> /dev/null || echo 0 ;;
+--user)
+  echo "\$*" >> "$d/shows"
+  [ "\$2" = show ] && cat "$d/user.show" 2> /dev/null ;;
 *) exit 9 ;;
 esac
+EOF
+  cat > "$d/bin/setpriv" << EOF
+#!/bin/sh
+echo "\$*" >> "$d/setpriv"
+while [ "\${1#--}" != "\$1" ]; do shift; done
+exec "\$@"
 EOF
   cat > "$d/bin/bootc" << EOF
 #!/bin/sh
@@ -67,7 +78,7 @@ EOF
 echo "bootctl \$* confirmed=\$(cat "$d/state/confirmed" 2> /dev/null)" >> "$d/calls"
 exit \$(cat "$d/bootctl.rc" 2> /dev/null || echo 0)
 EOF
-  chmod 755 "$d/bin/findmnt" "$d/bin/systemctl" "$d/bin/bootc" "$d/bin/blockie-bootctl"
+  chmod 755 "$d/bin/findmnt" "$d/bin/systemctl" "$d/bin/setpriv" "$d/bin/bootc" "$d/bin/blockie-bootctl"
   root=$dep/$A
 }
 
@@ -75,7 +86,7 @@ run() {
   PATH="$d/bin:$PATH" BLOCKIE_BOOT_OK_CONF=$d/conf BLOCKIE_BOOT_STATE=$d/state BLOCKIE_CMDLINE=$d/cmdline \
     BLOCKIE_SYSROOT=$s BLOCKIE_ROOT=$root BLOCKIE_OSTREE_ROOT=$lib BLOCKIE_PRODUCT_FILE=$d/product \
     BLOCKIE_SESSION_READY=$d/ready BLOCKIE_BOOTCTL=$d/bin/blockie-bootctl BLOCKIE_HEALTHY_WAIT=${HW:-3} \
-    BLOCKIE_BOOT_GATES=$d/gates \
+    BLOCKIE_BOOT_GATES=$d/gates BLOCKIE_HEALTHY_SETTLE=${HS:-0} BLOCKIE_SESSION_USER=root \
     "$script" "$@" > "$d/out" 2>&1
   rc=$?
 }
@@ -241,7 +252,8 @@ tries0=$(printf '%s 1\n%s 2\n%s 1\nnot a line' "$A" "$B" "$C")
 product() {
   setup "$1"
   : > "$d/product"
-  echo "emulation blockie-frontend.service" > "$d/ready"
+  echo "emulation blockie-frontend.service $I" > "$d/ready"
+  printf 'InvocationID=%s\nActiveState=active\n' "$I" > "$d/user.show"
   printf '%s\n' state=pending "arm=${2:-default}" android=bootable return=host recovery=no fastboot=no > "$d/gates"
 }
 
@@ -274,25 +286,67 @@ product healthy
 run healthy
 [[ $rc == 0 && $(cat "$d/state/confirmed") == "$A" && $(cat "$d/state/tries") == "$B 2" ]] &&
   [[ $(cat "$d/calls") == "bootctl healthy confirmed=$A" ]] &&
-  grep -qx "blockie-boot-ok: ready: emulation blockie-frontend.service" "$d/out"
-res $? "healthy with the ready report written before multi-user: confirmed first, then blockie-bootctl healthy"
+  [[ $(cat "$d/shows") == "--user show -p InvocationID,ActiveState blockie-frontend.service" ]] &&
+  [[ $(cat "$d/setpriv") == "--reuid=0 --regid=0 --init-groups --no-new-privs env -i PATH="*" XDG_RUNTIME_DIR=/run/user/0 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus timeout 5 systemctl --user show -p InvocationID,ActiveState blockie-frontend.service" ]] &&
+  grep -qx "blockie-boot-ok: ready: emulation blockie-frontend.service $I" "$d/out"
+res $? "healthy with the ready report written before multi-user: the session user's manager says the unit is active on the reported invocation, confirmed first, then blockie-bootctl healthy"
 
 product healthy-late
-rm -f "$d/ready"
-( sleep 1.5; echo "emulation blockie-frontend.service" > "$d/ready" ) &
+echo "emulation blockie-frontend.service" > "$d/ready"
+( sleep 1.5; echo "emulation blockie-frontend.service $I" > "$d/ready" ) &
 t0=${EPOCHREALTIME//[!0-9]/}
 run healthy
 ms=$(((${EPOCHREALTIME//[!0-9]/} - t0) / 1000))
 wait
 [[ $rc == 0 && $(cat "$d/state/confirmed") == "$A" && $(cat "$d/calls") == "bootctl healthy confirmed=$A" ]] && ((ms >= 1000))
-res $? "healthy waits for a ready report that comes after it started ($ms ms)"
+res $? "healthy waits for a ready report that comes after it started, a report without an invocation id does not count ($ms ms)"
 
-product healthy-noready
+product healthy-long
 rm -f "$d/ready"
+( sleep 2.5; echo "emulation blockie-frontend.service $I" > "$d/ready" ) &
+t0=${EPOCHREALTIME//[!0-9]/}
 HW=1 run healthy
-[[ $rc == 1 && ! -e $d/state/confirmed && $(cat "$d/state/tries") == "$tries0" && ! -s $d/calls ]] &&
-  grep -q "no ready report from the default session after 1 s" "$d/out"
-res $? "healthy with no ready report: nothing confirmed, no re-arm, exit 1"
+ms=$(((${EPOCHREALTIME//[!0-9]/} - t0) / 1000))
+wait
+[[ $rc == 0 && $(cat "$d/state/confirmed") == "$A" && $(cat "$d/calls") == "bootctl healthy confirmed=$A" ]] && ((ms >= 2000)) &&
+  [[ $(grep -c "not confirmed after 1 s, still waiting for a ready report from the default session" "$d/out") == 1 ]] &&
+  ! grep -q 'No such file' "$d/out"
+res $? "healthy has no deadline: one line at BLOCKIE_HEALTHY_WAIT, no error per pass for the missing file, then the confirm on a later report ($ms ms)"
+
+product healthy-settle
+t0=${EPOCHREALTIME//[!0-9]/}
+HS=2 run healthy
+ms=$(((${EPOCHREALTIME//[!0-9]/} - t0) / 1000))
+[[ $rc == 0 && $(cat "$d/state/confirmed") == "$A" && $(cat "$d/calls") == "bootctl healthy confirmed=$A" ]] && ((ms >= 2000))
+res $? "healthy confirms only after the settle ($ms ms, 2 s here, 30 s by default)"
+
+ok=0
+for st in "activating $I" "active $J"; do
+  product "healthy-stale-${st%% *}"
+  printf 'InvocationID=%s\nActiveState=%s\n' "${st#* }" "${st%% *}" > "$d/user.show"
+  ( sleep 2.5; printf 'InvocationID=%s\nActiveState=active\n' "$J" > "$d/user.show"
+    echo "emulation blockie-frontend.service $J" > "$d/ready" ) &
+  t0=${EPOCHREALTIME//[!0-9]/}
+  HS=1 run healthy
+  ms=$(((${EPOCHREALTIME//[!0-9]/} - t0) / 1000))
+  wait
+  [[ $rc == 0 && $(cat "$d/state/confirmed") == "$A" && $(cat "$d/calls") == "bootctl healthy confirmed=$A" ]] && ((ms >= 2500)) &&
+    [[ $(grep -c "blockie-frontend.service is not active on invocation $I after 1 s, waiting for a fresh ready report" "$d/out") == 1 ]] &&
+    grep -qx "blockie-boot-ok: ready: emulation blockie-frontend.service $J" "$d/out" || { ok=1; echo "  ${st%% *}: rc $rc, $ms ms"; }
+done
+res $ok "a stale report (the unit restarting, or active on another invocation) is never confirmed: healthy waits for a fresh report and confirms that one"
+
+product healthy-unread
+rm -f "$d/user.show"
+( sleep 1.5; printf 'InvocationID=%s\nActiveState=active\n' "$I" > "$d/user.show" ) &
+t0=${EPOCHREALTIME//[!0-9]/}
+run healthy
+ms=$(((${EPOCHREALTIME//[!0-9]/} - t0) / 1000))
+wait
+[[ $rc == 0 && $(cat "$d/state/confirmed") == "$A" && $(cat "$d/calls") == "bootctl healthy confirmed=$A" ]] && ((ms >= 1500)) &&
+  [[ $(grep -c "cannot read blockie-frontend.service from the user manager, retrying" "$d/out") == 1 ]] &&
+  ! grep -q 'not active on invocation' "$d/out"
+res $? "a user manager query with no answer does not make the report stale: healthy retries and confirms the same report once it answers ($ms ms)"
 
 setup healthy-dev
 echo "emulation blockie-frontend.service" > "$d/ready"
@@ -341,9 +395,9 @@ res $? "boot-ok takes no argument or healthy"
 hu=/usr/lib/systemd/system/blockie-boot-healthy.service
 if [[ -f $hu ]]; then
   grep -qx 'After=multi-user.target blockie-boot-ok.service' "$hu" && grep -qx 'ConditionPathExists=/run/blockie/product' "$hu" &&
-    grep -qx 'ExecStart=/usr/libexec/blockie/blockie-boot-ok healthy' "$hu" &&
+    grep -qx 'ExecStart=/usr/libexec/blockie/blockie-boot-ok healthy' "$hu" && grep -qx 'TimeoutStartSec=infinity' "$hu" &&
     [[ -L /etc/systemd/system/multi-user.target.wants/blockie-boot-healthy.service ]]
-  res $? "blockie-boot-healthy.service runs boot-ok healthy after multi-user.target on product boots, enabled"
+  res $? "blockie-boot-healthy.service runs boot-ok healthy after multi-user.target on product boots with no start timeout, enabled"
 fi
 
 if [[ $fails == 0 ]]; then

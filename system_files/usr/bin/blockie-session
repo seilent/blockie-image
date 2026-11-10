@@ -23,12 +23,13 @@ namere='^[a-z0-9][a-z0-9-]*$'
 appre='^[A-Za-z0-9][A-Za-z0-9._-]*$'
 wordre='^[A-Za-z0-9._/:=@+-]+$'
 dropre='^[a-z0-9][a-z0-9-]* [a-z0-9][a-z0-9-]*$'
+invre='^[0-9a-f]{32}$'
 reqfd=""
 
 log() { echo "$me: $*" >&2; }
 
 usage() {
-  echo "usage: $me list | current | get-default | set-default <name> | switch <name> [app] | request <name> [reason] | switcher | next | back | boot | menu <from> | install <name> | ended <unit> | revive <name> | ready | mark-ready" >&2
+  echo "usage: $me list | current | get-default | set-default <name> | switch <name> [app] | request <name> [reason] | switcher | next | back | boot | menu <from> | install <name> | ended <unit> | revive <name> | ready | mark-ready <invocation>" >&2
   exit 2
 }
 
@@ -715,8 +716,8 @@ revive() {
 }
 
 mark_ready() {
-  local d
-  [[ $(id -u) == 0 ]] || { log "mark-ready runs as root, start blockie-session-ready.service"; exit 2; }
+  local want=$1 d inv
+  [[ $(id -u) == 0 ]] || { log "mark-ready runs as root, start blockie-session-ready@$want.service"; exit 2; }
   ids || { log "no user $user"; exit 1; }
   d=$(get_default) || { log "ready: no default session"; exit 1; }
   load "$d" || { log "ready: $d is not a listed session"; exit 1; }
@@ -725,15 +726,19 @@ mark_ready() {
     log "ready: $d shows no window of $APP_ID, not marked"
     exit 1
   fi
-  put "$rundir/ready" "$d $UNIT" || exit 1
-  log "ready: $d"
+  inv=$(prop "$UNIT" InvocationID) || inv=""
+  [[ $inv == "$want" ]] || { log "ready: $UNIT runs invocation ${inv:-none}, not the reporting $want, not marked"; exit 1; }
+  put "$rundir/ready" "$d $UNIT $inv" || exit 1
+  log "ready: $d $inv"
 }
 
 ready() {
+  local inv=${INVOCATION_ID:-}
+  [[ $inv =~ $invre ]] || { log "ready: INVOCATION_ID names no unit invocation, nothing sent"; exit 2; }
   if [[ $(id -u) == 0 ]]; then
-    mark_ready
+    mark_ready "$inv"
   else
-    exec systemctl start --no-block blockie-session-ready.service
+    exec systemctl start "blockie-session-ready@$inv.service"
   fi
 }
 
@@ -759,7 +764,7 @@ main() {
     ended) (( $# == 2 )) || usage; ended "$2" ;;
     revive) (( $# == 2 )) && [[ $2 =~ $namere ]] || usage; revive "$2" ;;
     ready) (( $# == 1 )) || usage; ready ;;
-    mark-ready) (( $# == 1 )) || usage; mark_ready ;;
+    mark-ready) (( $# == 2 )) && [[ $2 =~ $invre ]] || usage; mark_ready "$2" ;;
     *) usage ;;
   esac
 }

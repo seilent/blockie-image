@@ -15,6 +15,8 @@ gates=${BLOCKIE_BOOT_GATES:-/run/blockie/boot/state}
 ready=${BLOCKIE_SESSION_READY:-/run/blockie-session/ready}
 bootctl=${BLOCKIE_BOOTCTL:-/usr/bin/blockie-bootctl}
 wait_s=${BLOCKIE_HEALTHY_WAIT:-300}
+settle=${BLOCKIE_HEALTHY_SETTLE:-30}
+user=${BLOCKIE_SESSION_USER:-blockie}
 deploys=$sysroot/ostree/deploy/default/deploy
 id_re='^[0-9a-f]{64}\.[0-9]+$'
 
@@ -30,6 +32,14 @@ esac
 [[ -r $lib ]] || die "missing $lib"
 . "$lib"
 
+user_show() {
+  local uid gid
+  uid=$(id -u "$user") && gid=$(id -g "$user") || return 1
+  setpriv --reuid="$uid" --regid="$gid" --init-groups --no-new-privs env -i PATH="$PATH" XDG_RUNTIME_DIR="/run/user/$uid" \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" timeout 5 systemctl --user show -p InvocationID,ActiveState "$1" \
+    < /dev/null 2> /dev/null
+}
+
 arm=$(sed -n 's/^arm=//p' "$gates" 2> /dev/null | head -n 1 || true)
 if [[ $mode == healthy ]]; then
   [[ -e $product ]] || die "healthy runs only on a product boot"
@@ -37,13 +47,29 @@ if [[ $mode == healthy ]]; then
     echo "$me: healthy: arm=${arm:-none}, not a default arm, the confirm stays with blockie-boot-ok: nothing to do"
     exit 0
   fi
-  n=0
-  until [[ -s $ready ]]; do
-    (( n < wait_s )) || die "not healthy: no ready report from the default session after $wait_s s"
+  n=0 seen="" since=0 stale="" unread=""
+  while :; do
+    name="" unit="" inv=""
+    read -r name unit inv _ 2> /dev/null < "$ready" || true
+    if [[ $inv =~ ^[0-9a-f]{32}$ && "$name $unit $inv" != "$stale" ]]; then
+      [[ "$name $unit $inv" == "$seen" ]] || { seen="$name $unit $inv"; since=$n; }
+      if (( n - since >= settle )); then
+        st=$(user_show "$unit" | LC_ALL=C sort) || true
+        [[ $st != "ActiveState=active"$'\n'"InvocationID=$inv" ]] || break
+        if [[ $st == *InvocationID=* ]]; then
+          echo "$me: healthy: $unit is not active on invocation $inv after $settle s, waiting for a fresh ready report"
+          stale=$seen
+        elif [[ -z $unread ]]; then
+          echo "$me: healthy: cannot read $unit from the user manager, retrying"
+          unread=yes
+        fi
+      fi
+    fi
+    (( n != wait_s )) || echo "$me: healthy: not confirmed after $wait_s s, still waiting for a ready report from the default session"
     sleep 1
     n=$((n + 1))
   done
-  echo "$me: ready: $(< "$ready")"
+  echo "$me: ready: $seen"
 fi
 
 src=$(findmnt -no SOURCE /var) || die "/var is not mounted"

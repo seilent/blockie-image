@@ -8,7 +8,7 @@ RequiresMountsFor=/var
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-TimeoutStartSec=420
+TimeoutStartSec=infinity
 ExecStart=/usr/libexec/blockie/blockie-boot-ok healthy
 
 [Install]

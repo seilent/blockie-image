@@ -51,11 +51,15 @@ const cases = [
   [units, "blockie", "blockie-session-appswitch@x;y.service", "start", "none"],
   [units, "blockie", "blockie-session-switcher.service", "start", "none"],
   [units, "blockie", "blockie-session-boot.service", "start", "none"],
-  [units, "blockie", "blockie-session-ready.service", "start", "yes"],
-  [units, "blockie", "blockie-session-ready.service", "stop", "none"],
-  [units, "blockie", "blockie-session-ready.service", "restart", "none"],
+  [units, "blockie", "blockie-session-ready@0123456789abcdef0123456789abcdef.service", "start", "yes"],
+  [units, "blockie", "blockie-session-ready@0123456789abcdef0123456789abcdef.service", "stop", "none"],
+  [units, "blockie", "blockie-session-ready@0123456789abcdef0123456789abcdef.service", "restart", "none"],
+  [units, "blockie", "blockie-session-ready.service", "start", "none"],
   [units, "blockie", "blockie-session-ready@x.service", "start", "none"],
-  [units, "other", "blockie-session-ready.service", "start", "none"],
+  [units, "blockie", "blockie-session-ready@0123456789abcdef0123456789abcde.service", "start", "none"],
+  [units, "blockie", "blockie-session-ready@0123456789abcdef0123456789abcdef0.service", "start", "none"],
+  [units, "blockie", "blockie-session-ready@0123456789ABCDEF0123456789ABCDEF.service", "start", "none"],
+  [units, "other", "blockie-session-ready@0123456789abcdef0123456789abcdef.service", "start", "none"],
   [units, "blockie", "blockie-poweroff.service", "start", "none"],
   [units, "other", "blockie-session-switch@x.service", "start", "none"],
   [units, "other", "blockie-session-appswitch@x.service", "start", "none"],
@@ -83,7 +87,7 @@ process.exit(bad ? 1 : 0);
 EOF
   local rc=$?
   [[ $rc == 0 ]] || sed 's/^/  /' "$t/polkit.out"
-  res $rc "polkit: blockie may start switch@, appswitch@ and revive@ of a session name and blockie-session-ready, nothing else"
+  res $rc "polkit: blockie may start switch@, appswitch@ and revive@ of a session name and ready@ of a 32 hex invocation id, nothing else"
 }
 
 if [[ ${1:-} == polkit ]]; then
@@ -142,6 +146,7 @@ if [[ $1 == --user ]]; then
         ActiveState) [[ -f $st.active ]] && echo active || echo inactive ;;
         FreezerState) [[ -f $st.frozen ]] && echo frozen || echo running ;;
         Job) [[ ! -f $st.job ]] || echo 1 ;;
+        InvocationID) cat "$st.inv" 2> /dev/null ;;
       esac
       ;;
     start)
@@ -179,6 +184,8 @@ if [[ $1 == --user ]]; then
     is-active) [[ -f $st.active ]] && echo active || echo inactive ;;
     thaw) rm -f "$st.frozen" ;;
   esac
+elif [[ $1 == start && -f $FAKE/start-rc ]]; then
+  exit "$(cat "$FAKE/start-rc")"
 fi
 exit 0
 EOF
@@ -1113,42 +1120,86 @@ res $? "a run with no pending request exits 0 with nothing logged"
 
 rm -f "${t:?}/run/ready"
 echo a > "$t/default"
+I=0123456789abcdef0123456789abcdef
+J=fedcba9876543210fedcba9876543210
 touch "$t/units/blockie-test-a.service.active" "$t/win/test.a"
-bs mark-ready > "$t/out" 2>&1
+echo "$I" > "$t/units/blockie-test-a.service.inv"
+bs mark-ready "$I" > "$t/out" 2>&1
 r=$?
-[[ $r == 0 && $(cat "$t/run/ready") == "a blockie-test-a.service" && $(stat -c %a "$t/run/ready") == 644 ]]
-res $? "mark-ready as root: the default session shows its window, ready names it and its unit (0644)"
-rm -f "${t:?}/run/ready" "${t:?}/win/test.a"
-bs mark-ready > "$t/out" 2>&1
+[[ $r == 0 && $(cat "$t/run/ready") == "a blockie-test-a.service $I" && $(stat -c %a "$t/run/ready") == 644 ]]
+res $? "mark-ready as root with the unit's own invocation: ready names the default session, its unit and the invocation id (0644)"
+rm -f "${t:?}/run/ready"
+echo "$J" > "$t/units/blockie-test-a.service.inv"
+bs mark-ready "$I" > "$t/out" 2>&1
+r=$?
+[[ $r == 1 && ! -e $t/run/ready ]] && grep -q "blockie-test-a.service runs invocation $J, not the reporting $I, not marked" "$t/out"
+r1=$?
+rm -f "${t:?}/units/blockie-test-a.service.inv"
+bs mark-ready "$I" > "$t/out" 2>&1
+r=$?
+[[ $r == 1 && ! -e $t/run/ready ]] && grep -q "runs invocation none, not the reporting $I" "$t/out"
+res $((r1 || $?)) "mark-ready from a stale sender (the unit restarted on another invocation, or has none): exit 1, nothing marked"
+r1=0
+for w in "" x "${I:1}" "${I}0" "${I^^}" "$I $I"; do
+  read -ra args <<< "$w"
+  bs mark-ready "${args[@]}" > "$t/out" 2>&1
+  r=$?
+  [[ $r == 2 && ! -e $t/run/ready ]] || { r1=1; echo "  mark-ready '$w': rc $r"; }
+done
+res $r1 "mark-ready refuses an argument that is not one 32 hex invocation id: exit 2, nothing marked"
+echo "$I" > "$t/units/blockie-test-a.service.inv"
+rm -f "${t:?}/win/test.a"
+bs mark-ready "$I" > "$t/out" 2>&1
 r=$?
 [[ $r == 1 && ! -e $t/run/ready ]] && grep -q 'shows no window of test.a' "$t/out"
 res $? "mark-ready with no window of the default session within its start wait: exit 1, nothing marked"
 touch "$t/win/test.a"
 echo b > "$t/default"
 rm -f "$t/units/blockie-test-b.service.active" "$t/win/test.b"
-bs mark-ready > "$t/out" 2>&1
+bs mark-ready "$I" > "$t/out" 2>&1
 r=$?
 [[ $r == 1 && ! -e $t/run/ready ]]
 res $? "mark-ready counts only the default session: a's window while b is the default marks nothing"
 echo a > "$t/default"
 : > "$t/log"
-FAKE_UID=1000 bs ready > "$t/out" 2>&1
+INVOCATION_ID=$I FAKE_UID=1000 bs ready > "$t/out" 2>&1
 r=$?
-[[ $r == 0 && ! -e $t/run/ready ]] && logged "systemctl start --no-block blockie-session-ready.service"
+[[ $r == 0 && ! -e $t/run/ready && $(cat "$t/log") == "systemctl start blockie-session-ready@$I.service" ]]
 r1=$?
-FAKE_UID=1000 bs mark-ready > "$t/out" 2>&1
+echo 1 > "$t/start-rc"
+INVOCATION_ID=$I FAKE_UID=1000 bs ready > "$t/out" 2>&1
+r=$?
+rm -f "${t:?}/start-rc"
+[[ $r == 1 ]]
+r1=$((r1 || $?))
+FAKE_UID=1000 bs mark-ready "$I" > "$t/out" 2>&1
 r=$?
 [[ $r == 2 && ! -e $t/run/ready ]]
-res $((r1 || $?)) "ready as the session user starts blockie-session-ready.service; mark-ready refuses a non root caller"
-bs ready > "$t/out" 2>&1
+res $((r1 || $?)) "ready as the session user waits for blockie-session-ready@<its INVOCATION_ID>.service and exits with its result; mark-ready refuses a non root caller"
+r1=0
+for w in "" x "${I^^}" "$I$I"; do
+  : > "$t/log"
+  INVOCATION_ID=$w FAKE_UID=1000 bs ready > "$t/out" 2>&1
+  r=$?
+  [[ $r == 2 && ! -s $t/log && ! -e $t/run/ready ]] && grep -q 'INVOCATION_ID names no unit invocation' "$t/out" ||
+    { r1=1; echo "  ready with INVOCATION_ID '$w': rc $r"; }
+done
+res $r1 "ready outside a unit, or with an INVOCATION_ID that is not 32 hex: exit 2, no unit started"
+INVOCATION_ID=$I bs ready > "$t/out" 2>&1
 r=$?
-[[ $r == 0 && $(cat "$t/run/ready") == "a blockie-test-a.service" ]]
-res $? "ready as root marks at once"
-rm -f "${t:?}/run/ready" "${t:?}/default"
-ru=$sf/usr/lib/systemd/system/blockie-session-ready.service
-grep -qxF 'ExecStart=/usr/bin/blockie-session mark-ready' "$ru" && grep -qxF 'ReadWritePaths=/run/blockie-session' "$ru" &&
+[[ $r == 0 && $(cat "$t/run/ready") == "a blockie-test-a.service $I" ]]
+r1=$?
+rm -f "${t:?}/run/ready"
+INVOCATION_ID=$J bs ready > "$t/out" 2>&1
+r=$?
+[[ $r == 1 && ! -e $t/run/ready ]]
+res $((r1 || $?)) "ready as root marks at once, only for the unit's own invocation"
+rm -f "${t:?}/run/ready" "${t:?}/default" "${t:?}/units/blockie-test-a.service.inv"
+ru=$sf/usr/lib/systemd/system/blockie-session-ready@.service
+grep -qxF 'ExecStart=/usr/bin/blockie-session mark-ready %i' "$ru" && grep -qxF 'ReadWritePaths=/run/blockie-session' "$ru" &&
   grep -qxF 'CapabilityBoundingSet=CAP_SETUID CAP_SETGID' "$ru" && grep -qxF 'NoNewPrivileges=yes' "$ru" &&
-  ! grep -q '^\[Install\]' "$ru"
-res $? "blockie-session-ready.service runs mark-ready in the switcher's sandbox, with no [Install]"
-
+  ! grep -q '^\[Install\]' "$ru" && [[ ! -e $sf/usr/lib/systemd/system/blockie-session-ready.service ]]
+res $? "blockie-session-ready@.service runs mark-ready %i in the switcher's sandbox, with no [Install], and no plain ready unit is left"
+sed -n '/^\[Unit\]/,/^\[/p' "$ru" | grep -qxF 'StartLimitIntervalSec=0'
+res $? "blockie-session-ready@.service has no start rate limit, so the frontend's retries always start it"
 done_

@@ -15,6 +15,7 @@ Requires:       blk-wmt
 Requires:       blk-bt
 Requires:       kmod
 Requires:       util-linux-core
+Requires:       util-linux
 Requires:       coreutils
 Requires:       systemd
 

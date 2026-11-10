@@ -4,7 +4,8 @@ polkit.addRule(function(action, subject) {
   }
   var unit = action.lookup("unit");
   var units = /^blockie-session-(switch|appswitch|revive)@[a-z0-9][a-z0-9-]*\.service$/;
-  if (action.lookup("verb") == "start" && unit && (units.test(unit) || unit == "blockie-session-ready.service")) {
+  var ready = /^blockie-session-ready@[0-9a-f]{32}\.service$/;
+  if (action.lookup("verb") == "start" && unit && (units.test(unit) || ready.test(unit))) {
     return polkit.Result.YES;
   }
 });

@@ -1,12 +1,13 @@
 [Unit]
 Description=Mark the default session ready
 After=blockie-setd.service
+StartLimitIntervalSec=0
 CollectMode=inactive-or-failed
 
 [Service]
 Type=oneshot
 TimeoutStartSec=660
-ExecStart=/usr/bin/blockie-session mark-ready
+ExecStart=/usr/bin/blockie-session mark-ready %i
 ProtectSystem=strict
 ReadWritePaths=/run/blockie-session
 NoNewPrivileges=yes
