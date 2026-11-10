@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 %global _build_id_links none
-%global commit 7b75f3e5dabc752c1f585518838dc6a548aeee5d
-%global shortcommit 7b75f3e
+%global commit 592eea4d90cb9d79e7c17fe1ac769420ea61940e
+%global shortcommit 592eea4
 %global qrdir qrcodegen-720f62bd
 
 Name:           blockie-frontend
@@ -23,6 +23,7 @@ Source9:        https://www.sqlite.org/2026/sqlite-amalgamation-3540100.zip
 Source10:       https://github.com/microsoft/Selawik/releases/download/1.01/Selawik_Release.zip
 Source11:       https://raw.githubusercontent.com/microsoft/Selawik/b65ff9ce7c4673e75ec5c622924a6b6f61f2f876/LICENSE.txt#/Selawik-LICENSE.txt
 Source12:       https://gitlab.freedesktop.org/wlroots/wlr-protocols/-/raw/1106a4a1c57562ddd438c547da4c0d6dc150d624/unstable/wlr-layer-shell-unstable-v1.xml#/wlr-layer-shell-1106a4a1.xml
+Source13:       https://gitlab.freedesktop.org/wayland/wayland-protocols/-/raw/1.41/stable/presentation-time/presentation-time.xml#/presentation-time-1.41.xml
 BuildRequires:  gcc
 BuildRequires:  gcc-c++
 BuildRequires:  wayland-devel
@@ -49,6 +50,7 @@ cp %{SOURCE6} "$cache/fribidi-1.0.16.tar.xz"
 cp %{SOURCE7} "$cache/harfbuzz-14.3.0.tar.xz"
 cp %{SOURCE8} "$cache/xdg-shell-1.41.xml"
 cp %{SOURCE12} "$cache/wlr-layer-shell-1106a4a1.xml"
+cp %{SOURCE13} "$cache/presentation-time-1.41.xml"
 cp %{SOURCE9} "$cache/sqlite-amalgamation-3540100.zip"
 cp %{SOURCE10} "$cache/Selawik_Release.zip"
 
@@ -65,6 +67,7 @@ cp .fe-cache/inc/stb_truetype.h third-party/stb_truetype.h
 sed -n '1,/^\*\*\*\*/p' .fe-cache/src/sqlite-amalgamation-3540100/sqlite3.h > third-party/sqlite-NOTICE
 sed -n '/<copyright>/,/<\/copyright>/p' .fe-cache/xdg-shell-1.41.xml > third-party/xdg-shell-NOTICE
 sed -n '/<copyright>/,/<\/copyright>/p' .fe-cache/wlr-layer-shell-1106a4a1.xml > third-party/wlr-layer-shell-NOTICE
+sed -n '/<copyright>/,/<\/copyright>/p' .fe-cache/presentation-time-1.41.xml > third-party/presentation-time-NOTICE
 cp %{SOURCE11} third-party/Selawik-LICENSE.txt
 
 %install
@@ -77,6 +80,7 @@ BLOCKIE_FE_CACHE=$PWD/.fe-cache BLOCKIE_FE_OUT=$PWD/.fe-out BLOCKIE_FE_JOBS=%{_s
 %files
 %license LICENSE third-party/*
 %{_libexecdir}/blockie/blockie-frontend
+%{_libexecdir}/blockie/blockie-powermenu
 %{_userunitdir}/blockie-frontend.service
 %{_datadir}/blockie/fonts/
 %{_datadir}/blockie/schema.d/20-frontend.json

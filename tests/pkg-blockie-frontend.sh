@@ -10,9 +10,9 @@ rpms=("$out"/blockie-frontend-*.rpm)
 [[ $(rpm -qp --qf '%{NAME} %{ARCH}' "${rpms[0]}") == "blockie-frontend aarch64" ]] || fail "name or arch"
 lic=/usr/share/licenses/blockie-frontend
 fonts=/usr/share/blockie/fonts
-want=$(printf '%s\n' /usr/libexec/blockie/blockie-frontend /usr/lib/systemd/user/blockie-frontend.service "$fonts" \
+want=$(printf '%s\n' /usr/libexec/blockie/blockie-frontend /usr/libexec/blockie/blockie-powermenu /usr/lib/systemd/user/blockie-frontend.service "$fonts" \
   "$fonts/selawk.ttf" "$fonts/selawkb.ttf" "$fonts/selawkl.ttf" "$fonts/selawksl.ttf" /usr/share/blockie/schema.d/20-frontend.json "$lic/Selawik-LICENSE.txt" "$lic/sqlite-NOTICE" "$lic" "$lic/LICENSE" "$lic/fribidi-COPYING" "$lic/harfbuzz-COPYING" \
-  "$lic/libspng-LICENSE" "$lic/qrcodegen.h" "$lic/stb_truetype.h" "$lic/zlib-LICENSE" "$lic/xdg-shell-NOTICE" "$lic/wlr-layer-shell-NOTICE" | LC_ALL=C sort)
+  "$lic/libspng-LICENSE" "$lic/qrcodegen.h" "$lic/stb_truetype.h" "$lic/zlib-LICENSE" "$lic/xdg-shell-NOTICE" "$lic/wlr-layer-shell-NOTICE" "$lic/presentation-time-NOTICE" | LC_ALL=C sort)
 [[ $(rpm -qpl "${rpms[0]}" | LC_ALL=C sort) == "$want" ]] || fail "file list: $(rpm -qpl "${rpms[0]}" | tr '\n' ' ')"
 t=$(mktemp -d)
 trap 'rm -rf "${t:?}"' EXIT
