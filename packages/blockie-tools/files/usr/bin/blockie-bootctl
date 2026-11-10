@@ -57,7 +57,7 @@ android_gate() {
     aw="misc $class"
   elif ! up "$bp" "$bt" "$bs"; then
     aw="slot b unbootable"
-  elif (( bs != 1 )); then
+  elif (( bs != 1 )) && [[ $ap/$at/$as != 15/3/0 ]]; then
     aw="slot b untested"
   elif ! up "$ap" "$at" "$as" || (( at == 0 )); then
     aw="slot a has no tries left"
@@ -251,7 +251,7 @@ healthy() {
       die "healthy: misc reads $class: nothing written"
       ;;
   esac
-  if [[ $class == reset || $suffix != _a || $ap/$at/$as/$bp/$bt/$bs != 15/3/0/13/1/1 ]]; then
+  if [[ $class == reset || $suffix != _a || $ap/$at/$as/$bp/$bt != 15/3/0/13/1 ]]; then
     write healthy default-a
   fi
   r=$reason

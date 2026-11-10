@@ -33,14 +33,14 @@ struct slot {
 static const char* dev = "/dev/block/by-name/misc";
 static int attempt;
 
-static const char* const writes[] = { "default-a", "hold-b", "fix-b", "refund-a", "test-b", "arm-a", "arm-b-once",
-                                      "rearm", "bcb-recovery", "bcb-attempt", "bcb-input", "bcb-clear", "clear-msg",
-                                      "restore", NULL };
+static const char* const writes[] = { "default-a", "hold-b", "fix-b", "unprove-b", "refund-a", "test-b", "arm-a",
+                                      "arm-b-once", "rearm", "bcb-recovery", "bcb-attempt", "bcb-input", "bcb-clear",
+                                      "clear-msg", "restore", NULL };
 
 static void usage(void)
 {
     fprintf(stderr, "usage: abctl [-d device] [-o offset] show\n"
-                    "       abctl [-d device] default-a | hold-b | fix-b | refund-a | test-b\n"
+                    "       abctl [-d device] default-a | hold-b | fix-b | unprove-b | refund-a | test-b\n"
                     "       abctl [-d device] arm-a | arm-b-once | rearm | clear-msg | restore <file>\n"
                     "       abctl [-d device] bcb-recovery <reason> | bcb-attempt | bcb-input | bcb-clear\n");
     exit(2);
@@ -87,6 +87,11 @@ static void set_slot(uint8_t* bc, int i, struct slot v)
 static int bootable(struct slot s)
 {
     return s.priority > 0 && (s.tries > 0 || s.successful);
+}
+
+static int full(struct slot s)
+{
+    return s.priority == 15 && s.tries == 3 && !s.successful;
 }
 
 static int crc_ok(const uint8_t* bc)
@@ -245,14 +250,19 @@ static int rules(const char* cmd, const uint8_t* old, const uint8_t* bc)
                 b0.successful);
         return 1;
     }
-    if (!strcmp(cmd, "test-b") && (a0.priority != 15 || a0.tries != 3 || a0.successful)) {
-        fprintf(stderr, "abctl: test-b refused: slot a reads %d/%d/%d, not 15/3/0\n", a0.priority, a0.tries,
+    if ((!strcmp(cmd, "test-b") || !strcmp(cmd, "unprove-b")) && !full(a0)) {
+        fprintf(stderr, "abctl: %s refused: slot a reads %d/%d/%d, not 15/3/0\n", cmd, a0.priority, a0.tries,
                 a0.successful);
         return 1;
     }
     if ((!strcmp(cmd, "hold-b") || !strcmp(cmd, "arm-b-once")) && (!bootable(a0) || !a0.tries)) {
         fprintf(stderr, "abctl: %s refused: slot a reads %d/%d/%d, not bootable with tries left\n", cmd, a0.priority,
                 a0.tries, a0.successful);
+        return 1;
+    }
+    if (!strcmp(cmd, "hold-b") && !b0.successful && !full(a0)) {
+        fprintf(stderr, "abctl: hold-b refused: slot b reads successful 0 and slot a reads %d/%d/%d, not 15/3/0\n",
+                a0.priority, a0.tries, a0.successful);
         return 1;
     }
     return 0;
@@ -288,15 +298,20 @@ static int count(const char* cmd, uint8_t* blk)
     return 0;
 }
 
-static int change(const char* cmd, uint8_t* blk, const uint8_t* file, const char* arg)
+static int change(const char* cmd, uint8_t* blk, uint8_t* file, const char* arg)
 {
     uint8_t* bc = blk + BC_OFF;
     if (!strcmp(cmd, "restore")) {
-        if (!valid(file + BC_OFF)) {
+        uint8_t* src = file + BC_OFF;
+        if (!valid(src)) {
             fprintf(stderr, "abctl: restore refused: no valid bootloader_control at 0x%x in the file\n", BC_OFF);
             return 1;
         }
-        if (memcmp(bc, file + BC_OFF, BC_SIZE) && rules(cmd, bc, file + BC_OFF))
+        if (get_slot(src, 1).successful && !(valid(bc) && get_slot(bc, 1).successful)) {
+            src[14] &= 0x7f;
+            put32(src + 28, crc32(src, 28));
+        }
+        if (memcmp(bc, src, BC_SIZE) && rules(cmd, bc, src))
             return 1;
         memcpy(blk, file, BLOCK);
         return 0;
@@ -329,20 +344,22 @@ static int change(const char* cmd, uint8_t* blk, const uint8_t* file, const char
     struct slot b = get_slot(bc, 1);
     if (!strcmp(cmd, "default-a")) {
         a = (struct slot){ 15, 3, 0, a.verity };
-        b = (struct slot){ 13, 1, 1, b.verity };
+        b = (struct slot){ 13, 1, b.successful, b.verity };
         set_suffix(bc, 'a');
     } else if (!strcmp(cmd, "hold-b")) {
         a = (struct slot){ 14, a.tries, 0, a.verity };
-        b = (struct slot){ 15, 1, 1, b.verity };
+        b = (struct slot){ 15, 1, b.successful, b.verity };
         set_suffix(bc, 'b');
     } else if (!strcmp(cmd, "fix-b")) {
-        b = (struct slot){ 13, 1, 1, b.verity };
+        b = (struct slot){ 13, 1, 0, b.verity };
+    } else if (!strcmp(cmd, "unprove-b")) {
+        b = (struct slot){ 13, 1, 0, b.verity };
     } else if (!strcmp(cmd, "refund-a")) {
         a.tries = a.tries < 3 ? a.tries + 1 : 3;
         b.priority = 12;
     } else if (!strcmp(cmd, "arm-a")) {
         a = (struct slot){ 15, 1, 0, a.verity };
-        b = (struct slot){ 14, 1, 1, b.verity };
+        b = (struct slot){ 14, 1, b.successful, b.verity };
         set_suffix(bc, 'a');
     } else if (!strcmp(cmd, "arm-b-once") || !strcmp(cmd, "test-b")) {
         a.priority = 14;
@@ -352,7 +369,7 @@ static int change(const char* cmd, uint8_t* blk, const uint8_t* file, const char
         a = (struct slot){ 15, 3, 0, a.verity };
         set_suffix(bc, 'a');
     }
-    if (strcmp(cmd, "fix-b"))
+    if (strcmp(cmd, "fix-b") && strcmp(cmd, "unprove-b"))
         set_slot(bc, 0, a);
     set_slot(bc, 1, b);
     if (rules(cmd, old, bc))

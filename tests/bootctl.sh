@@ -175,6 +175,7 @@ gate() { cat "$d/run/boot/state" 2> /dev/null; }
 writes() { grep -v '^abctl show$' "$d/calls" | paste -sd '|'; }
 gw() { printf '%s\n' "$@"; }
 D='_a 15/3/0 13/1/1 zero'
+U='_a 15/3/0 13/1/0 zero'
 G0=$(gw state=default arm=default android=bootable return=host recovery=no fastboot=no)
 
 setup healthy _a 15/2/0 13/1/1
@@ -197,6 +198,15 @@ setup same _a 15/3/0 13/1/1
 run healthy
 [[ $rc == 0 && $(st) == "$D" && -z $(writes) && $(gate) == "$G0" && -s $d/state/misc.last ]]
 res $? "healthy on a block already at default-a: no write, state=default"
+
+setup unproven _a 15/2/0 13/1/0
+run healthy
+[[ $rc == 0 && $(st) == "$U" && $(writes) == "abctl default-a" && $(gate) == "$G0" && -e $d/run/boot/healthy ]]
+r1=$?
+setup sameunproven _a 15/3/0 13/1/0
+run healthy
+[[ $rc == 0 && $(st) == "$U" && -z $(writes) && $(gate) == "$G0" ]]
+res $((r1 || $?)) "healthy on an unproven b (successful 0): default-a keeps b 13/1/0; a block at 15/3/0, 13/1/0 needs no write"
 
 setup testarm _a 15/0/0 14/1/1
 run healthy
@@ -226,9 +236,15 @@ res $? "healthy leaves a bcb that is not ours (Android's --wipe_data) in place"
 
 setup reset _a 15/7/0 15/7/0
 run healthy
-[[ $rc == 0 && $(st) == "$D" && $(writes) == "abctl default-a" ]] &&
+[[ $rc == 0 && $(st) == "$U" && $(writes) == "abctl default-a" ]] &&
   [[ $(gate) == "$(gw state=default arm=default android=bootable reason=reset return=host recovery=no fastboot=no)" ]]
-res $? "healthy on class reset (both 15/7/0): default-a, state=default reason=reset"
+res $? "healthy on class reset (both 15/7/0): default-a (b 13/1/0, successful as read), state=default reason=reset"
+
+setup mtkreset _a 15/7/1 15/7/0
+run healthy
+[[ $rc == 0 && $(st) == "$U" && $(writes) == "abctl default-a" ]] &&
+  [[ $(gate) == "$(gw state=default arm=default android=bootable reason=reset return=host recovery=no fastboot=no)" ]]
+res $? "healthy on MTK's default block (a 15/7/1, b 15/7/0): default-a gives a 15/3/0, b 13/1/0, reason=reset"
 
 setup invalid _a 15/2/0 13/1/1 crc=bad
 before=$(md5sum < "$m")
@@ -316,7 +332,7 @@ run gates
 grep -qx arm=default "$d/run/boot/state" || { ok=1; echo "  reset"; }
 : > "$d/calls"
 run healthy
-[[ $rc == 0 && $(writes) == "abctl default-a" && $(st) == "$D" ]] && grep -qx arm=default "$d/run/boot/state" &&
+[[ $rc == 0 && $(writes) == "abctl default-a" && $(st) == "$U" ]] && grep -qx arm=default "$d/run/boot/state" &&
   grep -qx reason=reset "$d/run/boot/state" || { ok=1; echo "  reset healthy: rc $rc $(writes)"; }
 setup arm-invalid _a 15/2/0 13/1/1 crc=bad
 run gates
@@ -358,12 +374,18 @@ run android
 [[ $rc == 1 && -z $(writes) ]]
 res $((r1 || $?)) "android after healthy: hold-b (a 14/3/0, b 15/1/1, suffix _b), the android marker, state=android; a second android is refused"
 
-setup untested _a 15/3/0 13/1/0
+setup unproven-android _a 15/2/0 13/1/0
+run healthy
+: > "$d/calls"
+run android
+[[ $rc == 0 && $(st) == '_b 14/3/0 15/1/0 zero' && $(writes) == "abctl hold-b" && -e $d/run/boot/android ]]
+r1=$?
+setup untested _a 15/2/0 13/1/0
 mkdir -p "$d/run/boot"
 printf 'state=default\n' > "$d/run/boot/state"
 run android
 [[ $rc == 1 && -z $(writes) && ! -e $d/run/boot/android ]] && grep -q 'slot b untested' "$d/out"
-res $? "android refused while slot b reads successful 0 (an untested boot_b), no marker"
+res $((r1 || $?)) "android on an unproven b after healthy (a 15/3/0): hold-b gives b 15/1/0, one try; refused with no marker while a reads 15/2/0, as abctl's hold-b rule"
 
 setup holdfail _a 15/2/0 13/1/1
 run healthy

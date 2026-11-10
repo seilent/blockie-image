@@ -309,10 +309,12 @@ def main():
         D = bc_of("_a", (15, 3, 0), (13, 1, 1))
         D2 = bc_of("_a", (15, 2, 0), (13, 1, 1))
         D0 = bc_of("_a", (15, 0, 0), (13, 1, 1))
+        U = bc_of("_a", (15, 3, 0), (13, 1, 0))
         F = bc_of("_b", (0, 0, 0), (15, 1, 1))
         H = bc_of("_b", (14, 3, 0), (15, 1, 1))
         T = bc_of("_a", (15, 1, 0), (14, 1, 1))
         RESET = bc_of("_a", (15, 7, 0), (15, 7, 0))
+        MTK = bc_of("_a", (15, 7, 1), (15, 7, 0))
         TORN = D[:16] + F[16:]
         check(F == open(os.path.join(a.abtest, "bc-after.bin"), "rb").read(), "bc_of builds bc-after.bin byte for byte")
 
@@ -329,10 +331,20 @@ def main():
             check(rc == 1 and why in err and cur() == orig[:0x800] + before + orig[0x820:], what + ": " + err.strip())
 
         slot_cmd("default-a", F, D, "default-a from a 0/0/0, b 15/1/1: a 15/3/0, b 13/1/1, suffix _a, misc+0 kept")
-        slot_cmd("default-a", RESET, D, "default-a from the preloader default (both 15/7/0)")
+        slot_cmd("default-a", RESET, U, "default-a from a tie at 15/7/0: b 13/1/0, successful kept")
+        slot_cmd("default-a", MTK, U, "default-a from MTK's default block (a 15/7/1, b 15/7/0): a 15/3/0, b 13/1/0")
         slot_cmd("default-a", H, D, "default-a from hold-b's state")
+        slot_cmd("default-a", bc_of("_a", (15, 2, 0), (13, 1, 0)), U, "default-a on an unproven b: b 13/1/0")
+        slot_cmd("default-a", bc_of("_b", (14, 3, 0), (15, 0, 0)), U, "default-a after an unproven b's try: b 13/1/0")
         slot_cmd("hold-b", D, H, "hold-b from D: a 14/3/0, b 15/1/1, suffix _b")
         slot_cmd("hold-b", D2, bc_of("_b", (14, 2, 0), (15, 1, 1)), "hold-b keeps a's tries")
+        slot_cmd("hold-b", U, bc_of("_b", (14, 3, 0), (15, 1, 0)), "hold-b on an unproven b with a 15/3/0: b 15/1/0")
+        refused("hold-b", bc_of("_a", (15, 2, 0), (13, 1, 0)), "slot b reads successful 0",
+                "hold-b refused on an unproven b with a 15/2/0")
+        refused("hold-b", bc_of("_a", (15, 3, 1), (13, 1, 0)), "not 15/3/0",
+                "hold-b refused on an unproven b with a 15/3/1")
+        slot_cmd("hold-b", bc_of("_a", (15, 3, 0), (0, 0, 0)), bc_of("_b", (14, 3, 0), (15, 1, 0)),
+                 "hold-b on a drained b with a 15/3/0: b 15/1/0, one try")
         refused("hold-b", F, "slot a unbootable", "hold-b refused on a 0/0/0, b 15/1/1")
         refused("hold-b", D0, "slot a unbootable", "hold-b refused while a reads tries 0")
         slot_cmd("arm-b-once", D, bc_of("_b", (14, 3, 0), (15, 1, 0)), "arm-b-once from D: a 14/3/0, b 15/1/0")
@@ -341,12 +353,14 @@ def main():
         for cmd in ("hold-b", "arm-b-once"):
             refused(cmd, bc_of("_a", (0, 2, 0), (13, 1, 1)), "not bootable with tries left",
                     f"{cmd} refused on a 0/2/0 (a unbootable as read, the result would raise it to 14)")
-        slot_cmd("fix-b", bc_of("_a", (15, 0, 0), (0, 0, 0)), bc_of("_a", (15, 0, 0), (13, 1, 1)),
-                 "fix-b on a 15/0/0, b 0/0/0: b 13/1/1, a and suffix as read")
-        slot_cmd("fix-b", bc_of("_b", (0, 0, 0), (0, 0, 0)), bc_of("_b", (0, 0, 0), (13, 1, 1)),
-                 "fix-b with no bootable slot: b 13/1/1")
+        slot_cmd("fix-b", bc_of("_a", (15, 0, 0), (0, 0, 0)), bc_of("_a", (15, 0, 0), (13, 1, 0)),
+                 "fix-b on a 15/0/0, b 0/0/0: b 13/1/0, a and suffix as read")
+        slot_cmd("fix-b", bc_of("_b", (0, 0, 0), (0, 0, 0)), bc_of("_b", (0, 0, 0), (13, 1, 0)),
+                 "fix-b with no bootable slot: b 13/1/0")
+        slot_cmd("fix-b", bc_of("_a", (15, 2, 0), (0, 0, 1)), bc_of("_a", (15, 2, 0), (13, 1, 0)),
+                 "fix-b on a b 0/0/1: b 13/1/0, an unbootable b always comes back unproven")
         x = bytearray(bc_of("_a", (15, 0, 0), (0, 0, 0)))
-        y = bytearray(bc_of("_a", (15, 0, 0), (13, 1, 1)))
+        y = bytearray(bc_of("_a", (15, 0, 0), (13, 1, 0)))
         x[13] = y[13] = 0xfe
         slot_cmd("fix-b", fix_crc(x), fix_crc(y), "fix-b leaves slot a's two bytes as read (reserved bits 0xfe)")
         refused("fix-b", D2, "slot b reads bootable", "fix-b refused on a 15/2/0, b 13/1/1")
@@ -370,14 +384,62 @@ def main():
         refused("test-b", D2, "not 15/3/0", "test-b refused on a 15/2/0")
         refused("test-b", bc_of("_a", (15, 3, 1), (13, 1, 1)), "not 15/3/0", "test-b refused on a 15/3/1")
         refused("test-b", H, "not 15/3/0", "test-b refused on a 14/3/0")
+        slot_cmd("arm-a", F, T, "arm-a from b 15/1/1: a 15/1/0, b 14/1/1")
+        slot_cmd("arm-a", U, bc_of("_a", (15, 1, 0), (14, 1, 0)), "arm-a on an unproven b: b 14/1/0")
+        slot_cmd("unprove-b", D, U, "unprove-b from D: b 13/1/0, a 15/3/0 and suffix as read")
+        slot_cmd("unprove-b", U, U, "unprove-b on an unproven b: b 13/1/0 again")
+        slot_cmd("unprove-b", bc_of("_a", (15, 3, 0), (12, 1, 1)), U,
+                 "unprove-b on b 12 (a KPOC refund spent): b 13/1/0")
+        x = bytearray(D)
+        y = bytearray(U)
+        x[13] = y[13] = 0xfe
+        slot_cmd("unprove-b", fix_crc(x), fix_crc(y),
+                 "unprove-b leaves slot a's two bytes as read (reserved bits 0xfe)")
+        for bc, what in ((D2, "a 15/2/0"), (H, "a 14/3/0"), (T, "a 15/1/0"), (bc_of("_a", (15, 3, 1), (13, 1, 1)),
+                         "a 15/3/1")):
+            refused("unprove-b", bc, "not 15/3/0", f"unprove-b refused on {what}")
+        refused("unprove-b", F, "slot a unbootable", "unprove-b refused on a 0/0/0")
+
+        walk = [bc_of("_a", (15, 3, 0), (13, 1, 1))]
+        put(walk[0])
+        for cmd, after in (("unprove-b", U), ("hold-b", bc_of("_b", (14, 3, 0), (15, 1, 0))),
+                           ("spent", bc_of("_b", (14, 3, 0), (15, 0, 0))),
+                           ("drain", bc_of("_b", (14, 2, 0), (0, 0, 0))),
+                           ("fix-b", bc_of("_b", (14, 2, 0), (13, 1, 0))), ("default-a", U)):
+            if cmd in ("spent", "drain"):
+                put(after)
+                rc = 0
+            else:
+                rc, out, err = abctl("-d", m, cmd)
+            walk.append(cur()[0x800:0x820])
+            check(rc == 0 and walk[-1] == after, f"walk: {cmd} gives {after.hex()}: {walk[-1].hex()}")
+        check(all(not b[14] >> 7 for b in walk[1:]), "walk (unprove-b, hold-b, a try, the drain, fix-b, default-a): b "
+              "never reads successful")
+        put(bc_of("_a", (0, 0, 0), (0, 0, 0)))
+        rc, out, err = abctl("-d", m, "show")
+        check(rc == 0 and slot("a", 0, 0, 0) in out.splitlines() and slot("b", 0, 0, 0) in out.splitlines(),
+              "show reads a drained a and a drained b: both unbootable")
+
+        rfile = os.path.join(d, "restore.bin")
+        for live, src, after, what in ((U, D, U, "a file with b successful 1 over a live b successful 0 keeps 0"),
+                                       (D, U, U, "a file with b successful 0 over a live 1 writes 0"),
+                                       (D, H, H, "a file with b successful 1 over a live 1 keeps 1"),
+                                       (TORN, D, U, "a file with b successful 1 over a torn live block writes 0")):
+            open(rfile, "wb").write(orig[:0x800] + src + orig[0x820:])
+            put(live)
+            rc, out, err = abctl("-d", m, "restore", rfile)
+            data = cur()
+            check(rc == 0 and data[0x800:0x820] == after and data[:0x800] == orig[:0x800] and
+                  data[0x820:] == orig[0x820:], f"restore: {what}" + (": " + err.strip() if rc else ""))
 
         for bc, cls, what in ((D, "ours", "D"), (H, "ours", "H"), (F, "ours", "a 0/0/0, b 15/1/1"),
-                              (RESET, "reset", "equal priorities"), (bc_of("_a", (15, 7, 0), (13, 1, 1)), "reset",
-                              "a tries 7"), (TORN, "invalid", "torn sector")):
+                              (RESET, "reset", "equal priorities"), (MTK, "reset", "MTK's default block"),
+                              (bc_of("_a", (15, 7, 0), (13, 1, 1)), "reset", "a tries 7"),
+                              (TORN, "invalid", "torn sector")):
             put(bc)
             rc, out, err = abctl("-d", m, "show")
             check(f"class {cls}" in out.splitlines(), f"show prints class {cls} for {what}")
-        for cmd in ("default-a", "hold-b", "fix-b", "refund-a", "test-b", "arm-a", "arm-b-once", "rearm"):
+        for cmd in ("default-a", "hold-b", "fix-b", "unprove-b", "refund-a", "test-b", "arm-a", "arm-b-once", "rearm"):
             refused(cmd, TORN, "no valid bootloader_control", f"{cmd} refused on a torn sector")
 
         def traced(args):
@@ -391,6 +453,7 @@ def main():
 
         for args, before, size, off in ((["default-a"], F, 512, 2048), (["hold-b"], D, 512, 2048),
                                         (["fix-b"], bc_of("_a", (15, 0, 0), (0, 0, 0)), 512, 2048),
+                                        (["unprove-b"], D, 512, 2048),
                                         (["refund-a"], D2, 512, 2048), (["test-b"], D, 512, 2048),
                                         (["arm-a"], F, 512, 2048), (["arm-b-once"], D, 512, 2048),
                                         (["rearm"], T, 512, 2048), (["bcb-recovery", "menu"], D, 512, 0),
