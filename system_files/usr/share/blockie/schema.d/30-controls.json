@@ -1,0 +1,13 @@
+{
+  "owner": "blockie-set",
+  "keys": {
+    "controls.rumble": {
+      "type": "u",
+      "default": 100,
+      "enum": [0, 25, 50, 75, 100],
+      "group": "controls",
+      "label": "Vibration",
+      "map": true
+    }
+  }
+}

@@ -3,6 +3,65 @@ set -euo pipefail
 
 fail() { echo "wifi: $*" >&2; exit 1; }
 
+here=$(cd "$(dirname "$0")" && pwd)
+rules=${NETWORK_RULES:-/usr/share/polkit-1/rules.d/50-blockie-network.rules}
+[[ -f $rules ]] || rules=$here/../system_files/usr/share/polkit-1/rules.d/50-blockie-network.rules
+grants=(org.freedesktop.NetworkManager.enable-disable-wifi)
+
+polkit() {
+  RULES=$rules GRANTS="${grants[*]}" node - << 'EOF' || fail "polkit: blockie may use NetworkManager's enable-disable-wifi, nothing else"
+const fs = require("fs");
+const rules = [];
+const polkit = { Result: { YES: "yes", NO: "no", AUTH_ADMIN: "auth_admin" }, addRule: (f) => rules.push(f) };
+new Function("polkit", fs.readFileSync(process.env.RULES, "utf8"))(polkit);
+const nm = "org.freedesktop.NetworkManager.";
+const grants = process.env.GRANTS.split(" ");
+const others = ["network-control", "wifi.scan", "settings.modify.system", "enable-disable-network", "reload",
+  "sleep-wake", "enable-disable-wwan", "enable-disable-wimax", "wifi.share.protected", "wifi.share.open",
+  "settings.modify.own", "settings.modify.hostname", "settings.modify.global-dns", "checkpoint-rollback",
+  "enable-disable-statistics", "enable-disable-connectivity-check", "enable-disable-wifi2", "network-control2",
+  "wifi", "settings.modify"].map((a) => nm + a);
+const cases = [];
+for (const id of grants) {
+  cases.push([id, "blockie", "yes"]);
+  for (const user of ["blockie-set", "root", "nobody", "blockie2"]) {
+    cases.push([id, user, "none"]);
+  }
+  cases.push([id.replace(nm, "org.freedesktop.NetworkManagerX."), "blockie", "none"]);
+}
+for (const id of others) {
+  cases.push([id, "blockie", "none"]);
+}
+cases.push(["org.freedesktop.systemd1.manage-units", "blockie", "none"]);
+cases.push(["org.freedesktop.timedate1.set-timezone", "blockie", "none"]);
+cases.push(["org.freedesktop.login1.power-off", "blockie", "none"]);
+let bad = 0;
+for (const [id, user, want] of cases) {
+  const action = { id: id, lookup: () => undefined };
+  let got = "none";
+  for (const r of rules) {
+    const v = r(action, { user: user });
+    if (v !== undefined) {
+      got = v;
+      break;
+    }
+  }
+  if (got !== want) {
+    console.log(`${id} ${user}: ${got}, want ${want}`);
+    bad++;
+  }
+}
+process.exit(bad ? 1 : 0);
+EOF
+}
+
+if [[ ${1:-} == polkit ]]; then
+  command -v node > /dev/null || { echo "wifi: polkit needs node" >&2; exit 2; }
+  polkit
+  echo "wifi: polkit ok"
+  exit 0
+fi
+
 rpm -q blk-wmt blockie-tools wpa_supplicant NetworkManager-wifi iw wireless-regdb > /dev/null || fail "packages"
 for f in blk-wmt blockie-wifi; do
   [[ -x /usr/libexec/blockie/$f ]] || fail "/usr/libexec/blockie/$f not executable"
@@ -39,4 +98,15 @@ done
 nm=$(NetworkManager --print-config 2> /dev/null) || fail "NetworkManager --print-config failed"
 grep -qxF "$only" <<< "$nm" || fail "NetworkManager's merged config does not leave ap0, wlan1, p2p0, waydroid0 and veth* unmanaged"
 grep -qxF "$fw" <<< "$nm" || fail "NetworkManager's merged config has a firewall backend"
+[[ $(stat -c '%a %U' /usr/share/polkit-1/rules.d/50-blockie-network.rules 2> /dev/null) == '644 root' ]] ||
+  fail "50-blockie-network.rules is not a 644 file owned by root"
+for a in "${grants[@]}"; do
+  grep -qF "id=\"$a\"" /usr/share/polkit-1/actions/org.freedesktop.NetworkManager.policy ||
+    fail "the NetworkManager policy has no $a action"
+done
+if command -v node > /dev/null; then
+  polkit
+else
+  echo "polkit: no node in the image, the host leg (tests/wifi.sh polkit) evaluates the rule"
+fi
 echo "wifi: ok"

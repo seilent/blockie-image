@@ -168,6 +168,41 @@ check(keys["system.timezone"]["backend"] == "timedate1"
       "only one timedate1 key of type s with enum_from zones loads, other backend keys are dropped")
 check(keys["session.default"]["default"] == "emulation", "a key defined twice keeps the first file's definition")
 check(m.default_sessions() == ["emulation", "funeos"], "default sessions: DEFAULT=yes, quoted or not")
+want = {
+    "display.brightness": {"type": "u", "default": 40, "min": 10, "max": 100, "group": "display", "label": "Brightness"},
+    "sound.volume_step": {"type": "u", "default": 5, "enum": [2, 5, 10], "group": "sound", "label": "Volume step"},
+    "controls.rumble": {"type": "u", "default": 100, "enum": [0, 25, 50, 75, 100], "group": "controls",
+                        "label": "Vibration"},
+    "power.screen_off": {"type": "u", "default": 300, "enum": [0, 60, 120, 300, 600, 1800], "group": "power",
+                         "label": "Screen off after"},
+    "games.shader": {"type": "b", "default": True, "group": "games", "label": "Shaders"},
+    "games.integer_scale": {"type": "b", "default": False, "group": "games", "label": "Integer scale"},
+    "games.resume": {"type": "b", "default": False, "group": "games", "label": "Resume"},
+    "games.rewind": {"type": "b", "default": False, "group": "games", "label": "Rewind"},
+}
+got = {k: {f: v for f, v in keys[k].items() if f != "map"} for k in want if k in keys}
+check(got == want, f"the five 30-*.json files load with their types, defaults, ranges, enums, groups and labels: {got}")
+check(all(keys[k].get("map") is True for k in want if k in keys)
+      and not [k for k, v in keys.items() if "map" in v and k not in want and not k.startswith("buttons.")],
+      "map is true on every key of the five files and on no other key but buttons.*")
+
+
+def takes(key, good, bad):
+    spec = keys.get(key)
+    if spec is None:
+        return False
+    return (all(m.check(key, spec, v) == v for v in good)
+            and all(refused(lambda v=v: m.check(key, spec, v), "Invalid") for v in bad))
+
+
+check(takes("display.brightness", [10, 55, 100], [9, 101, 0, True, "40"]),
+      "display.brightness takes 10 to 100, refuses 9, 101, a boolean and a string")
+check(takes("sound.volume_step", [2, 5, 10], [0, 1, 3, 4, 6, 20]), "sound.volume_step takes only 2, 5 and 10")
+check(takes("controls.rumble", [0, 25, 50, 75, 100], [1, 30, 99, 101]), "controls.rumble takes only 0, 25, 50, 75 and 100")
+check(takes("power.screen_off", [0, 60, 120, 300, 600, 1800], [1, 30, 59, 900, 3600]),
+      "power.screen_off takes only 0, 60, 120, 300, 600 and 1800")
+check(all(takes(k, [True, False], [0, 1, "true", None]) for k in want if k.startswith("games.")),
+      "the games keys take true and false, refuse 0, 1, a string and null")
 s = m.Store(keys)
 check(s.get("test.level") == 3 and s.get("session.default") == "emulation", "defaults before any write")
 check(s.set("test.level", 7) and s.get("test.level") == 7, "set a valid value")
@@ -349,6 +384,21 @@ EOF
   res $? "bus: Changed signals for the set keys"
   grep -q '"test.level": 5' "$t/store/settings.json"
   res $? "bus: the daemon wrote the store"
+  [[ $("$cli" list display.) == display.brightness=40 && $("$cli" list sound.) == sound.volume_step=5 &&
+    $("$cli" list controls.) == controls.rumble=100 && $("$cli" list power.) == power.screen_off=300 &&
+    $("$cli" list games.) == $'games.integer_scale=false\ngames.resume=false\ngames.rewind=false\ngames.shader=true' ]]
+  res $? "bus: the five settings files answer their defaults"
+  "$cli" set power.screen_off 30 2> "$t/err"
+  r=$?
+  "$cli" set display.brightness 101 2>> "$t/err"
+  r2=$?
+  [[ $r != 0 && $r2 != 0 && $("$cli" get power.screen_off) == 300 && $("$cli" get display.brightness) == 40 ]] &&
+    grep -q 'power.screen_off is one of 0, 60, 120, 300, 600, 1800' "$t/err" &&
+    grep -q 'display.brightness is at most 100' "$t/err"
+  res $? "bus: a u enum and a u max refuse with the reason, the defaults stay"
+  "$cli" set display.brightness 10 && "$cli" set power.screen_off 0 && "$cli" set games.shader false &&
+    [[ $("$cli" get display.brightness) == 10 && $("$cli" get power.screen_off) == 0 && $("$cli" get games.shader) == false ]]
+  res $? "bus: the lowest brightness, never and shaders off are taken"
 
   gg() {
     DBUS_SESSION_BUS_ADDRESS=$BLOCKIE_SETD_BUS gdbus call --session --dest net.seilent.Blockie.Settings \

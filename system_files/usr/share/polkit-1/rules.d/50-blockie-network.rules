@@ -1,0 +1,5 @@
+polkit.addRule(function(action, subject) {
+  if (action.id == "org.freedesktop.NetworkManager.enable-disable-wifi" && subject.user == "blockie") {
+    return polkit.Result.YES;
+  }
+});

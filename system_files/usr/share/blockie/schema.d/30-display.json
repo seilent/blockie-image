@@ -1,0 +1,14 @@
+{
+  "owner": "blockie-set",
+  "keys": {
+    "display.brightness": {
+      "type": "u",
+      "default": 40,
+      "min": 10,
+      "max": 100,
+      "group": "display",
+      "label": "Brightness",
+      "map": true
+    }
+  }
+}

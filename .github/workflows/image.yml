@@ -217,6 +217,8 @@ jobs:
           suite env SESSION_RULES="$PWD/system_files/usr/share/polkit-1/rules.d/50-blockie-session.rules" tests/session.sh polkit
           t=bootctl-polkit
           suite env BOOT_RULES="$PWD/system_files/usr/share/polkit-1/rules.d/50-blockie-boot.rules" tests/bootctl.sh polkit
+          t=network-polkit
+          suite env NETWORK_RULES="$PWD/system_files/usr/share/polkit-1/rules.d/50-blockie-network.rules" tests/wifi.sh polkit
           t=setd
           suite podman run --rm -v "$PWD/tests:/tests:ro" "$IMAGE:$TAG" \
             bash -c 'dnf -y -q install dbus-daemon > /dev/null && /tests/setd.sh'
