@@ -282,7 +282,7 @@ port() {
       -p BindsTo=blockie-frontend.service -p After=blockie-frontend.service -p MemoryHigh=80% -p MemoryMax=90% \
       -p TasksMax=512 -p OOMPolicy=kill -p TimeoutStopSec=10s -- env -u XDG_CONFIG_HOME -u XDG_DATA_HOME \
       -u XDG_CACHE_HOME -u SDL_AUDIODRIVER PATH="$shims:$PATH" HOME="$data/ports-home" TMPDIR="$ptmp" PM_CAN_MOUNT=N \
-      ALSA_CONFIG_PATH=/usr/share/blockie/ports/alsa.conf BLOCKIE_PORTMSG_ENV="$msg" bash "$real"
+      ALSA_CONFIG_PATH=/usr/share/blockie/ports/alsa.conf BLOCKIE_PORTMSG_ENV="$msg" BLOCKIE_GPULIB="$gpulib" bash "$real"
   ) < /dev/null > "$log" 2>&1 3<&- {lk}>&- &
   pid=$!
   appids "$pid" "$snap" < /dev/null > /dev/null 2>&1 3<&- {lk}>&- &

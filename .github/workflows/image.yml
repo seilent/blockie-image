@@ -191,9 +191,54 @@ jobs:
           path: ${{ steps.dnf.outputs.dir }}
           key: dnf-rpms-aarch64-${{ steps.dnf.outputs.date }}
 
+      - name: Westonpack dir
+        id: wpdir
+        run: echo "dir=$RUNNER_TEMP/westonpack" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        if: inputs.cold != true
+        with:
+          path: ${{ steps.wpdir.outputs.dir }}
+          key: westonpack-0bccaeebc11296bb1fe4278c9677cb82965c5a04bcd63745fa09d78228bc1a93
+
+      - name: Westonpack
+        id: westonpack
+        env:
+          DIR: ${{ steps.wpdir.outputs.dir }}
+          URL: https://github.com/PortsMaster/PortMaster-New/releases/download/2025-07-24_0745/weston_pkg_0.2.squashfs
+          SHA256: 0bccaeebc11296bb1fe4278c9677cb82965c5a04bcd63745fa09d78228bc1a93
+        run: |
+          f=$DIR/weston_pkg_0.2.squashfs
+          mkdir -p "$DIR"
+          if [[ -f $f && $(sha256sum < "$f" | cut -d' ' -f1) == "$SHA256" ]]; then
+            echo "weston_pkg_0.2.squashfs from the cache"
+          else
+            rm -f "$f" "$f.part"
+            if ! curl -fsSL --retry 3 -o "$f.part" "$URL"; then
+              rm -f "$f.part"
+              echo "::warning::$URL did not download, the westonpack check is skipped"
+            elif [[ $(sha256sum < "$f.part" | cut -d' ' -f1) != "$SHA256" ]]; then
+              rm -f "$f.part"
+              echo "::warning::$URL is not sha256 $SHA256, the westonpack check is skipped"
+            else
+              mv "$f.part" "$f"
+              echo "save=true" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+          if [[ -f $f ]]; then
+            echo "file=$f" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        if: github.ref == 'refs/heads/main' && inputs.cold != true && steps.westonpack.outputs.save == 'true'
+        with:
+          path: ${{ steps.wpdir.outputs.dir }}
+          key: westonpack-0bccaeebc11296bb1fe4278c9677cb82965c5a04bcd63745fa09d78228bc1a93
+
       - name: Test
         env:
           TAG: ${{ steps.version.outputs.push_tag }}
+          WESTONPACK: ${{ steps.westonpack.outputs.file }}
         run: |
           suite() {
             rc=0
@@ -208,6 +253,13 @@ jobs:
           for t in image units blobs audio wifi bt boot-ok bootctl data session hotkeyd power game game-cmd ports ports-helper android android-sched; do
             suite podman run --rm -v "$PWD/tests:/tests:ro" -v "$PWD/boot:/repo-boot:ro" "$IMAGE:$TAG" "/tests/$t.sh"
           done
+          t=westonpack
+          if [[ -n $WESTONPACK ]]; then
+            suite podman run --rm -v "$PWD/tests:/tests:ro" -v "$WESTONPACK:/westonpack/weston_pkg_0.2.squashfs:ro" \
+              "$IMAGE:$TAG" /tests/westonpack.sh /westonpack/weston_pkg_0.2.squashfs
+          else
+            echo "::warning::no weston_pkg_0.2.squashfs, the westonpack check is skipped"
+          fi
           t=android-polkit
           build/ci-need.sh node:nodejs
           suite env BLOCKIE_ANDROID_ROOT="$PWD/system_files" tests/android.sh polkit

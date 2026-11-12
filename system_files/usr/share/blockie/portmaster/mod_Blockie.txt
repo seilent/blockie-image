@@ -7,9 +7,72 @@ export SDL_VIDEODRIVER="wayland"
 export SDL_VIDEO_WAYLAND_WMCLASS="net.seilent.Blockie.Port"
 export SDL_APP_ID="net.seilent.Blockie.Port"
 
+BLOCKIE_PORTS_COMPAT=/usr/lib64/blockie-ports/compat
+
+_blockie_join() {
+  local out=":" part d
+  local -a dirs
+  for part in "$@"; do
+    IFS=: read -ra dirs <<< "$part"
+    for d in "${dirs[@]}"; do
+      [[ -n $d && $out != *":$d:"* ]] && out+="$d:"
+    done
+  done
+  out=${out#:}
+  printf '%s' "${out%:}"
+}
+
+_blockie_xlocks() {
+  local dir=${BLOCKIE_XDIR:-/tmp} f n pid comm
+  for f in "$dir"/.X*-lock; do
+    n=${f##*/.X}
+    n=${n%-lock}
+    [[ $n =~ ^[0-9]+$ && -f $f && ! -L $f && -O $f ]] || continue
+    pid=
+    comm=
+    { read -r pid < "$f"; } 2> /dev/null
+    [[ $pid =~ ^[0-9]+$ ]] && { read -r comm < "/proc/$pid/comm"; } 2> /dev/null
+    [[ $comm == Xwayland || $comm == wp_weston ]] && continue
+    rm -f -- "$f" "$dir/.X11-unix/X$n"
+  done
+}
+
+_blockie_started() {
+  local s
+  local -a f
+  { read -r s < "/proc/$1/stat"; } 2> /dev/null || return 1
+  read -ra f <<< "${s##*) }"
+  printf '%s' "${f[19]}"
+}
+
+_blockie_xwatch() {
+  local dir=${BLOCKIE_XDIR:-/tmp} polls=${BLOCKIE_XWATCH_POLLS:-60} t0=${EPOCHREALTIME%[.,]*} me=$$ start i f s
+  [[ $polls =~ ^[1-9][0-9]*$ ]] || polls=60
+  start=$(_blockie_started "$me") || return 0
+  for ((i = 0; i < polls; i++)); do
+    sleep 0.5
+    [[ $(_blockie_started "$me") == "$start" ]] || return 0
+    for f in "$dir/.X11-unix/X0" "$dir/.X11-unix/X1"; do
+      s=$(stat -c %Y -- "$f" 2> /dev/null) || continue
+      (( s >= t0 )) && return 0
+    done
+  done
+  [[ $(_blockie_started "$me") == "$start" ]] || return 0
+  echo "blockie: westonpack display not up" >&2
+  kill -TERM "$me" 2> /dev/null
+}
+
 if [[ "${0##*/}" == westonwrap*.sh ]]; then
   CFW_NAME="ROCKNIX"
   glxinfo() { :; }
+  WP_32BIT="${WP_32BIT:-0}"
+  export SEATD_VTBOUND=0
+  export WRAPPED_LIBRARY_PATH_MALI="$(_blockie_join "${WRAPPED_LIBRARY_PATH_MALI-}" "${BLOCKIE_GPULIB-}" "$BLOCKIE_PORTS_COMPAT")"
+  export LD_LIBRARY_PATH="$(_blockie_join "${LD_LIBRARY_PATH-}" "${BLOCKIE_GPULIB-}" "$BLOCKIE_PORTS_COMPAT")"
+  if [[ ${1-} != cleanup ]] && (( $# >= 5 )); then
+    _blockie_xlocks
+    _blockie_xwatch < /dev/null &
+  fi
 fi
 
 GODOT2_OPTS="-r ${DISPLAY_WIDTH}x${DISPLAY_HEIGHT} -f"

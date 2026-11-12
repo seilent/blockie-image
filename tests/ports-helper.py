@@ -725,6 +725,106 @@ def _(c):
     c(len(hmlog("open")) == 0, "sync opened harbourmaster")
 
 
+WP = "0a761c28877625861d9c9c4326664428"
+XKB = "lib_aarch64/libxkbcommon.so.0"
+
+
+def wp_unpack(digest, hide=True):
+    f = f"{LIBS}/weston_pkg_0.2.squashfs"
+    if not os.path.exists(f):
+        mkzip(f, {"westonwrap.sh": ("#!/bin/sh\n", 0o755), XKB: "invented xkb",
+                  "lib_aarch64/libxkbcommon-x11.so.0": "invented xkb x11", "lib_aarch64/libweston-14.so.0": "invented"})
+    saved = m.HIDE
+    if not hide:
+        m.HIDE = {}
+    r, w = os.pipe()
+    try:
+        m.unpack_tree(f, digest, m.Proto(w))
+    finally:
+        m.HIDE = saved
+        os.close(w)
+        os.close(r)
+    return f"{UNPACKED}/{digest}"
+
+
+def xkb_state(tree):
+    p = f"{tree}/{XKB}"
+    return os.path.lexists(p), os.path.lexists(p + ".blockie-hidden"), mode(f"{tree}/lib_aarch64")
+
+
+@case("the xkbcommon hide at unpack: under the listed md5 libxkbcommon.so.0 is renamed before the seal, "
+      "libxkbcommon-x11.so.0 stays, another md5 keeps its libxkbcommon.so.0")
+def _(c):
+    reset()
+    tree = wp_unpack(WP)
+    c(xkb_state(tree) == (False, True, 0o555), f"listed {xkb_state(tree)}")
+    c(mode(f"{tree}/{XKB}.blockie-hidden") == 0o444, "the hidden file is not sealed")
+    c(os.path.isfile(f"{tree}/lib_aarch64/libxkbcommon-x11.so.0"), "libxkbcommon-x11.so.0 hidden")
+    c([r[0] for r in unindex()] == ["weston_pkg_0.2.squashfs"] and unindex()[0][4] == WP, f"index {unindex()}")
+    other = wp_unpack(md5(f"{LIBS}/weston_pkg_0.2.squashfs"))
+    c(xkb_state(other) == (True, False, 0o555), f"another md5 {xkb_state(other)}")
+
+
+@case("the xkbcommon hide at sync, with no XDG_RUNTIME_DIR and no /run/user/<uid>: a tree unpacked before it is "
+      "hidden, another md5 is left, the unpack index is byte identical, idempotent")
+def _(c):
+    reset()
+    call("sync")
+    tree = wp_unpack(WP, hide=False)
+    other = wp_unpack(md5(f"{LIBS}/weston_pkg_0.2.squashfs"))
+    before = open(f"{UNPACKED}/index.tsv", "rb").read()
+    c(xkb_state(tree) == (True, False, 0o555), f"before {xkb_state(tree)}")
+    c(not os.path.exists(f"/run/user/{os.getuid()}"), f"/run/user/{os.getuid()} exists, the case does not hold")
+    env = {k: v for k, v in os.environ.items() if k != "XDG_RUNTIME_DIR"}
+    for i in range(2):
+        os.remove(f"{STATE}/index.tsv")
+        r = sub("sync", env=env)
+        c(r.returncode == 0 and r.stdout == "done\tsync\n", f"sync {i} {r.stdout!r} {r.stderr[-400:]}")
+        c(("hid lib_aarch64/libxkbcommon.so.0" in r.stderr) == (i == 0), f"sync {i} log {r.stderr[-400:]}")
+        c(xkb_state(tree) == (False, True, 0o555), f"sync {i} {xkb_state(tree)}")
+        c(xkb_state(other) == (True, False, 0o555), f"sync {i} another md5 {xkb_state(other)}")
+        c(os.path.isfile(f"{tree}/lib_aarch64/libxkbcommon-x11.so.0"), f"sync {i} hid libxkbcommon-x11.so.0")
+        c(open(f"{UNPACKED}/index.tsv", "rb").read() == before, f"sync {i} changed the unpack index")
+        c(os.path.isfile(f"{STATE}/index.tsv"), f"sync {i} wrote no index")
+
+
+@case("the xkbcommon hide: a sync stopped with the dir 0755 or after the rename is finished by the next sync; "
+      "a refused rename is logged, the sync still writes the index and the next one hides")
+def _(c):
+    reset()
+    call("sync")
+    tree = wp_unpack(WP, hide=False)
+    d = f"{tree}/lib_aarch64"
+    os.chmod(d, 0o755)
+    rc, lines = call("sync")
+    c(rc == 0 and xkb_state(tree) == (False, True, 0o555), f"dir 0755 with the name {lines} {xkb_state(tree)}")
+    os.chmod(d, 0o755)
+    rc, lines = call("sync")
+    c(rc == 0 and xkb_state(tree) == (False, True, 0o555), f"hidden with the dir 0755 {lines} {xkb_state(tree)}")
+    os.chmod(d, 0o755)
+    os.rename(f"{tree}/{XKB}.blockie-hidden", f"{tree}/{XKB}")
+    os.chmod(d, 0o555)
+    os.remove(f"{STATE}/index.tsv")
+    real = os.rename
+
+    def deny(a, b, *args, **kw):
+        if str(a).endswith(XKB):
+            raise PermissionError(13, "invented denial", a)
+        return real(a, b, *args, **kw)
+
+    LOG.clear()
+    os.rename = deny
+    try:
+        rc, lines = call("sync")
+    finally:
+        os.rename = real
+    c(rc == 0 and lines == ["done\tsync"] and os.path.isfile(f"{STATE}/index.tsv"), f"refused {lines}")
+    c(any("cannot hide lib_aarch64/libxkbcommon.so.0" in x for x in LOG), f"log {LOG}")
+    c(xkb_state(tree)[:2] == (True, False), f"refused {xkb_state(tree)}")
+    rc, lines = call("sync")
+    c(rc == 0 and xkb_state(tree) == (False, True, 0o555), f"after the refusal {lines} {xkb_state(tree)}")
+
+
 @case("the real harbourmaster: after a stamp change, an offline open still loads both sources")
 def _(c):
     tree = f"{REAL_USR}/PortMaster"

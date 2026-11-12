@@ -28,6 +28,8 @@ Requires:       xdelta
 Requires:       libtheora
 Requires:       squashfs-tools
 Requires:       python3
+Requires:       libjpeg8
+Requires:       bzip2-libs
 
 %description
 The read only PortMaster tree port scripts source: control.txt, funcs.txt, device_info.txt and the
@@ -63,6 +65,8 @@ ln -s %{_bindir}/7zz "$pm/7zzs.%{_target_cpu}"
 ln -s %{_bindir}/innoextract "$pm/innoextract.%{_target_cpu}"
 ln -s %{_bindir}/xdelta3 "$pm/xdelta3"
 ln -s %{_libdir}/libtheoradec.so.1 "$pm/libs.%{_target_cpu}/libtheoradec.so.1"
+install -d %{buildroot}%{_libdir}/blockie-ports/compat
+ln -s %{_libdir}/libbz2.so.1 %{buildroot}%{_libdir}/blockie-ports/compat/libbz2.so.1.0
 %{python3} -m compileall -q -s %{buildroot} -p / --invalidation-mode unchecked-hash "$pm/pylibs" "$pm/exlibs"
 (cd "$pm" && find . -mindepth 1 -name __pycache__ -prune -o -print | LC_ALL=C sort | while IFS= read -r p; do
   if [ -L "$p" ]; then
@@ -84,3 +88,5 @@ install -m0644 %{SOURCE3} "$lic/LICENSE-gamecontrollerdb.txt"
 %dir %{pmroot}
 %{pmroot}/PortMaster
 %{pmroot}/tree.sha256
+%dir %{_libdir}/blockie-ports/compat
+%{_libdir}/blockie-ports/compat/libbz2.so.1.0

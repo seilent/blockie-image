@@ -14,14 +14,17 @@ arch=$(uname -m)
 [[ $(rpm -qp --qf '%{LICENSE}' "$rpm") == "MIT AND GPL-2.0-only AND Apache-2.0 AND BSD-3-Clause AND PSF-2.0 AND OFL-1.1 AND Bitstream-Vera AND Arev AND Zlib AND LicenseRef-Fedora-Public-Domain" ]] ||
   fail "licence tag"
 requires=$(rpm -qpR "$rpm")
-for r in gptokeyb gptokeyb2 love luajit 7zip-standalone-all innoextract xdelta libtheora squashfs-tools python3; do
+for r in gptokeyb gptokeyb2 love luajit 7zip-standalone-all innoextract xdelta libtheora squashfs-tools python3 libjpeg8 \
+  bzip2-libs; do
   grep -qx "$r" <<< "$requires" || fail "no Requires $r"
 done
 root=/usr/share/blockie/portmaster
 lic=/usr/share/licenses/$name
+compat=/usr/lib64/blockie-ports/compat
 files=$(rpm -qpl "$rpm")
-bad=$(grep -v -e "^$root\(/.*\)\?$" -e "^$lic\(/.*\)\?$" <<< "$files" || true)
-[[ -z $bad ]] || fail "files outside $root and $lic: $bad"
+bad=$(grep -v -e "^$root\(/.*\)\?$" -e "^$lic\(/.*\)\?$" -e "^$compat\(/libbz2\.so\.1\.0\)\?$" <<< "$files" || true)
+[[ -z $bad ]] || fail "files outside $root, $lic and $compat/libbz2.so.1.0: $bad"
+grep -qx "$compat/libbz2.so.1.0" <<< "$files" || fail "no $compat/libbz2.so.1.0"
 bad=$(grep -iE 'x86_64|armhf' <<< "$files" || true)
 [[ -z $bad ]] || fail "x86_64 or armhf files: $bad"
 t=$(mktemp -d)
@@ -59,6 +62,9 @@ want=$(printf '%s\n' "gptokeyb /usr/lib64/blockie-ports/gptokeyb" "gptokeyb2 /us
   "innoextract.$arch /usr/bin/innoextract" "xdelta3 /usr/bin/xdelta3" \
   "libs.$arch/libtheoradec.so.1 /usr/lib64/libtheoradec.so.1" "runtimes/love_11.5/love.$arch /usr/bin/love" | LC_ALL=C sort)
 [[ $links == "$want" ]] || fail "links: $links"
+[[ -L $t$compat/libbz2.so.1.0 && $(readlink "$t$compat/libbz2.so.1.0") == /usr/lib64/libbz2.so.1 ]] ||
+  fail "$compat/libbz2.so.1.0 does not link to /usr/lib64/libbz2.so.1"
+[[ $(find "$t$compat" -mindepth 1 -printf '%f\n') == libbz2.so.1.0 ]] || fail "$compat holds more than libbz2.so.1.0"
 
 while read -r kind n from; do
   n=${n//@/$arch}

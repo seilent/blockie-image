@@ -75,7 +75,17 @@ rpm -q e2fsprogs tzdata erofs-utils vulkan-tools egl-utils drm-utils strace file
   libwayland-server NetworkManager-wifi wpa_supplicant iw wireless-regdb iperf3 bluez alsa-ucm alsa-ucm-utils \
   alsa-utils retroarch libretro-mgba libretro-pcsx-rearmed kmscube glmark2 > /dev/null || fail "packages missing"
 rpm -q gptokeyb gptokeyb2 portmaster SDL2_mixer SDL2_ttf SDL2_image love luajit innoextract xdelta turbojpeg \
-  7zip-standalone-all squashfs-tools sdl2-compat openal-soft libtheora libvorbis > /dev/null || fail "ports packages missing"
+  7zip-standalone-all squashfs-tools sdl2-compat openal-soft libtheora libvorbis libjpeg8 > /dev/null || fail "ports packages missing"
+compat=/usr/lib64/blockie-ports/compat
+[[ -f $compat/libjpeg.so.8 && $(rpm -qf --qf '%{NAME}' "$compat/libjpeg.so.8") == libjpeg8 ]] &&
+  grep -qaF LIBJPEG_8.0 "$compat/libjpeg.so.8" || fail "$compat/libjpeg.so.8 is not libjpeg8's LIBJPEG_8.0 library"
+[[ $(readlink "$compat/libbz2.so.1.0") == /usr/lib64/libbz2.so.1 && -f $compat/libbz2.so.1.0 ]] ||
+  fail "$compat/libbz2.so.1.0 does not resolve to /usr/lib64/libbz2.so.1"
+! rpm -q --whatprovides 'libjpeg.so.8()(64bit)' > /dev/null 2>&1 || fail "a package provides libjpeg.so.8()(64bit)"
+for l in libEGL.so libGLESv2.so; do
+  [[ ! -e /usr/lib64/$l && ! -L /usr/lib64/$l ]] || fail "/usr/lib64/$l is in the image"
+done
+grep -qE '^[dD]!? /tmp/\.X11-unix ' /usr/lib/tmpfiles.d/x11.conf || fail "x11.conf does not make /tmp/.X11-unix"
 [[ -z $(find -L /usr/share/blockie/portmaster/PortMaster -type l) ]] ||
   fail "dangling links in the PortMaster tree: $(find -L /usr/share/blockie/portmaster/PortMaster -type l | tr '\n' ' ')"
 [[ $(readlink /etc/localtime) == ../usr/share/zoneinfo/Asia/Tokyo && -f /usr/share/zoneinfo/Asia/Tokyo ]] ||

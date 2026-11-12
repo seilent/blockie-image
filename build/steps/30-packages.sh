@@ -9,7 +9,7 @@ for c in snes9x genesis-plus-gx mupen64plus-next ppsspp flycast; do
   own+=("libretro-$c/libretro-$c")
 done
 own+=(retroarch/retroarch libretro-shaders-blockie/libretro-shaders-blockie waydroid/waydroid)
-own+=(gptokeyb/gptokeyb gptokeyb2/gptokeyb2 portmaster/portmaster)
+own+=(gptokeyb/gptokeyb gptokeyb2/gptokeyb2 libjpeg8/libjpeg8 portmaster/portmaster)
 
 own_rpm() {
   local dir=/pkgs/${1%%/*} name=${1#*/} f found=()

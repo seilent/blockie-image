@@ -50,6 +50,8 @@ REAL_FILES = re.compile(r"device_info_.*\.env|harbourmaster\.txt")
 OWN = ("harbourmaster", "mod_Blockie.txt")
 KEEP = ("PortMaster", ".blockie")
 BUILTIN = ("love_11.5.squashfs",)
+HIDE = {"0a761c28877625861d9c9c4326664428": ("lib_aarch64/libxkbcommon.so.0",)}
+HIDDEN = ".blockie-hidden"
 KEEP_STALE = 3
 GC_S = 30 * 86400
 IMAGES = 128 << 20
@@ -307,6 +309,40 @@ def seal(top):
                 os.chmod(p, 0o555)
 
 
+def hide_fresh(tree, md5):
+    for rel in HIDE.get(md5, ()):
+        p = os.path.join(tree, rel)
+        if os.path.lexists(p):
+            os.rename(p, p + HIDDEN)
+
+
+def hide_old():
+    for md5, rels in sorted(HIDE.items()):
+        tree = os.path.join(UNPACKED, md5)
+        if os.path.islink(tree) or not os.path.isdir(tree):
+            continue
+        for rel in rels:
+            p = os.path.join(tree, rel)
+            d = os.path.dirname(p)
+            if os.path.islink(d):
+                continue
+            try:
+                shown, hidden = os.path.lexists(p), os.path.lexists(p + HIDDEN)
+                if shown and not hidden:
+                    os.chmod(d, 0o755)
+                    os.rename(p, p + HIDDEN)
+                    fsync_dir(d)
+                    os.chmod(d, 0o555)
+                    log(f"hid {rel} in the runtime tree {md5}")
+                elif hidden and not shown:
+                    if stat.S_IMODE(os.lstat(d).st_mode) != 0o555:
+                        os.chmod(d, 0o555)
+                else:
+                    log(f"left {rel} in the runtime tree {md5}: {'both names' if shown else 'neither name'} present")
+            except OSError as err:
+                log(f"cannot hide {rel} in the runtime tree {md5}: {err}")
+
+
 def unpack_tree(path, md5, proto):
     tree = os.path.join(UNPACKED, md5)
     os.makedirs(UNPACKED, 0o755, exist_ok=True)
@@ -327,6 +363,7 @@ def unpack_tree(path, md5, proto):
         if p.returncode != 0:
             remove(tmp)
             raise Fail("runtime")
+        hide_fresh(tmp, md5)
         seal(tmp)
         os.rename(tmp, tree)
         os.chmod(tree, 0o555)
@@ -1042,6 +1079,7 @@ def cmd_sync(name, ctx):
             write_atomic(os.path.join(FARM, "config", fn), src.encode())
         write_atomic(STAMP, stamp)
         log(f"synced {FARM} to {TREE}")
+    hide_old()
     write_index()
 
 

@@ -195,15 +195,15 @@ scope+=" -p TimeoutStopSec=10s --"
 scope+=" env -u XDG_CONFIG_HOME -u XDG_DATA_HOME -u XDG_CACHE_HOME -u SDL_AUDIODRIVER PATH=$shims:$FAKE/bin:$PATH"
 scope+=" HOME=$data/ports-home TMPDIR=$data/cache/ports-tmp/run PM_CAN_MOUNT=N ALSA_CONFIG_PATH=/usr/share/blockie/ports/alsa.conf"
 scope+=" BLOCKIE_PORTMSG_ENV=WAYLAND_DISPLAY=wayland-test XDG_RUNTIME_DIR=$t/run LD_LIBRARY_PATH=/invented/farm"
-scope+=" BLOCKIE_THEME=light bash $probe"
+scope+=" BLOCKIE_THEME=light BLOCKIE_GPULIB=/invented/farm bash $probe"
 [[ $rc == 0 && $(< "$FAKE/systemd-run.log") == "$scope" ]] &&
   [[ $(sed -n 's/^PATH=//p' "$FAKE/port.env") == "$shims:$FAKE/bin:"* ]] && envis "HOME=$data/ports-home" &&
   envis "TMPDIR=$data/cache/ports-tmp/run" && envis PM_CAN_MOUNT=N && envis ALSA_CONFIG_PATH=/usr/share/blockie/ports/alsa.conf &&
   envis "BLOCKIE_PORTMSG_ENV=WAYLAND_DISPLAY=wayland-test XDG_RUNTIME_DIR=$t/run LD_LIBRARY_PATH=/invented/farm BLOCKIE_THEME=light" &&
-  envis LD_LIBRARY_PATH=/invented/farm && envis VK_DRIVER_FILES=/invented/icd.json &&
+  envis LD_LIBRARY_PATH=/invented/farm && envis VK_DRIVER_FILES=/invented/icd.json && envis BLOCKIE_GPULIB=/invented/farm &&
   ! grep -qE '^(XDG_CONFIG_HOME|XDG_DATA_HOME|XDG_CACHE_HOME|SDL_AUDIODRIVER)=' "$FAKE/port.env" &&
   [[ $(< "$FAKE/port.umask") == 0022 && $(< "$FAKE/port.cwd") == "$pdir" && ! -s $FAKE/port.tmp ]]
-res $? "a port runs bash <script> in one scope with a 10 s stop, from roms/ports, with the shims first, the ports HOME and TMPDIR (emptied), XDG and SDL_AUDIODRIVER unset, PM_CAN_MOUNT=N, the ALSA redirect, the portmsg env, gpu.env and umask 022"
+res $? "a port runs bash <script> in one scope with a 10 s stop, from roms/ports, with the shims first, the ports HOME and TMPDIR (emptied), XDG and SDL_AUDIODRIVER unset, PM_CAN_MOUNT=N, the ALSA redirect, the portmsg env, gpu.env, BLOCKIE_GPULIB and umask 022"
 FAKE_PORT=rc1 play "$probe"
 [[ $rc == 0 && $(sed -n 's/^BLOCKIE_PORTMSG_ENV=//p' "$FAKE/port.env") == *" BLOCKIE_THEME=dark" ]]
 res $? "the portmsg env carries the --theme, dark when none is given"
@@ -417,6 +417,132 @@ for f in sudo mount umount; do
   [[ $(stat -c %a "$shims/$f") == 755 ]] || { ok=1; echo "  $f"; }
 done
 res $ok "the shims are 755"
+
+mod=/usr/share/blockie/portmaster/mod_Blockie.txt
+compat=/usr/lib64/blockie-ports/compat
+ww=$t/ww
+x=$ww/x
+mkdir -p "$ww/gpu1" "$ww/gpu2" "$ww/crusty" "$ww/app" "$x/.X11-unix"
+for f in gpu1/libEGL.so gpu1/libGLESv2.so gpu2/libGLESv2.so crusty/libEGL.so app/libEGL.so app/libGLESv2.so; do
+  : > "$ww/$f"
+done
+cat > "$ww/westonwrap.sh" << EOF
+#!/bin/bash
+CFW_NAME=Blockie
+source "$mod"
+[[ -z \${WW_TWICE:-} ]] || source "$mod"
+printf '%s\n' "\$LD_LIBRARY_PATH" "\$WRAPPED_LIBRARY_PATH_MALI" "\${SEATD_VTBOUND-unset}" "\${WP_32BIT-unset}"
+EOF
+cp "$ww/westonwrap.sh" "$ww/other.sh"
+wwenv() {
+  local n=$1
+  shift
+  env -i PATH=/usr/bin:/usr/sbin "$@" bash "$ww/$n" cleanup > "$ww/out" 2> /dev/null
+  mapfile -t got < "$ww/out"
+  got+=("" "" "" "")
+}
+resolve() {
+  local d
+  local -a dirs
+  IFS=: read -ra dirs <<< "$1"
+  for d in "${dirs[@]}"; do
+    [[ -n $d && -e $d/$2 ]] && { printf '%s' "${d%/}"; return 0; }
+  done
+  return 1
+}
+penv=(BLOCKIE_GPULIB="$ww/gpu1:$ww/gpu2" WRAPPED_LIBRARY_PATH_MALI="$ww/portmali" LD_LIBRARY_PATH="$ww/inherited")
+wwenv westonwrap.sh "${penv[@]}"
+p="$ww/crusty/::${got[1]}::$ww/app"
+[[ ${got[0]} == "$ww/inherited:$ww/gpu1:$ww/gpu2:$compat" && ${got[1]} == "$ww/portmali:$ww/gpu1:$ww/gpu2:$compat" &&
+  $(resolve "$p" libGLESv2.so) == "$ww/gpu1" && $(resolve "$p" libEGL.so) == "$ww/crusty" && ${got[2]} == 0 &&
+  ${got[3]} == 0 ]]
+res $? "westonwrap*.sh: the game's path as westonwrap.sh:48 builds it finds libGLESv2.so in the first BLOCKIE_GPULIB dir and libEGL.so in the crusty dir, a port's _MALI value first, the compat dir last on both paths, SEATD_VTBOUND=0, WP_32BIT=0"
+
+ok=0
+for e in "BLOCKIE_GPULIB=" "BLOCKIE_INVENTED=1"; do
+  wwenv westonwrap.sh "$e"
+  [[ ${got[0]} == "$compat" && ${got[1]} == "$compat" ]] || { ok=1; echo "  $e: ${got[*]}"; }
+done
+wwenv westonwrap.sh BLOCKIE_GPULIB=":$ww/gpu1::" LD_LIBRARY_PATH="$ww/inherited:"
+[[ ${got[0]} == "$ww/inherited:$ww/gpu1:$compat" && ${got[1]} == "$ww/gpu1:$compat" ]] || { ok=1; echo "  empty parts: ${got[*]}"; }
+wwenv westonwrap.sh WW_TWICE=1 "${penv[@]}"
+[[ ${got[0]} == "$ww/inherited:$ww/gpu1:$ww/gpu2:$compat" && ${got[1]} == "$ww/portmali:$ww/gpu1:$ww/gpu2:$compat" ]] ||
+  { ok=1; echo "  sourced twice: ${got[*]}"; }
+wwenv other.sh "${penv[@]}"
+[[ ${got[0]} == "$ww/inherited" && ${got[1]} == "$ww/portmali" && ${got[2]} == unset ]] || { ok=1; echo "  other.sh: ${got[*]}"; }
+res $ok "westonwrap*.sh: no empty element with an empty or missing BLOCKIE_GPULIB or empty parts, no dir twice when sourced twice; another script name keeps LD_LIBRARY_PATH, WRAPPED_LIBRARY_PATH_MALI and SEATD_VTBOUND"
+
+cat > "$ww/westonwrap_wait.sh" << EOF
+#!/bin/bash
+CFW_NAME=Blockie
+source "$mod"
+for ((i = 0; i < \${WW_WAIT:-0}; i++)); do
+  [[ -e \$BLOCKIE_XDIR/.X11-unix/X0 || -e \$BLOCKIE_XDIR/.X11-unix/X1 ]] && break
+  sleep 0.1
+done
+sleep "\${WW_LINGER:-0}"
+echo ended
+EOF
+wwrun() {
+  local log=$1
+  shift
+  env -i PATH=/usr/bin:/usr/sbin BLOCKIE_XDIR="$x" "${@}" > "$log" 2>&1
+}
+wargs=(headless noop kiosk crusty_x11egl true)
+dead() { bash -c 'echo $$'; }
+lockx() {
+  printf '%10d\n' "$2" > "$x/.X$1-lock"
+  : > "$x/.X11-unix/X$1"
+}
+mkfifo "$ww/fifo"
+cp /usr/bin/bash "$ww/Xwayland"
+cp /usr/bin/bash "$ww/wp_weston"
+cp /usr/bin/bash "$ww/notx"
+held=()
+for n in Xwayland wp_weston notx; do
+  "$ww/$n" -c 'read -r -t 60 <> "$1"' _ "$ww/fifo" &
+  held+=("$!")
+done
+lockx 0 "$(dead)"
+lockx 1 "${held[2]}"
+lockx 2 "${held[0]}"
+lockx 3 "${held[1]}"
+lockx 4 "$(dead)"
+chown 1000 "$x/.X4-lock"
+lockx 5 1
+printf 'invented\n' > "$x/.X5-lock"
+ok=0
+wwrun "$ww/log" BLOCKIE_XWATCH_POLLS=1 bash "$ww/westonwrap_wait.sh" "${wargs[@]}"
+for n in 0 1 5; do
+  [[ ! -e $x/.X$n-lock && ! -e $x/.X11-unix/X$n ]] || { ok=1; echo "  :$n kept"; }
+done
+for n in 2 3 4; do
+  [[ -f $x/.X$n-lock && -e $x/.X11-unix/X$n ]] || { ok=1; echo "  :$n removed"; }
+done
+lockx 6 "$(dead)"
+for a in cleanup "headless noop kiosk crusty_x11egl"; do
+  read -ra args <<< "$a"
+  wwrun "$ww/log" BLOCKIE_XWATCH_POLLS=2 WW_LINGER=1.6 bash "$ww/westonwrap_wait.sh" "${args[@]}"
+  [[ $? == 0 && $(< "$ww/log") == ended && -f $x/.X6-lock ]] || { ok=1; echo "  $a: $(< "$ww/log")"; }
+done
+kill "${held[@]}" 2> /dev/null
+wait "${held[@]}" 2> /dev/null
+res $ok "the X lock step removes the port user's locks whose pid is dead, not a number or a live process other than Xwayland or wp_weston, each with its socket, and keeps those of a live Xwayland or wp_weston and another user's; with cleanup or 4 arguments neither it nor the watcher runs"
+
+ok=0
+rm -f "$x"/.X*-lock "$x"/.X11-unix/X*
+wwrun "$ww/log" BLOCKIE_XWATCH_POLLS=2 WW_WAIT=100 timeout 20 bash "$ww/westonwrap_wait.sh" "${wargs[@]}"
+r=$?
+[[ $r == 143 && $(< "$ww/log") == 'blockie: westonpack display not up' ]] || { ok=1; echo "  no socket: rc $r $(< "$ww/log")"; }
+(sleep 0.3; : > "$x/.X11-unix/X1") &
+wwrun "$ww/log" BLOCKIE_XWATCH_POLLS=3 WW_WAIT=100 WW_LINGER=2.5 timeout 20 bash "$ww/westonwrap_wait.sh" "${wargs[@]}"
+r=$?
+[[ $r == 0 && $(< "$ww/log") == ended ]] || { ok=1; echo "  socket in time: rc $r $(< "$ww/log")"; }
+rm -f "$x"/.X11-unix/X*
+wwrun "$ww/log" BLOCKIE_XWATCH_POLLS=3 bash "$ww/westonwrap_wait.sh" "${wargs[@]}"
+sleep 2.2
+[[ $(< "$ww/log") == ended ]] || { ok=1; echo "  westonwrap gone: $(< "$ww/log")"; }
+res $ok "the watcher TERMs a westonwrap whose X socket never comes and logs its line, leaves one alone whose socket comes in time, and stops when westonwrap exits"
 
 if [[ $fails == 0 ]]; then
   echo "ports: all ok"

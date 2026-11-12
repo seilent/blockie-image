@@ -1,0 +1,14 @@
+FROM localhost/blockie-pkg-builder
+
+COPY SOURCE.env SOURCE.sha256 /tmp/src/
+RUN . /tmp/src/SOURCE.env \
+ && umask 022 \
+ && install -d /srcpkg \
+ && curl -fsSL --retry 3 -o "/srcpkg/$SOURCE_TAR" "$SOURCE_URL" \
+ && (cd /srcpkg && sha256sum -c /tmp/src/SOURCE.sha256) \
+ && rm -rf /tmp/src
+
+COPY libjpeg8.spec /tmp/spec/
+RUN dnf -y --setopt=install_weak_deps=False builddep /tmp/spec/libjpeg8.spec \
+ && dnf clean all \
+ && rm -rf /tmp/spec
