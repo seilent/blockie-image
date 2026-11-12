@@ -497,9 +497,9 @@ lockx() {
 mkfifo "$ww/fifo"
 cp /usr/bin/bash "$ww/Xwayland"
 cp /usr/bin/bash "$ww/wp_weston"
-cp /usr/bin/bash "$ww/notx"
+cp /usr/bin/bash "$ww/labwc"
 held=()
-for n in Xwayland wp_weston notx; do
+for n in Xwayland wp_weston labwc; do
   "$ww/$n" -c 'read -r -t 60 <> "$1"' _ "$ww/fifo" &
   held+=("$!")
 done
@@ -513,10 +513,10 @@ lockx 5 1
 printf 'invented\n' > "$x/.X5-lock"
 ok=0
 wwrun "$ww/log" BLOCKIE_XWATCH_POLLS=1 bash "$ww/westonwrap_wait.sh" "${wargs[@]}"
-for n in 0 1 5; do
+for n in 0 5; do
   [[ ! -e $x/.X$n-lock && ! -e $x/.X11-unix/X$n ]] || { ok=1; echo "  :$n kept"; }
 done
-for n in 2 3 4; do
+for n in 1 2 3 4; do
   [[ -f $x/.X$n-lock && -e $x/.X11-unix/X$n ]] || { ok=1; echo "  :$n removed"; }
 done
 lockx 6 "$(dead)"
@@ -527,7 +527,7 @@ for a in cleanup "headless noop kiosk crusty_x11egl"; do
 done
 kill "${held[@]}" 2> /dev/null
 wait "${held[@]}" 2> /dev/null
-res $ok "the X lock step removes the port user's locks whose pid is dead, not a number or a live process other than Xwayland or wp_weston, each with its socket, and keeps those of a live Xwayland or wp_weston and another user's; with cleanup or 4 arguments neither it nor the watcher runs"
+res $ok "the X lock step removes the port user's locks whose pid is dead or not a number, each with its socket, and keeps those of any live process (a labwc holder included) and another user's; with cleanup or 4 arguments neither it nor the watcher runs"
 
 ok=0
 rm -f "$x"/.X*-lock "$x"/.X11-unix/X*

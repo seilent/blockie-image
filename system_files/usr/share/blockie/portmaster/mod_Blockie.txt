@@ -23,16 +23,14 @@ _blockie_join() {
 }
 
 _blockie_xlocks() {
-  local dir=${BLOCKIE_XDIR:-/tmp} f n pid comm
+  local dir=${BLOCKIE_XDIR:-/tmp} f n pid
   for f in "$dir"/.X*-lock; do
     n=${f##*/.X}
     n=${n%-lock}
     [[ $n =~ ^[0-9]+$ && -f $f && ! -L $f && -O $f ]] || continue
     pid=
-    comm=
     { read -r pid < "$f"; } 2> /dev/null
-    [[ $pid =~ ^[0-9]+$ ]] && { read -r comm < "/proc/$pid/comm"; } 2> /dev/null
-    [[ $comm == Xwayland || $comm == wp_weston ]] && continue
+    [[ $pid =~ ^[1-9][0-9]*$ ]] && kill -0 "$pid" 2> /dev/null && continue
     rm -f -- "$f" "$dir/.X11-unix/X$n"
   done
 }
