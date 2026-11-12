@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+
+unp=/var/lib/blockie/data/roms/ports/PortMaster/libs/.unpacked
+
+for x in "$@"; do
+  [[ $x != -* ]] || continue
+  while [[ $x == ?*/ ]]; do
+    x=${x%/}
+  done
+  if [[ -L $x && $(readlink -- "$x") =~ ^"$unp"/[0-9a-f]{32}$ ]]; then
+    rm -f -- "$x"
+  fi
+done
+exit 0

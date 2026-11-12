@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+title=${1:?usage: run-progress <title> <blockie-ports command> [<arg>]}
+shift
+msg=/usr/libexec/blockie/blockie-portmsg
+run=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+read -ra clean <<< "${BLOCKIE_PORTMSG_ENV:-}"
+
+env -i "${clean[@]}" HOME="${HOME:-/}" LANG=C.UTF-8 PATH=/usr/bin:/usr/sbin XDG_RUNTIME_DIR="$run" \
+  /usr/libexec/blockie/blockie-ports "$@" |
+  while IFS=$'\t' read -r -a f; do
+    case ${f[0]-} in
+      progress)
+        if [[ ${f[1]-} != "${last-}" ]]; then
+          printf '%s\n' "${f[1]-}"
+          last=${f[1]-}
+        fi
+        if [[ ${f[2]-} =~ ^[0-9]+$ && ( ${f[3]-} == - || ${f[3]-} =~ ^[0-9]+$ ) ]]; then
+          env -i "${clean[@]}" "$msg" --progress-set "${f[2]}" "${f[3]}" < /dev/null > /dev/null 2>&1
+        fi
+        ;;
+      fail) printf '%s\n' "${f[2]-}" ;;
+    esac
+  done |
+  { env -i "${clean[@]}" "$msg" --progress --title "$title"; cat > /dev/null; }
+exit "${PIPESTATUS[0]}"

@@ -9,6 +9,7 @@ for c in snes9x genesis-plus-gx mupen64plus-next ppsspp flycast; do
   own+=("libretro-$c/libretro-$c")
 done
 own+=(retroarch/retroarch libretro-shaders-blockie/libretro-shaders-blockie waydroid/waydroid)
+own+=(gptokeyb/gptokeyb gptokeyb2/gptokeyb2 portmaster/portmaster)
 
 own_rpm() {
   local dir=/pkgs/${1%%/*} name=${1#*/} f found=()
@@ -69,4 +70,16 @@ dnf -y "${opts[@]}" install \
   libretro-mgba \
   libretro-pcsx-rearmed \
   libretro-gambatte \
-  libretro-nestopia
+  libretro-nestopia \
+  SDL2_mixer \
+  SDL2_ttf \
+  SDL2_image \
+  love \
+  luajit \
+  innoextract \
+  xdelta \
+  turbojpeg \
+  sdl2-compat \
+  openal-soft \
+  libtheora \
+  libvorbis

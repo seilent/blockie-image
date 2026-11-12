@@ -205,7 +205,7 @@ jobs:
             esac
             return "$rc"
           }
-          for t in image units blobs audio wifi bt boot-ok bootctl data session hotkeyd power game game-cmd android android-sched; do
+          for t in image units blobs audio wifi bt boot-ok bootctl data session hotkeyd power game game-cmd ports ports-helper android android-sched; do
             suite podman run --rm -v "$PWD/tests:/tests:ro" -v "$PWD/boot:/repo-boot:ro" "$IMAGE:$TAG" "/tests/$t.sh"
           done
           t=android-polkit

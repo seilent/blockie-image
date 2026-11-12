@@ -11,6 +11,9 @@ gpuenv=/run/blockie-gpu/gpu.env
 dl1=/usr/libexec/blockie/dl1
 buttons=${BLOCKIE_GAME_BUTTONS:-/run/blockie-set/buttons}
 input=${BLOCKIE_GAME_INPUT:-$data/retroarch/input.cfg}
+pdir=$data/roms/ports
+shims=/usr/libexec/blockie/ports/bin
+appre='^[A-Za-z0-9][A-Za-z0-9._-]*$'
 
 usage() { echo "usage: $me <system> <rompath> [--core <id>] [--config <file>] [--theme dark|light]" >&2; exit 64; }
 refuse() { echo "$me: $*" >&2; exit 64; }
@@ -81,15 +84,25 @@ while (( $# )); do
   esac
 done
 
-[[ $system =~ ^[a-z0-9]+$ && -n ${default[$system]:-} ]] || refuse "unknown system $(q "$system")"
-(( have_core )) || core=${default[$system]}
-[[ $core =~ ^[a-z0-9_]+$ && $ids == *" $core "* ]] || refuse "unknown core $(q "$core")"
+if [[ $system == ports ]]; then
+  (( ! have_core && ! have_config )) || refuse "ports takes no --core or --config"
+else
+  [[ $system =~ ^[a-z0-9]+$ && -n ${default[$system]:-} ]] || refuse "unknown system $(q "$system")"
+  (( have_core )) || core=${default[$system]}
+  [[ $core =~ ^[a-z0-9_]+$ && $ids == *" $core "* ]] || refuse "unknown core $(q "$core")"
+fi
 [[ $theme == dark || $theme == light ]] || refuse "unknown theme $(q "$theme")"
 
 [[ $rom == /* && $rom != *[[:cntrl:]]* ]] || refuse "rompath $(q "$rom") is not an absolute path"
-real=$(realpath -e -- "$rom" 2> /dev/null) || refuse "rompath $(q "$rom") does not exist"
-[[ $real == "$data"/* ]] || refuse "rompath $(q "$rom") is not under $data"
-[[ -f $real ]] || refuse "rompath $(q "$rom") is not a file"
+if [[ $system == ports ]]; then
+  [[ $rom == "$pdir"/*.sh && ${rom#"$pdir"/} != */* && -f $rom && ! -L $rom &&
+    $(realpath -e -- "$rom" 2> /dev/null) == "$rom" ]] || refuse "rompath $(q "$rom") is not a script in $pdir"
+  real=$rom
+else
+  real=$(realpath -e -- "$rom" 2> /dev/null) || refuse "rompath $(q "$rom") does not exist"
+  [[ $real == "$data"/* ]] || refuse "rompath $(q "$rom") is not under $data"
+  [[ -f $real ]] || refuse "rompath $(q "$rom") is not a file"
+fi
 
 lines=()
 shader=
@@ -126,15 +139,15 @@ if (( have_config )); then
 fi
 
 so=$cores/${core}_libretro.so
-if [[ ! -f $so ]]; then
+if [[ $system != ports && ! -f $so ]]; then
   echo "$me: core $core is not installed ($so)" >&2
   exit 69
 fi
 
 run=${XDG_RUNTIME_DIR:-}
 [[ $run == /* && $run != *[\|\"[:cntrl:]]* && -d $run ]] || die "XDG_RUNTIME_DIR is not a directory"
-exec 9> "$run/blockie-game.lock" || die "cannot open $run/blockie-game.lock"
-if ! flock -n 9; then
+exec {lk}> "$run/blockie-game.lock" || die "cannot open $run/blockie-game.lock"
+if ! flock -n "$lk"; then
   echo "$me: another game holds $run/blockie-game.lock" >&2
   exit 75
 fi
@@ -167,17 +180,128 @@ if ! systemctl --user is-active --quiet blockie-frontend.service; then
 fi
 
 if ! "$dl1" check; then
-  echo "$me: the DL1 gate failed, RetroArch not started" >&2
+  echo "$me: the DL1 gate failed, the game not started" >&2
   exit 71
 fi
 
+gpulib=
 if [[ -r $gpuenv ]]; then
   while IFS='=' read -r k v; do
     case $k in
       LD_LIBRARY_PATH | VK_DRIVER_FILES) export "$k=$v" ;;
     esac
+    [[ $k != LD_LIBRARY_PATH ]] || gpulib=$v
   done < "$gpuenv"
 fi
+
+toplevels() {
+  local line
+  timeout 2 wlrctl toplevel list 2> /dev/null | while IFS= read -r line; do
+    printf '%s\n' "${line%%: *}"
+  done
+}
+
+stopped() {
+  local k v
+  while read -r k v; do
+    if [[ $k == State: ]]; then
+      [[ $v == T* ]]
+      return
+    fi
+  done < "/proc/$1/status"
+  return 1
+}
+
+appids() {
+  local p=$1 out=$run/blockie-game.appids id step=1 t0=$SECONDS last=$SECONDS new
+  local -A skip=() got=()
+  local list=()
+  for id in $2 $(sed -n 's/^[[:space:]]*\(APP_ID\|FOCUS\)[[:space:]]*=//p' /etc/blockie/sessions.d/*.conf \
+    /usr/lib/blockie/sessions.d/*.conf 2> /dev/null | tr -d "\"'"); do
+    skip[$id]=1
+  done
+  while kill -0 "$p" 2> /dev/null && (( SECONDS - last < 300 && ${#list[@]} < 4 )); do
+    sleep "$step"
+    (( SECONDS - t0 < 30 )) || step=5
+    ! stopped "$p" || continue
+    new=0
+    while IFS= read -r id; do
+      [[ $id =~ $appre && -z ${skip[$id]:-} && -z ${got[$id]:-} && $id != net.seilent.* && $id != blockie-* ]] ||
+        continue
+      (( ${#list[@]} < 4 )) || break
+      got[$id]=1
+      list+=("$id")
+      new=1
+    done < <(toplevels)
+    if (( new )); then
+      printf '%s\n' "${list[@]}" > "$out.tmp" && mv -f -- "$out.tmp" "$out"
+      last=$SECONDS
+    fi
+  done
+}
+
+ended() {
+  [[ -z $poll ]] || kill "$poll" 2> /dev/null
+  poll=
+  systemctl --user stop blockie-game.scope 2> /dev/null {lk}>&- 3<&-
+  rm -f -- "$run/blockie-game.appids" "$run/blockie-game.appids.tmp"
+  "$dl1" set > /dev/null {lk}>&- 3<&-
+}
+
+pstop() {
+  trap '' TERM INT HUP
+  [[ -z $pid ]] || kill -TERM "$pid" 2> /dev/null
+  ended
+  [[ -z $pid ]] || wait "$pid"
+  exit "$1"
+}
+
+port() {
+  local log=$run/blockie-ports/last.log ptmp=$data/cache/ports-tmp/run snap line rc quit=0
+  local msg="WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-} XDG_RUNTIME_DIR=$run LD_LIBRARY_PATH=$gpulib BLOCKIE_THEME=$theme" v
+  for v in "${WAYLAND_DISPLAY:-}" "$run" "$gpulib" "$theme"; do
+    [[ $v =~ ^[A-Za-z0-9_./:@+,=-]*$ ]] || die "$(q "$v") has a space or a glob character, BLOCKIE_PORTMSG_ENV not built"
+  done
+  pid=
+  poll=
+  rm -rf -- "${ptmp:?}" && mkdir -p -m 0700 -- "$ptmp" || die "cannot empty $ptmp"
+  mkdir -p -- "${log%/*}" || die "cannot make ${log%/*}"
+  snap=$(toplevels {lk}>&-)
+  cmd=$run/blockie-game.cmd
+  trap '[[ -z $poll ]] || kill "$poll" 2> /dev/null; rm -f -- "$cmd" "$run/blockie-game.appids" "$run/blockie-game.appids.tmp"' EXIT
+  trap 'pstop 143' TERM
+  trap 'pstop 130' INT
+  trap 'pstop 129' HUP
+  rm -f -- "$cmd" "$run/blockie-game.quit" "$run/blockie-game.appids" "$run/blockie-game.appids.tmp"
+  mkfifo -m 600 -- "$cmd" || die "cannot make $cmd"
+  exec 3<> "$cmd" || die "cannot open $cmd"
+  (
+    cd -- "$pdir" || exit
+    umask 022
+    exec systemd-run --user --scope --quiet --unit=blockie-game --collect --slice=blockie-emulation.slice \
+      -p BindsTo=blockie-frontend.service -p After=blockie-frontend.service -p MemoryHigh=80% -p MemoryMax=90% \
+      -p TasksMax=512 -p OOMPolicy=kill -p TimeoutStopSec=10s -- env -u XDG_CONFIG_HOME -u XDG_DATA_HOME \
+      -u XDG_CACHE_HOME -u SDL_AUDIODRIVER PATH="$shims:$PATH" HOME="$data/ports-home" TMPDIR="$ptmp" PM_CAN_MOUNT=N \
+      ALSA_CONFIG_PATH=/usr/share/blockie/ports/alsa.conf BLOCKIE_PORTMSG_ENV="$msg" bash "$real"
+  ) < /dev/null > "$log" 2>&1 3<&- {lk}>&- &
+  pid=$!
+  appids "$pid" "$snap" < /dev/null > /dev/null 2>&1 3<&- {lk}>&- &
+  poll=$!
+  while kill -0 "$pid" 2> /dev/null; do
+    read -r -t 0.5 -u 3 line || continue
+    if [[ $line == QUIT ]]; then
+      quit=1
+      systemctl --user stop --no-block blockie-game.scope 2> /dev/null {lk}>&- 3<&- || kill -TERM "$pid" 2> /dev/null
+    fi
+  done
+  wait "$pid"
+  rc=$?
+  pid=
+  ended
+  (( rc != 137 || quit )) || exit 1
+  exit 0
+}
+[[ $system != ports ]] || port
 
 if [[ -z $shader && $enable != false && -f $share/shader-defaults ]]; then
   n=0

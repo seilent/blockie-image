@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+me=mount
+unp=/var/lib/blockie/data/roms/ports/PortMaster/libs/.unpacked
+progress=/usr/libexec/blockie/ports/run-progress
+
+refuse() { echo "$me: $*" >&2; exit 32; }
+
+lookup() {
+  local st s m i h
+  tree=
+  st=$(stat -L -c '%s %.9Y %i' -- "$src") || return 1
+  read -r s m i <<< "$st"
+  m=${m/./}
+  while IFS=$'\t' read -r _ ts tm ti th; do
+    [[ $ts == "$s" && $tm == "$m" && $ti == "$i" && $th =~ ^[0-9a-f]{32}$ ]] && h=$th
+  done < "$unp/index.tsv"
+  [[ -n ${h:-} && -d $unp/$h ]] && tree=$h
+}
+
+(( $# == 2 )) && [[ $1 == *.squashfs && $1 != -* && $2 != -* ]] ||
+  refuse "only mount <file>.squashfs <dir> is supported"
+src=$(realpath -e -- "$1" 2> /dev/null) && [[ -f $src ]] || refuse "$1 is not a file"
+name=${src##*/}
+name=${name%.squashfs}
+[[ $name =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] || refuse "$1 is not a runtime name"
+dir=$2
+while [[ $dir == ?*/ ]]; do
+  dir=${dir%/}
+done
+if [[ -L $dir ]]; then
+  [[ $(readlink -- "$dir") =~ ^"$unp"/[0-9a-f]{32}$ ]] || refuse "$dir is a link that is not a runtime"
+else
+  [[ -d $dir && -z $(ls -A -- "$dir") ]] || refuse "$dir is not an empty directory"
+fi
+if ! lookup 2> /dev/null; then
+  "$progress" "$name" unpack "$src" || "$progress" "$name" runtime "$name" || refuse "no runtime for $1"
+  lookup 2> /dev/null || refuse "no unpacked tree for $1"
+fi
+[[ -L $dir ]] || rmdir -- "$dir" || refuse "cannot replace $dir"
+ln -sfnT -- "$unp/$tree" "$dir" || refuse "cannot link $dir"
+touch -- "$unp/$tree.used"

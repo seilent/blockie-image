@@ -1,0 +1,15 @@
+[Unit]
+Description=Sync the PortMaster tree on the data partition
+After=blockie-data.service blockie-dl1.service
+Before=blockie-seat.service
+ConditionPathIsMountPoint=/var/lib/blockie/data
+
+[Service]
+Type=oneshot
+User=blockie
+TimeoutStartSec=60
+ExecStartPre=+/usr/libexec/blockie/dl1 check
+ExecStart=/usr/libexec/blockie/blockie-ports sync
+
+[Install]
+WantedBy=multi-user.target

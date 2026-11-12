@@ -1,0 +1,46 @@
+#!/bin/bash
+
+pm_message_close 2> /dev/null
+
+blockie_patcher() {
+  local msg=/usr/libexec/blockie/blockie-portmsg ids=() titles=() options=() answers=() line rest i v
+  if [[ -n ${PATCHER_QUESTIONS:-} && -f $PATCHER_QUESTIONS ]]; then
+    while IFS= read -r line; do
+      rest=${line#?$'\t'}
+      if [[ $line == q$'\t'* ]]; then
+        ids+=("${rest%%$'\t'*}")
+        titles+=("${rest#*$'\t'}")
+        options+=("")
+      else
+        options[-1]+=$rest$'\n'
+      fi
+    done < <(env -u LD_PRELOAD -u LD_LIBRARY_PATH /usr/bin/luajit - "$PATCHER_QUESTIONS" <<'EOF'
+local f = io.open(arg[1], "r")
+if not f then return end
+local chunk = load(f:read("*a"), "@" .. arg[1], "t", _G)
+f:close()
+if not chunk then return end
+local ok, questions = pcall(chunk)
+if not ok or type(questions) ~= "table" then return end
+local function clean(s)
+  return (tostring(s):gsub("%c", " "))
+end
+for _, q in ipairs(questions) do
+  io.write("q\t", clean(q.id), "\t", clean(q.question or ""), "\n")
+  for _, o in ipairs(q.options or {}) do
+    io.write("o\t", clean(o[1]), "\t", clean(o[2]), "\n")
+  end
+end
+EOF
+)
+  fi
+  for i in "${!ids[@]}"; do
+    v=$(printf '%s' "${options[i]}" | env -i $BLOCKIE_PORTMSG_ENV "$msg" --choose --title "${titles[i]}") || return 1
+    answers+=("${ids[i]}=$v")
+  done
+  env "${answers[@]}" "$PATCHER_FILE" |
+    { env -i $BLOCKIE_PORTMSG_ENV "$msg" --progress --title "$PATCHER_GAME"; cat > /dev/null; }
+  env -i $BLOCKIE_PORTMSG_ENV "$msg" --close
+}
+
+blockie_patcher

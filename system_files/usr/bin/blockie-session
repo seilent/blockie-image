@@ -17,6 +17,7 @@ t_revive=${BLOCKIE_SESSION_REVIVE_WAIT:-5}
 revive_max=${BLOCKIE_SESSION_REVIVE_MAX:-3}
 revive_window=${BLOCKIE_SESSION_REVIVE_WINDOW:-300}
 uptime=${BLOCKIE_UPTIME:-/proc/uptime}
+appids=${BLOCKIE_SESSION_APPIDS:-}
 dirs=("$root/etc/blockie/sessions.d" "$root/usr/lib/blockie/sessions.d")
 units=("$root/etc/systemd/user" "$root/usr/lib/systemd/user")
 namere='^[a-z0-9][a-z0-9-]*$'
@@ -280,6 +281,18 @@ focus() {
   as_user wlrctl toplevel focus "app_id:$1" > /dev/null 2>&1 || log "focus of $1 failed"
 }
 
+gamefocus() {
+  local line got=()
+  [[ $2 == blockie-emulation.slice ]] || { printf '%s' "$1"; return 0; }
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ $line =~ $appre ]] || continue
+    got+=("$line")
+    (( ${#got[@]} < 4 )) || break
+  done < <(as_user timeout 2 dd if="${appids:-/run/user/$uid/blockie-game.appids}" iflag=nofollow bs=4096 count=1 \
+    status=none 2> /dev/null)
+  printf '%s' "$1${got[*]:+ ${got[*]}} net.seilent.Blockie.PortMsg"
+}
+
 minimize() {
   local a
   for a in $2; do
@@ -403,12 +416,14 @@ switch_once() {
   load "$want" || { log "$want is not a listed session"; return 1; }
   t_name=$want t_unit=$UNIT t_app=$APP_ID t_focus=$FOCUS t_slice=$SLICE t_bg=$BACKGROUND t_wait=${START_WAIT:-$t_start}
   t_first=${PARK_FIRST:-no}
+  t_focus=$(gamefocus "$t_focus" "$t_slice")
   state=$(check_state "$want")
   [[ $state == available ]] || { log "$want is $state"; return 1; }
   read_current
   if [[ -n $cur_name && $cur_name != "$want" ]] && load "$cur_name" && [[ $UNIT == "$cur_unit" ]]; then
     s_name=$cur_name s_unit=$UNIT s_app=$APP_ID s_bg=$BACKGROUND s_focus=$FOCUS s_slice=$SLICE s_wait=${START_WAIT:-$t_start}
     s_leave=$LEAVE
+    s_focus=$(gamefocus "$s_focus" "$s_slice")
   fi
   if [[ $cur_name == "$want" ]] && active "$t_unit" && thawed "$(frozen_unit "$t_unit" "$t_slice")"; then
     focus "$t_app" "$t_focus"

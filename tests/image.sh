@@ -25,6 +25,7 @@ for d in /blockie /vendor; do
   [[ -d $d && ! -L $d && -z $(ls -A "$d") ]] || fail "$d is not an empty directory"
 done
 [[ $(readlink /mnt) == var/mnt ]] || fail "/mnt is $(readlink /mnt), not var/mnt"
+[[ $(readlink /roms) == var/lib/blockie/data/roms ]] || fail "/roms is $(readlink /roms), not var/lib/blockie/data/roms"
 
 for u in systemd-oomd.service systemd-oomd.socket systemd-pstore.service systemd-firstboot.service \
   bootloader-update.service udisks2.service fstrim.timer fstrim.service fwupd.service fwupd-refresh.service \
@@ -50,6 +51,13 @@ for g in wheel systemd-journal input video render audio; do
 done
 [[ $(getent passwd blockie | cut -d: -f6,7) == /var/home/blockie:/bin/bash ]] || fail "blockie home or shell"
 grep -qx 'd /var/home/blockie 0700 blockie blockie -' /usr/lib/tmpfiles.d/blockie.conf || fail "home tmpfiles line"
+[[ $(< /usr/lib/udev/rules.d/70-blockie-uinput.rules) == 'KERNEL=="uinput", GROUP="blockie", MODE="0660"' ]] &&
+  getent group blockie > /dev/null || fail "/dev/uinput is not 0660 to the blockie group"
+cmp -s <(printf 'd /var/lib/blockie/data/%s\n' 'cache 0755 blockie blockie -' 'roms 0755 root root -' \
+  'roms/ports 0755 blockie blockie -' 'ports-home 0700 blockie blockie -' 'cache/ports-tmp 0700 blockie blockie -') \
+  <(grep -E '^d /var/lib/blockie/data/(cache|roms|ports-home)[/ ]' /usr/lib/blockie/data-tmpfiles.conf) ||
+  fail "the data tmpfiles do not make cache, roms, roms/ports, ports-home and cache/ports-tmp in that order"
+[[ -s /usr/share/blockie/ports/alsa.conf ]] || fail "the ports alsa.conf is missing"
 for p in /var/cache/libX11 /var/cache/libX11/compose /var/lib/alsa /var/lib/bluetooth /var/lib/bluetooth/mesh /var/lib/geoclue \
   /var/lib/lxc /var/cache/lxc /var/lib/lxcfs; do
   [[ -d $p && ! -L $p ]] || fail "$p is not a directory in the image"
@@ -66,6 +74,10 @@ done
 rpm -q e2fsprogs tzdata erofs-utils vulkan-tools egl-utils drm-utils strace file procps-ng jq libwayland-client \
   libwayland-server NetworkManager-wifi wpa_supplicant iw wireless-regdb iperf3 bluez alsa-ucm alsa-ucm-utils \
   alsa-utils retroarch libretro-mgba libretro-pcsx-rearmed kmscube glmark2 > /dev/null || fail "packages missing"
+rpm -q gptokeyb gptokeyb2 portmaster SDL2_mixer SDL2_ttf SDL2_image love luajit innoextract xdelta turbojpeg \
+  7zip-standalone-all squashfs-tools sdl2-compat openal-soft libtheora libvorbis > /dev/null || fail "ports packages missing"
+[[ -z $(find -L /usr/share/blockie/portmaster/PortMaster -type l) ]] ||
+  fail "dangling links in the PortMaster tree: $(find -L /usr/share/blockie/portmaster/PortMaster -type l | tr '\n' ' ')"
 [[ $(readlink /etc/localtime) == ../usr/share/zoneinfo/Asia/Tokyo && -f /usr/share/zoneinfo/Asia/Tokyo ]] ||
   fail "/etc/localtime is not Asia/Tokyo"
 [[ -f /usr/share/zoneinfo/zone.tab ]] || fail "zone.tab missing"

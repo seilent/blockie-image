@@ -50,5 +50,22 @@ GPL-2.0-or-later), handheld/shaders/sameboy-lcd.glsl (LIJI32, Lior Halphon 2015-
 handheld/shaders/retro-v2.glsl (Hyllian 2013, GPL-2.0-or-later). sp101-color.glsl is ported from
 handheld/shaders/color/sp101-color.slang of https://github.com/libretro/slang-shaders (afb1416b) by Pokefan531,
 hunterk and crashGG (public domain).
+packages/gptokeyb: gptokeyb (https://github.com/PortsMaster/gptokeyb, 5b1284e, GPL-2.0-or-later), built with
+no-kill-mode.patch, which removes the hotkey plus START kill. The source and the patch are under
+/usr/share/blockie/sources/portmaster/gptokeyb/.
+packages/gptokeyb2: gptokeyb2 and libinterpose (https://github.com/PortsMaster/gptokeyb2, 647b46f,
+GPL-2.0-or-later, with inih under BSD-3-Clause), built with no-kill-mode.patch, which removes the hotkey plus START
+kill. The source and the patch are under /usr/share/blockie/sources/portmaster/gptokeyb2/.
+packages/portmaster: PortMaster (https://github.com/PortsMaster/PortMaster-GUI, 2026.11.12-1059 9efc198, MIT, Copyright
+(c) 2023-2025 Jacob): the port script helpers and harbourmaster with the libraries it imports, ansimarkup and colorama
+(BSD-3-Clause), loguru, urllib3 and charset_normalizer (MIT), requests (Apache-2.0), idna (BSD-3-Clause) and
+typing_extensions (PSF-2.0), the Noto Sans (OFL-1.1) and DejaVu Sans (Bitstream Vera and Arev; the DejaVu changes are in
+the public domain) fonts, and gamecontrollerdb.txt with its .Backup copies from
+https://github.com/mdqinc/SDL_GameControllerDB (Zlib, LICENSE-gamecontrollerdb.txt from c0f11d4); the texts under
+/usr/share/licenses/portmaster/. requests' certs.py returns the system CA bundle instead of importing certifi.
+LICENSE-charset_normalizer.txt is the LICENSE of https://github.com/jawah/charset_normalizer (3.0.1, 5dd7aa0).
+utils/patcher.txt is Blockie's own.
 system_files/usr/share/blockie/retroarch/core: the gambatte.opt and mgba.opt option values come from the settings of
 https://github.com/BruhMeh/Ayaneo-Handheld-Scripts (168d1c9), values only.
+system_files/usr/share/blockie/portmaster/mod_Blockie.txt: modeled on PortMaster's mod_nuubOS.txt
+(https://github.com/PortsMaster/PortMaster-GUI, 9efc198, MIT, Copyright (c) 2023-2025 Jacob), MIT.

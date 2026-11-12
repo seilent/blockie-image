@@ -1,0 +1,184 @@
+diff --git a/src/gptokeyb2.h b/src/gptokeyb2.h
+index 8b4b0b1..fb814c3 100644
+--- a/src/gptokeyb2.h
++++ b/src/gptokeyb2.h
+@@ -484,8 +484,6 @@ bool strcasestartswith(const char *str, const char *suffix);
+ int strcasecmp(const char *s1, const char *s2);
+ int strncasecmp(const char *s1, const char *s2, size_t n);
+ 
+-bool process_kill();
+-
+ void debug_parse(const char *categories);
+ 
+ void string_init();
+diff --git a/src/state.c b/src/state.c
+index 05b47a7..7f5262c 100644
+--- a/src/state.c
++++ b/src/state.c
+@@ -331,12 +331,6 @@ void state_update()
+      */
+     Uint32 current_ticks = SDL_GetTicks();
+ 
+-    if (is_pressed(GBTN_START) && is_pressed(current_state.hotkey_gbtn))
+-    {
+-        if (process_kill())
+-            current_state.running = false;
+-    }
+-
+     current_state.last_pressed = current_state.pressed;
+ 
+     for (int btn=0; btn < GBTN_MAX; btn++)
+diff --git a/src/util.c b/src/util.c
+index 9a3faf5..b7b1ad3 100644
+--- a/src/util.c
++++ b/src/util.c
+@@ -458,149 +458,6 @@ void emitMouseWheel(int wheel)
+ }
+ 
+ 
+-#define KILL_BUFFER 1024
+-
+-bool process_with_pkill(const char *process_name, bool use_sudo)
+-{
+-    char temp_buffer[KILL_BUFFER];
+-
+-    if (use_sudo)
+-        snprintf(temp_buffer, KILL_BUFFER, "sudo pkill -9 '%s'", process_name);
+-    else
+-        snprintf(temp_buffer, KILL_BUFFER, "pkill -9 '%s'", process_name);
+-
+-    // Execute the command
+-    int status = system(temp_buffer);
+-
+-    // Check if the command executed successfully
+-    if (status == -1)
+-        return false;
+-
+-    return true;
+-}
+-
+-
+-static int process_parent(int pid)
+-{   // parent pid of pid, or -1 if unknown.
+-    char path[64];
+-    char stat_buffer[512];
+-
+-    snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+-
+-    FILE *fp = fopen(path, "r");
+-    if (fp == NULL)
+-        return -1;
+-
+-    size_t len = fread(stat_buffer, 1, sizeof(stat_buffer) - 1, fp);
+-    fclose(fp);
+-    stat_buffer[len] = '\0';
+-
+-    // The process name can contain spaces and brackets, the parent pid comes after the last ')'.
+-    char *after_name = strrchr(stat_buffer, ')');
+-    int ppid = -1;
+-
+-    if (after_name == NULL || sscanf(after_name + 1, " %*c %d", &ppid) != 1)
+-        return -1;
+-
+-    return ppid;
+-}
+-
+-
+-static bool process_is_ours(int pid)
+-{   // pgrep -f also matches gptokeyb2 itself (its command line contains the
+-    // process name), anything that started it, and the popen shell running pgrep.
+-    if (process_parent(pid) == getpid())
+-        return true;
+-
+-    for (int ancestor = getpid(); ancestor > 1; ancestor = process_parent(ancestor))
+-    {
+-        if (ancestor == pid)
+-            return true;
+-    }
+-
+-    return false;
+-}
+-
+-
+-bool process_with_kill(const char *process_name, bool use_sudo)
+-{
+-    char temp_buffer[KILL_BUFFER];
+-    bool status = false;
+-    bool found = false;
+-
+-    snprintf(temp_buffer, KILL_BUFFER, "pgrep -f '%s'", process_name);
+-
+-    FILE *fp = popen(temp_buffer, "r");
+-    if (fp == NULL) {
+-        perror("Error executing pgrep command");
+-        return false;
+-    }
+-
+-    char pid_str[32];
+-
+-    while (fgets(pid_str, sizeof(pid_str), fp) != NULL)
+-    {
+-        int pid = atoi(pid_str);
+-
+-        if (pid <= 0 || process_is_ours(pid))
+-            continue;
+-
+-        found = true;
+-
+-        // Kill the process
+-        if (use_sudo)
+-            snprintf(temp_buffer, KILL_BUFFER, "sudo kill -9 %d", pid);
+-        else
+-            snprintf(temp_buffer, KILL_BUFFER, "kill -9 %d", pid);
+-
+-        int ret = system(temp_buffer);
+-        if (ret != 0)
+-        {
+-            fprintf(stderr, "Unable to kill '%s' with PID %d.\n", process_name, pid);
+-        }
+-        else
+-        {
+-            status = true;
+-            printf("Process with name '%s' and PID %d killed successfully.\n", process_name, pid);
+-        }
+-    }
+-
+-    if (!found)
+-    {
+-        printf("No process with name '%s' found.\n", process_name);
+-    }
+-
+-    pclose(fp);
+-
+-    return status;
+-}
+-
+-
+-void process_with_pc_quit()
+-{
+-    emitKey(kb_uinp_fd, KEY_F4, true, MOD_ALT);
+-    SDL_Delay(15);
+-
+-    emitKey(kb_uinp_fd, KEY_F4, false, MOD_ALT);
+-    SDL_Delay(15);
+-}
+-
+-
+-bool process_kill()
+-{
+-    if (want_pc_quit)
+-        process_with_pc_quit();
+-
+-    if (strlen(kill_process_name) == 0)
+-        return false;
+-
+-    if (want_kill)
+-        return process_with_kill(kill_process_name, want_sudo);
+-
+-    return process_with_pkill(kill_process_name, want_sudo);
+-}
+-
+-
+ static const struct {
+     const char *name;
+     Uint32 flag;

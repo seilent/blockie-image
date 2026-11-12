@@ -705,6 +705,48 @@ grep -qxF 'ExecStart=/usr/bin/blockie-session request %i app' "$as" && grep -qxF
   grep -qxF "f $run/lock/request.lock 0600 root root -" "$sf/usr/lib/tmpfiles.d/blockie.conf"
 res $? "appswitch@ requests with reason app in the switch@ sandbox; tmpfiles makes the lock dir and the request lock"
 
+em=$sf/usr/lib/blockie/sessions.d/emulation.conf
+grep -qxF 'FOCUS=com.libretro.RetroArch net.seilent.Blockie.Port' "$em" && grep -qxF 'SLICE=blockie-emulation.slice' "$em"
+res $? "the shipped emulation session focuses RetroArch, then a port window, in blockie-emulation.slice"
+
+: > "$R/usr/lib/systemd/user/blockie-test-m.service"
+echo "blockie-test-m.service test.m" >> "$t/apps"
+session usr/lib/blockie/sessions.d m LABEL=Mike UNIT=blockie-test-m.service APP_ID=test.m SLICE=blockie-emulation.slice \
+  FOCUS=test.game
+rm -f "$t/run/session-pending" "$t/run/session-wanted" "$t/units/blockie-test-a.service.frozen" "$t/win/test.game"
+touch "$t/units/blockie-test-a.service.active" "$t/win/test.a"
+printf 'a blockie-test-a.service 3\n' > "$t/run/session-current"
+mins() { sed -n 's/^wlrctl toplevel minimize app_id://p' "$t/log" | paste -sd ' '; }
+export BLOCKIE_SESSION_APPIDS=$t/appids
+printf '%s\n' test.port1 'bad/id' test.port2 '' test.port3 test.port4 test.port5 > "$t/appids"
+go m
+go a
+[[ $(mins) == "test.game test.port1 test.port2 test.port3 test.port4 net.seilent.Blockie.PortMsg test.m" ]]
+res $? "app id file: valid ids after the static FOCUS, at most 4, then net.seilent.Blockie.PortMsg last"
+touch "$t/win/test.port2" "$t/win/net.seilent.Blockie.PortMsg"
+go m
+logged "wlrctl toplevel focus app_id:test.port2" && ! logged "wlrctl toplevel focus app_id:net.seilent.Blockie.PortMsg" &&
+  ! logged "wlrctl toplevel focus app_id:test.m"
+res $? "app id file: back to the emulation session focuses the port window, never the message window left open"
+rm -f "$t/win/test.port2" "$t/win/net.seilent.Blockie.PortMsg"
+go a
+printf 'test.evil\n' > "$t/evil"
+ln -sfn "$t/evil" "$t/appids"
+go m
+go a
+r1=$(mins)
+rm -f "$t/appids"
+go m
+go a
+[[ $r1 == "test.game net.seilent.Blockie.PortMsg test.m" && $(mins) == "$r1" ]]
+res $? "app id file: a symlink is never followed, a missing file adds only net.seilent.Blockie.PortMsg"
+printf 'test.port1\n' > "$t/appids"
+go e
+go a
+[[ $(mins) == "test.game test.other test.e" ]]
+res $? "app id file: a session outside blockie-emulation.slice gets no ids from it"
+unset BLOCKIE_SESSION_APPIDS
+
 fo=$sf/usr/libexec/blockie/blockie-funeos
 mkdir -p "$t/fdev" "$t/fbin"
 for d in fdev fbin; do

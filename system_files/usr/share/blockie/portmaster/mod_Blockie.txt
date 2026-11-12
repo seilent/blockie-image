@@ -1,0 +1,161 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+
+CUR_TTY=/dev/null
+
+export SDL_VIDEODRIVER="wayland"
+export SDL_VIDEO_WAYLAND_WMCLASS="net.seilent.Blockie.Port"
+export SDL_APP_ID="net.seilent.Blockie.Port"
+
+if [[ "${0##*/}" == westonwrap*.sh ]]; then
+  CFW_NAME="ROCKNIX"
+  glxinfo() { :; }
+fi
+
+GODOT2_OPTS="-r ${DISPLAY_WIDTH}x${DISPLAY_HEIGHT} -f"
+GODOT_OPTS="--resolution ${DISPLAY_WIDTH}x${DISPLAY_HEIGHT} -f"
+
+_blockie_le16() {
+  printf '%s%s' "${1:2:2}" "${1:0:2}"
+}
+
+BLOCKIE_PAD_GUID="$(_blockie_le16 0019)0000$(_blockie_le16 4001)0000$(_blockie_le16 0428)0000$(_blockie_le16 0100)0000"
+BLOCKIE_PAD_MAPPING="${BLOCKIE_PAD_GUID},AYANEO Controller,a:b1,b:b0,x:b3,y:b2,back:b8,start:b9,guide:b10,leftshoulder:b4,rightshoulder:b5,lefttrigger:b6,righttrigger:b7,dpup:h0.1,dpright:h0.2,dpdown:h0.4,dpleft:h0.8,platform:Linux,"
+
+get_controls() {
+  ANALOGSTICKS="${ANALOG_STICKS:-0}"
+  LOWRES="N"
+  DEVICE="blockie"
+  param_device="blockie"
+
+  local dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/blockie-ports"
+  mkdir -p "$dir"
+  export SDL_GAMECONTROLLERCONFIG_FILE="$dir/gamecontrollerdb.txt"
+  printf '%s\n' "$BLOCKIE_PAD_MAPPING" > "$SDL_GAMECONTROLLERCONFIG_FILE"
+
+  sdl_controllerconfig="$(< "$SDL_GAMECONTROLLERCONFIG_FILE")"
+}
+
+BLOCKIE_ERROR_S=10
+
+_blockie_portmsg() {
+  env -i $BLOCKIE_PORTMSG_ENV /usr/libexec/blockie/blockie-portmsg "$@"
+}
+
+_blockie_words() {
+  local t="${1,,}"
+  if [[ $t == *"requires the latest portmaster"* || $t == *"requires the latest version of portmaster"* ||
+    $t == *"requires a newer version of portmaster"* ]]; then
+    printf '%s' "this port needs a newer blockie"
+  else
+    printf '%s' "$1"
+  fi
+}
+
+_blockie_text() {
+  local text="" title="" timeout=""
+  if [ "${1#--}" = "$1" ]; then
+    text="$1"
+    shift
+  fi
+  while (( $# )); do
+    case "$1" in
+      --text) text="${2-}"; shift ;;
+      --title) title="${2-}"; shift ;;
+      --timeout) timeout="${2-}"; shift ;;
+      --type | --ok-text | --cancel-text) shift ;;
+      --*) ;;
+      *) [[ -n $text ]] || text="$1" ;;
+    esac
+    shift
+  done
+  BLOCKIE_TEXT_ARGS=(--text "$(_blockie_words "$text")")
+  [[ -n $title ]] && BLOCKIE_TEXT_ARGS+=(--title "$title")
+  BLOCKIE_TEXT_TIMEOUT=""
+  if [[ $timeout =~ ^[0-9]+$ ]]; then
+    BLOCKIE_TEXT_TIMEOUT="$timeout"
+    BLOCKIE_TEXT_ARGS+=(--timeout "$timeout")
+  fi
+}
+
+_blockie_text_wait() {
+  _blockie_text "$@"
+  [[ -n $BLOCKIE_TEXT_TIMEOUT ]] || BLOCKIE_TEXT_ARGS+=(--timeout "$BLOCKIE_ERROR_S")
+  _blockie_portmsg "${BLOCKIE_TEXT_ARGS[@]}" --wait
+  local rc=$?
+  (( rc == 3 )) && return 0
+  return "$rc"
+}
+
+pm_message() {
+  echo "$1"
+
+  if [ "$1" = "Patching process already completed. Skipping." ]; then
+    return
+  fi
+
+  _blockie_text "$@"
+  [[ -n $BLOCKIE_TEXT_TIMEOUT ]] || BLOCKIE_TEXT_ARGS+=(--wait)
+  _blockie_portmsg "${BLOCKIE_TEXT_ARGS[@]}" &
+}
+
+pm_show_error() {
+  _blockie_text_wait "$@"
+}
+
+pm_message_close() {
+  _blockie_portmsg --close || :
+}
+
+PortMasterDialogInit() {
+  BLOCKIE_DIALOG_LAST=""
+}
+
+PortMasterDialogExit() {
+  pm_message_close
+}
+
+PortMasterDialog() {
+  BLOCKIE_DIALOG_RESULT="DONE"
+  case "$1" in
+    message)
+      printf '%s\n' "$(_blockie_words "${2-}")" | _blockie_portmsg --progress || :
+      ;;
+    progress)
+      local amount=0 total=100
+      [[ ${3-} =~ ^[0-9]+$ ]] && amount="$3"
+      [[ ${4-} =~ ^[1-9][0-9]*$ ]] && total="$4"
+      if [[ -n ${2-} && $2 != "${BLOCKIE_DIALOG_LAST-}" ]]; then
+        printf '%s\n' "$2" | _blockie_portmsg --progress || :
+        BLOCKIE_DIALOG_LAST="$2"
+      fi
+      _blockie_portmsg --progress-set "$amount" "$total" || :
+      ;;
+    message_box)
+      _blockie_text_wait "${@:2}"
+      BLOCKIE_DIALOG_RESULT="TRUE"
+      ;;
+    check_runtime)
+      if "$controlfolder/harbourmaster" --quiet --no-check runtime_check "${2-}"; then
+        BLOCKIE_DIALOG_RESULT="OKAY"
+      else
+        BLOCKIE_DIALOG_RESULT="FAIL"
+      fi
+      ;;
+  esac
+}
+
+PortMasterDialogResult() {
+  PortMasterDialog "$@"
+  echo "$BLOCKIE_DIALOG_RESULT"
+}
+
+PortMasterDialogMessageBox() {
+  PortMasterDialog "message_box" "$@"
+  echo "$BLOCKIE_DIALOG_RESULT"
+}
+
+PortMasterDialogCheckRuntime() {
+  PortMasterDialog "check_runtime" "$@"
+  echo "$BLOCKIE_DIALOG_RESULT"
+}

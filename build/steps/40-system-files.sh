@@ -2,6 +2,7 @@
 set -euo pipefail
 
 cp -a /ctx/system_files/. /
+/usr/libexec/blockie/ports/alsa-gen
 ln -sfn ../usr/share/zoneinfo/Asia/Tokyo /etc/localtime
 
 while read -r t u g; do
@@ -76,3 +77,4 @@ sed -i 's/^SELINUX=.*/SELINUX=disabled/' /etc/selinux/config
 grep -qx 'SELINUX=disabled' /etc/selinux/config || { echo "40-system-files: SELINUX not disabled" >&2; exit 1; }
 
 install -d -m 755 /blockie /vendor
+ln -sfn var/lib/blockie/data/roms /roms

@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+me=alsa-gen
+in=${1:-/usr/share/alsa/alsa.conf}
+out=${2:-/usr/share/blockie/ports/alsa.conf}
+redirect=/usr/share/blockie/ports/alsa-redirect.conf
+
+tmp=$(mktemp "$out.XXXXXX")
+trap 'rm -f "${tmp:?}"' EXIT
+if ! awk -v redirect="$redirect" '
+  state == 0 && $0 == "@hooks [" { state = 1; print; next }
+  state == 1 && $0 == "]" { state = 9 }
+  state == 1 && /^[ \t]*files \[$/ {
+    print
+    indent = $0
+    sub(/files \[$/, "", indent)
+    print indent "\t\"/etc/alsa/conf.d\""
+    print indent "\t\"" redirect "\""
+    state = 2
+    next
+  }
+  state == 2 {
+    if ($0 == indent "]") {
+      print
+      state = 3
+    }
+    next
+  }
+  { print }
+  END { exit (state == 3 ? 0 : 1) }
+' "$in" > "$tmp"; then
+  echo "$me: no top @hooks file list in $in" >&2
+  exit 1
+fi
+chmod 644 "$tmp"
+mv -f "$tmp" "$out"

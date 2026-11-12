@@ -1,0 +1,109 @@
+diff --git a/src/gptokeyb.cpp b/src/gptokeyb.cpp
+index 11acb0a..2d06a03 100644
+--- a/src/gptokeyb.cpp
++++ b/src/gptokeyb.cpp
+@@ -210,13 +210,10 @@ int main(int argc, char* argv[])
+             }
+         } else if ((strcmp(argv[ii], "1") == 0) || (strcmp(argv[ii], "-1") == 0) || (strcmp(argv[ii], "-k") == 0)) {
+             if (ii + 1 < argc) { 
+-                kill_mode = true;
+                 AppToKill = argv[++ii];
+             }
+         } else if ((strcmp(argv[ii], "-sudokill") == 0)) {
+             if (ii + 1 < argc) { 
+-                kill_mode = true;
+-                sudo_kill = true;
+                 AppToKill = argv[++ii];
+                 if (strcmp(AppToKill, "exult") == 0) { // special adjustment for Exult, which adds double spaces during text input
+                     app_exult_adjust = true;
+diff --git a/src/gptokeyb.h b/src/gptokeyb.h
+index df87fae..d4294f0 100644
+--- a/src/gptokeyb.h
++++ b/src/gptokeyb.h
+@@ -126,8 +126,6 @@ void handleAnalogTrigger(bool is_triggered, bool& was_triggered, int key, int mo
+ 
+ short char_to_keycode(const char* str);
+ 
+-void doKillMode();
+-
+ // gptokeyb.cpp
+ int applyDeadzone(int value, int deadzone);
+ void setKeyRepeat(int code, bool is_pressed);
+diff --git a/src/keyboard.cpp b/src/keyboard.cpp
+index c2a1367..f235ae8 100644
+--- a/src/keyboard.cpp
++++ b/src/keyboard.cpp
+@@ -736,10 +736,7 @@ void handleEventBtnFakeKeyboardMouseDevice(const SDL_Event& event, bool is_press
+         }
+         break;
+     } //switch
+-    if ((kill_mode) && (state.start_pressed && state.hotkey_pressed)) {
+-        doKillMode();
+-    } //kill mode 
+-    else if ((textinputpreset_mode) && (state.textinputpresettrigger_pressed && state.start_pressed)) { //activate input preset mode - send predefined text as a series of keystrokes
++    if ((textinputpreset_mode) && (state.textinputpresettrigger_pressed && state.start_pressed)) { //activate input preset mode - send predefined text as a series of keystrokes
+         printf("[GPTK]: text input preset pressed\n");
+         state.start_combo_triggered = true;
+         if (state.start_jsdevice == state.textinputpresettrigger_jsdevice) {
+diff --git a/src/util.cpp b/src/util.cpp
+index 47872d3..361ed6a 100644
+--- a/src/util.cpp
++++ b/src/util.cpp
+@@ -388,42 +388,3 @@ short char_to_keycode(const char* str)
+     // Default
+     return 0;
+ }
+-
+-
+-void doKillMode()
+-{
+-    if (pckill_mode) {
+-        emitKey(KEY_F4, true, KEY_LEFTALT);
+-        SDL_Delay(15);
+-        emitKey(KEY_F4, false, KEY_LEFTALT);
+-    }
+-
+-    SDL_RemoveTimer( state.key_repeat_timer_id );
+-    if (state.start_jsdevice == state.hotkey_jsdevice) {
+-        if (! sudo_kill) {
+-            printf("[GPTK]: Killing: %s\n", AppToKill);
+-            system(("pkill -f '" + std::string(AppToKill) + "' ").c_str());
+-            // system("show_splash.sh exit");
+-
+-            sleep(3);
+-            if (system((" pgrep -f '" + std::string(AppToKill) + "' ").c_str()) == 0) {
+-                printf("[GPTK]: Forcefully Killing: %s\n", AppToKill);
+-                system((" pkill -9 -f '" + std::string(AppToKill) + "' ").c_str());
+-            }
+-
+-            exit(0); 
+-        } else {
+-            printf("[GPTK]: Killing: %s\n", AppToKill);
+-            system((" sudo pkill -f '" + std::string(AppToKill) + "' ").c_str());
+-
+-            sleep(3);
+-
+-            if (system((" pgrep -f '" + std::string(AppToKill) + "' ").c_str()) == 0) {
+-                printf("[GPTK]: Forcefully Killing: %s\n", AppToKill);
+-                system((" sudo pkill -9 -f '" + std::string(AppToKill) + "' ").c_str());
+-            }
+-
+-            exit(0); 
+-        }
+-    } // sudo kill
+-}
+diff --git a/src/xbox360.cpp b/src/xbox360.cpp
+index fe06ea4..2cefe22 100644
+--- a/src/xbox360.cpp
++++ b/src/xbox360.cpp
+@@ -180,10 +180,6 @@ void handleEventBtnFakeXbox360Device(const SDL_Event &event, bool is_pressed)
+         emitAxisMotion(ABS_HAT0X, is_pressed ? 1 : 0);
+         break;
+     }
+-
+-    if ((kill_mode) && (state.start_pressed && state.hotkey_pressed)) {
+-        doKillMode();
+-    } //kill mode
+ }
+ 
+ void handleEventAxisFakeXbox360Device(const SDL_Event &event)

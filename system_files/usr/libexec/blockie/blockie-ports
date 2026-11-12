@@ -1,0 +1,1093 @@
+#!/usr/bin/python3 -IS
+import contextlib
+import errno
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shutil
+import signal
+import sqlite3
+import stat
+import subprocess
+import sys
+import time
+import traceback
+import zipfile
+from pathlib import Path
+
+ME = "blockie-ports"
+DATA = os.environ.get("BLOCKIE_PORTS_DATA", "/var/lib/blockie/data")
+MOUNT = os.environ.get("BLOCKIE_PORTS_MOUNT", DATA)
+USR = os.environ.get("BLOCKIE_PORTS_USR", "/usr/share/blockie/portmaster")
+TREE = os.path.join(USR, "PortMaster")
+PYLIBS = os.environ.get("BLOCKIE_PORTS_PYLIBS", os.path.join(TREE, "pylibs"))
+EXLIBS = os.environ.get("BLOCKIE_PORTS_EXLIBS", os.path.join(TREE, "exlibs"))
+SYSTEMCTL = os.environ.get("BLOCKIE_PORTS_SYSTEMCTL", "systemctl")
+NMCLI = os.environ.get("BLOCKIE_PORTS_NMCLI", "nmcli")
+UNSQUASHFS = os.environ.get("BLOCKIE_PORTS_UNSQUASHFS", "unsquashfs")
+FLOOR = int(os.environ.get("BLOCKIE_PORTS_FLOOR", str(2 << 30)))
+WAIT_S = float(os.environ.get("BLOCKIE_PORTS_WAIT_S", "600"))
+CA = "/etc/pki/tls/certs/ca-bundle.crt"
+PORTS = os.path.join(DATA, "roms", "ports")
+FARM = os.path.join(PORTS, "PortMaster")
+LIBS = os.path.join(FARM, "libs")
+UNPACKED = os.path.join(LIBS, ".unpacked")
+UNINDEX = os.path.join(UNPACKED, "index.tsv")
+PART = os.path.join(LIBS, ".part")
+RUNTIMES = os.path.join(FARM, "config", "runtimes.json")
+STATE = os.path.join(PORTS, ".blockie")
+TXN = os.path.join(STATE, "txn")
+STALE = os.path.join(STATE, "stale")
+UPDATES = os.path.join(STATE, "updates")
+INDEX = os.path.join(STATE, "index.tsv")
+CATALOG = os.path.join(STATE, "catalog.db")
+STAMP = os.path.join(STATE, "tree.sha256")
+TMP = os.path.join(DATA, "cache", "ports-tmp", "helper")
+REAL_DIRS = ("config", "libs", "resources", "themes")
+REAL_FILES = re.compile(r"device_info_.*\.env|harbourmaster\.txt")
+OWN = ("harbourmaster", "mod_Blockie.txt")
+KEEP = ("PortMaster", ".blockie")
+BUILTIN = ("love_11.5.squashfs",)
+KEEP_STALE = 3
+GC_S = 30 * 86400
+IMAGES = 128 << 20
+SQUASH_RATIO = 3
+PORT = re.compile(r"[a-z0-9][a-z0-9._-]*\.zip")
+RUNTIME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*")
+MD5 = re.compile(r"[0-9a-f]{32}")
+SAFE_IMAGE = re.compile(r"[a-z0-9][a-z0-9._-]*\.(?:png|jpg)")
+CTRL = re.compile(r"[\x00-\x1f\x7f]")
+BODY = re.compile(r"[\x00-\x09\x0b-\x1f\x7f]")
+SCAN = (re.compile(r"libs/([A-Za-z0-9][A-Za-z0-9._+-]*?)\.squashfs"),
+        re.compile(r"\b\w*runtime=[\"']?([A-Za-z0-9][A-Za-z0-9._+-]*)", re.I))
+COVERS = ("cover.png", "cover.jpg", "screenshot.png", "screenshot.jpg")
+CANCEL = [False]
+
+
+class Fail(Exception):
+    def __init__(self, why):
+        super().__init__(why)
+        self.why = why
+
+
+class Proto:
+    def __init__(self, fd):
+        self.fd = fd
+
+    def line(self, *fields):
+        try:
+            os.write(self.fd, ("\t".join(fields) + "\n").encode())
+        except OSError:
+            pass
+
+    def progress(self, what, done, total):
+        self.line("progress", what, str(done), "-" if total is None else str(total))
+
+    def done(self, name):
+        self.line("done", name)
+
+    def fail(self, name, why):
+        self.line("fail", name, why)
+
+
+def log(msg):
+    print(f"{ME}: {msg}", file=sys.stderr, flush=True)
+
+
+def on_term(signum, frame):
+    CANCEL[0] = True
+
+
+def fsync_dir(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def fsync_file(path):
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def write_atomic(path, data):
+    tmp = f"{path}.tmp-{os.getpid()}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC | os.O_NOFOLLOW, 0o644)
+    try:
+        try:
+            view = memoryview(data)
+            while view:
+                view = view[os.write(fd, view):]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, path)
+    except BaseException:
+        remove(tmp)
+        raise
+    fsync_dir(os.path.dirname(path))
+
+
+def remove(path):
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISDIR(st.st_mode):
+        os.unlink(path)
+        return
+    for root, dirs, files in os.walk(path):
+        os.chmod(root, stat.S_IMODE(os.lstat(root).st_mode) | 0o700)
+    shutil.rmtree(path)
+
+
+def inside(path):
+    if not isinstance(path, str) or not os.path.isabs(path):
+        return False
+    path = os.path.normpath(path)
+    base = os.path.basename(path)
+    parent = os.path.realpath(os.path.dirname(path))
+    ports = os.path.realpath(PORTS)
+    if base in ("", ".", "..") or (parent == ports and base in KEEP):
+        return False
+    return (parent + "/").startswith(ports + "/")
+
+
+def free_bytes():
+    st = os.statvfs(PORTS)
+    return st.f_bavail * st.f_frsize
+
+
+def need(nbytes):
+    if free_bytes() <= nbytes + FLOOR:
+        raise Fail("space")
+
+
+def offline():
+    try:
+        out = subprocess.run([NMCLI, "-t", "-f", "TYPE,STATE", "device"], stdin=subprocess.DEVNULL,
+                             capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    for line in out.splitlines():
+        kind, _, state = line.partition(":")
+        if kind != "loopback" and state.split(" ")[0] == "connected":
+            return False
+    return True
+
+
+def scope_active():
+    try:
+        return subprocess.run([SYSTEMCTL, "--user", "is-active", "--quiet", "blockie-game.scope"],
+                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL).returncode == 0
+    except OSError:
+        return False
+
+
+def open_lock(path):
+    return os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o644)
+
+
+def helper_lock(proto, wait):
+    fd = open_lock(os.path.join(STATE, "lock"))
+    end = time.monotonic() + WAIT_S
+    shown = None
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            pass
+        now = time.monotonic()
+        if not wait or now >= end or CANCEL[0]:
+            os.close(fd)
+            raise Fail("cancel" if CANCEL[0] else "busy")
+        waited = int(WAIT_S - (end - now))
+        if waited != shown:
+            proto.progress("wait", waited, int(WAIT_S))
+            shown = waited
+        time.sleep(0.2)
+
+
+@contextlib.contextmanager
+def game_lock():
+    run = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    fd = open_lock(os.path.join(run, "blockie-game.lock"))
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Fail("busy")
+        yield
+    finally:
+        os.close(fd)
+
+
+def empty_tmp():
+    remove(TMP)
+    os.makedirs(TMP, 0o700)
+
+
+def md5_file(path):
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for data in iter(lambda: f.read(1 << 20), b""):
+            h.update(data)
+    return h.hexdigest()
+
+
+def read_unindex():
+    rows = []
+    try:
+        with open(UNINDEX) as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        return rows
+    for line in lines:
+        r = line.split("\t")
+        if len(r) == 5 and all(x.isdigit() for x in r[1:4]) and MD5.fullmatch(r[4]):
+            rows.append((r[0], int(r[1]), int(r[2]), int(r[3]), r[4]))
+    return rows
+
+
+def write_unindex(rows):
+    write_atomic(UNINDEX, "".join("\t".join(map(str, r)) + "\n" for r in rows).encode())
+
+
+def lookup(rows, path):
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        return None
+    name = os.path.basename(path)
+    for r in rows:
+        if r[:4] == (name, st.st_size, st.st_mtime_ns, st.st_ino):
+            return r
+    return None
+
+
+def current(path, md5):
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISREG(st.st_mode):
+        return False
+    row = lookup(read_unindex(), path)
+    if row is not None:
+        return row[4] == md5
+    return md5_file(path) == md5
+
+
+def record(path, md5):
+    st = os.stat(path)
+    name = os.path.basename(path)
+    rows = [r for r in read_unindex() if r[0] != name]
+    rows.append((name, st.st_size, st.st_mtime_ns, st.st_ino, md5))
+    write_unindex(rows)
+
+
+def seal(top):
+    for root, dirs, files in os.walk(top, topdown=False):
+        for f in files:
+            p = os.path.join(root, f)
+            st = os.lstat(p)
+            if stat.S_ISREG(st.st_mode):
+                os.chmod(p, 0o555 if st.st_mode & 0o111 else 0o444)
+        for d in dirs:
+            p = os.path.join(root, d)
+            if stat.S_ISDIR(os.lstat(p).st_mode):
+                os.chmod(p, 0o555)
+
+
+def unpack_tree(path, md5, proto):
+    tree = os.path.join(UNPACKED, md5)
+    os.makedirs(UNPACKED, 0o755, exist_ok=True)
+    if not os.path.isdir(tree):
+        size = os.stat(path).st_size
+        need(size * SQUASH_RATIO)
+        tmp = f"{tree}.tmp-{os.getpid()}"
+        remove(tmp)
+        proto.progress("unpack", 0, size)
+        with subprocess.Popen([UNSQUASHFS, "-percentage", "-no-xattrs", "-d", tmp, path], stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, text=True, errors="replace") as p:
+            for line in p.stdout:
+                line = line.strip()
+                if line.isdigit() and int(line) <= 100:
+                    proto.progress("unpack", size * int(line) // 100, size)
+                elif line:
+                    log(f"unsquashfs: {line}")
+        if p.returncode != 0:
+            remove(tmp)
+            raise Fail("runtime")
+        seal(tmp)
+        os.rename(tmp, tree)
+        os.chmod(tree, 0o555)
+        fsync_dir(UNPACKED)
+    record(path, md5)
+
+
+def journal(name, data):
+    os.makedirs(TXN, 0o755, exist_ok=True)
+    write_atomic(os.path.join(TXN, name), json.dumps(data).encode())
+
+
+def drop_journal(name):
+    remove(os.path.join(TXN, name))
+
+
+def mark_update(name):
+    os.makedirs(UPDATES, 0o755, exist_ok=True)
+    os.close(os.open(os.path.join(UPDATES, name), os.O_WRONLY | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o644))
+
+
+def clear_update(name):
+    remove(os.path.join(UPDATES, name))
+
+
+def rollback(data):
+    for p in reversed(data.get("new", [])):
+        if inside(p):
+            remove(p)
+
+
+def replay():
+    try:
+        names = sorted(os.listdir(TXN))
+    except FileNotFoundError:
+        return
+    for n in names:
+        p = os.path.join(TXN, n)
+        if ".tmp-" not in n:
+            try:
+                with open(p) as f:
+                    data = json.load(f)
+                update = data.get("op") == "update"
+                if not (update and data.get("extracted")):
+                    rollback(data)
+                if update and PORT.fullmatch(str(data.get("name"))):
+                    mark_update(data["name"])
+                log(f"replayed the journal of {n}")
+            except (OSError, ValueError, AttributeError, TypeError) as err:
+                log(f"dropped the unreadable journal {n}: {err}")
+        remove(p)
+    fsync_dir(TXN)
+
+
+def whole(v):
+    return v.encode("utf-8", "replace").decode() if isinstance(v, str) else v
+
+
+def text(v):
+    return CTRL.sub(" ", whole(v)).strip() if isinstance(v, str) else ""
+
+
+def body(v):
+    return BODY.sub(" ", whole(v)).strip() if isinstance(v, str) else ""
+
+
+def join_list(v):
+    if isinstance(v, str):
+        v = [v]
+    return "\t".join(t for t in (text(x) for x in v or []) if t) if isinstance(v, list) else ""
+
+
+def norm(name):
+    return name if name.endswith(".squashfs") else name + ".squashfs"
+
+
+def port_scripts(info):
+    out = []
+    for key in ("items", "items_opt"):
+        items = info.get(key)
+        for i in items if isinstance(items, list) else []:
+            if isinstance(i, str) and "/" not in i and i.lower().endswith(".sh"):
+                out.append(os.path.join(PORTS, i))
+    return out
+
+
+def runtimes_of(info, scripts):
+    names = []
+
+    def add(n):
+        n = norm(n)
+        if RUNTIME.fullmatch(n) and n not in names:
+            names.append(n)
+
+    attr = info.get("attr") if isinstance(info.get("attr"), dict) else {}
+    rts = attr.get("runtime") or []
+    for r in [rts] if isinstance(rts, str) else rts:
+        if isinstance(r, str):
+            add(r)
+    for s in scripts:
+        try:
+            with open(s, encoding="utf-8", errors="replace") as f:
+                src = f.read()
+        except OSError:
+            continue
+        for rx in SCAN:
+            for m in rx.finditer(src):
+                add(m.group(1))
+    return names
+
+
+def cover_of(port_dir, attr):
+    image = attr.get("image") if isinstance(attr.get("image"), dict) else {}
+    covers = image.get("covers") if isinstance(image.get("covers"), list) else []
+    for c in covers + [image.get("screenshot")] + list(COVERS):
+        if not isinstance(c, str) or "/" in c or c in ("", ".", "..") or CTRL.search(c):
+            continue
+        if not c.lower().endswith((".png", ".jpg", ".jpeg")):
+            continue
+        p = os.path.join(port_dir, c)
+        try:
+            if stat.S_ISREG(os.lstat(p).st_mode):
+                return p
+        except FileNotFoundError:
+            pass
+    return None
+
+
+def utf8(name):
+    try:
+        name.encode()
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def write_index():
+    owners = {}
+    names = sorted(n for n in os.listdir(PORTS) if utf8(n))
+    for d in names:
+        port_dir = os.path.join(PORTS, d)
+        if d in KEEP or CTRL.search(port_dir) or not stat.S_ISDIR(os.lstat(port_dir).st_mode):
+            continue
+        try:
+            with open(os.path.join(port_dir, "port.json"), encoding="utf-8") as f:
+                info = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(info, dict):
+            continue
+        scripts = [os.path.basename(s) for s in port_scripts({"items": info.get("items")})]
+        attr = info.get("attr") if isinstance(info.get("attr"), dict) else {}
+        title = text(attr.get("title")) if len(scripts) == 1 else ""
+        cover = cover_of(port_dir, attr)
+        if cover is not None and not utf8(cover):
+            cover = None
+        for s in scripts:
+            owners.setdefault(s.casefold(), (title, port_dir, cover))
+    lines = []
+    for f in names:
+        p = os.path.join(PORTS, f)
+        if not f.endswith(".sh") or f.startswith(".") or CTRL.search(f) or not stat.S_ISREG(os.lstat(p).st_mode):
+            continue
+        stem = f[:-3]
+        title, port_dir, cover = owners.get(f.casefold(), ("", None, None))
+        lines.append("\t".join((stem, title or stem, port_dir or "-", cover or "-")) + "\n")
+    write_atomic(INDEX, "".join(lines).encode())
+
+
+def image(p):
+    if p is None:
+        return None
+    p = str(p)
+    if SAFE_IMAGE.fullmatch(os.path.basename(p)) and not CTRL.search(p) and os.path.isfile(p):
+        return p
+    return None
+
+
+def write_catalog(hm):
+    rows = []
+    seen = set()
+    hidden = {"reqs": 0, "exp": 0}
+    try:
+        marks = set(os.listdir(UPDATES))
+    except FileNotFoundError:
+        marks = set()
+    for src in hm.sources.values():
+        for name in src.ports:
+            if name in seen:
+                continue
+            seen.add(name)
+            info = hm.port_info(name)
+            if not info:
+                continue
+            if not hm.match_requirements(info):
+                hidden["reqs"] += 1
+                continue
+            attrs = hm.port_info_attrs(info)
+            if "exp" in attrs and not hm.cfg_data.get("show_experimental", False):
+                hidden["exp"] += 1
+                continue
+            attr = info.get("attr") if isinstance(info.get("attr"), dict) else {}
+            source = info.get("source") if isinstance(info.get("source"), dict) else {}
+            size = source.get("size")
+            images = hm.port_images(name) or {}
+            rows.append((name, text(attr.get("title")) or name, join_list(attr.get("genres")),
+                         join_list(attr.get("porter")), body(attr.get("desc")), body(attr.get("inst")),
+                         size if isinstance(size, int) and not isinstance(size, bool) else 0,
+                         text(attr.get("availability")), join_list(attr.get("runtime")),
+                         int("installed" in attrs), int("update available" in attrs or name in marks),
+                         image(images.get("screenshot")), image(images.get("cover"))))
+    log(f"catalog: {len(rows)} ports, hidden: {hidden['reqs']} by requirements, {hidden['exp']} experimental")
+    tmp = f"{CATALOG}.tmp-{os.getpid()}"
+    remove(tmp)
+    db = sqlite3.connect(tmp)
+    try:
+        db.execute("CREATE TABLE ports (name TEXT PRIMARY KEY, title TEXT, genres TEXT, porter TEXT, "
+                   "description TEXT, inst TEXT, size INTEGER, availability TEXT, runtimes TEXT, "
+                   "installed INTEGER, update_available INTEGER, screenshot TEXT, cover TEXT)")
+        db.executemany("INSERT INTO ports VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+        db.commit()
+    finally:
+        db.close()
+    fsync_file(tmp)
+    os.replace(tmp, CATALOG)
+    fsync_dir(STATE)
+
+
+def fix_permissions(path_check=None):
+    if path_check is None or not os.path.lexists(path_check) or os.path.islink(path_check):
+        return
+    subprocess.run(["chmod", "-R", "u+rwx,go+rx,go-w", "--", str(path_check)], stdin=subprocess.DEVNULL)
+
+
+def skip_runtime(runtime, port_name=None, in_install=False):
+    return 0
+
+
+def load_hm():
+    for p in (EXLIBS, PYLIBS):
+        if p not in sys.path:
+            sys.path.insert(0, p)
+    import harbourmaster
+    from loguru import logger
+    logger.remove()
+    logger.add(sys.stderr, level="WARNING")
+    logger.add(os.path.join(FARM, "harbourmaster.txt"), level="DEBUG", mode="w")
+    return harbourmaster
+
+
+def make_feed(hmod, proto):
+    class Feed(hmod.Callback):
+        def __init__(self):
+            super().__init__()
+            self.cancellable = False
+            self.what = "load"
+            self.last = 0.0
+
+        def progress(self, message, amount, total=None, fmt=None):
+            if CANCEL[0] and self.cancellable:
+                raise hmod.CancelEvent()
+            if message is None or amount is None:
+                return
+            now = time.monotonic()
+            if now - self.last >= 0.25 or (total is not None and amount >= total):
+                self.last = now
+                proto.progress(self.what, amount, total)
+
+        def message_box(self, message, *args, **kwargs):
+            log(text(str(message)))
+
+        @contextlib.contextmanager
+        def enable_cancellable(self, cancellable=False):
+            old = self.cancellable
+            self.cancellable = cancellable
+            try:
+                yield
+            finally:
+                self.cancellable = old
+
+    return Feed()
+
+
+class Ctx:
+    def __init__(self, proto):
+        self.proto = proto
+        self.hmod = None
+        self.feed = None
+
+    def load(self):
+        if self.hmod is None:
+            self.hmod = load_hm()
+            self.feed = make_feed(self.hmod, self.proto)
+        return self.hmod, self.feed
+
+    def open(self, check):
+        hmod, feed = self.load()
+        off = offline()
+        hm = hmod.HarbourMaster({"no-check": off or not check, "offline": off, "quiet": True, "debug": False},
+                                temp_dir=Path(TMP), callback=feed)
+        hm.check_runtime = skip_runtime
+        hm._fix_permissions = fix_permissions
+        return hm
+
+
+def installed(hm, name):
+    return name in hm.installed_ports or name in hm.broken_ports
+
+
+def installed_info(hm, name):
+    return hm.installed_ports.get(name) or hm.broken_ports.get(name) or {}
+
+
+def rt_remote(hm, rt):
+    remote = hm.runtimes_info.get(rt, {}).get("remote", {}).get(hm.device.get("primary_arch", "aarch64"))
+    if isinstance(remote, dict) and isinstance(remote.get("md5"), str) and isinstance(remote.get("url"), str):
+        return remote
+    return None
+
+
+def fetch_runtime(hm, ctx, rt):
+    hmod, feed = ctx.load()
+    remote = rt_remote(hm, rt)
+    if remote is None:
+        raise Fail("unknown-runtime")
+    md5 = remote["md5"]
+    final = os.path.join(LIBS, rt)
+    if current(final, md5):
+        unpack_tree(final, md5, ctx.proto)
+        return
+    if hm.config["offline"]:
+        raise Fail("network")
+    size = remote.get("size") if isinstance(remote.get("size"), int) else 0
+    need(size * (1 + SQUASH_RATIO))
+    os.makedirs(PART, 0o755, exist_ok=True)
+    os.makedirs(UNPACKED, 0o755, exist_ok=True)
+    part = os.path.join(PART, f"{rt}.{os.getpid()}")
+    tmp = os.path.join(UNPACKED, f"{md5}.tmp-{os.getpid()}")
+    journal(rt, {"op": "runtime", "name": rt, "new": [part, tmp]})
+    try:
+        res = [None]
+        feed.what = "runtime"
+        with feed.enable_cancellable(True):
+            try:
+                got = hmod.download(Path(part), remote["url"], md5_result=res, callback=feed, no_check=True)
+            except hmod.CancelEvent:
+                raise Fail("cancel")
+        if CANCEL[0]:
+            raise Fail("cancel")
+        if got is None:
+            raise Fail("network")
+        if res[0] != md5:
+            raise Fail("md5")
+        fsync_file(part)
+        os.replace(part, final)
+        fsync_dir(LIBS)
+        unpack_tree(final, md5, ctx.proto)
+    except BaseException:
+        remove(part)
+        remove(tmp)
+        drop_journal(rt)
+        raise
+    drop_journal(rt)
+
+
+def gc(hm):
+    rows = read_unindex()
+    named = set()
+    for info in list(hm.installed_ports.values()) + list(hm.broken_ports.values()):
+        for rt in runtimes_of(info, port_scripts(info)):
+            row = lookup(rows, os.path.join(LIBS, rt))
+            if row is not None:
+                named.add(row[4])
+    now = time.time()
+    try:
+        entries = os.listdir(UNPACKED)
+    except FileNotFoundError:
+        entries = []
+    for e in entries:
+        p = os.path.join(UNPACKED, e)
+        if ".tmp-" in e:
+            remove(p)
+            continue
+        if not MD5.fullmatch(e) or e in named:
+            continue
+        try:
+            used = os.stat(p + ".used").st_mtime
+        except FileNotFoundError:
+            used = os.lstat(p).st_mtime
+        if now - used > GC_S:
+            log(f"removed the unused runtime tree {e}")
+            remove(p)
+            remove(p + ".used")
+    try:
+        for e in os.listdir(PART):
+            remove(os.path.join(PART, e))
+    except FileNotFoundError:
+        pass
+    if entries:
+        write_unindex([r for r in rows if os.path.isdir(os.path.join(UNPACKED, r[4]))])
+
+
+def why_of(err):
+    if isinstance(err, Fail):
+        return err.why
+    if isinstance(err, OSError) and err.errno == errno.ENOSPC:
+        return "space"
+    log(traceback.format_exc())
+    return "other"
+
+
+def find_port(hm, name):
+    if name == "portmaster.zip" or any(name in s.utils for s in hm.sources.values()):
+        raise Fail("other")
+    for src in hm.sources.values():
+        if name in src.ports:
+            return src
+    raise Fail("other")
+
+
+def zip_parts(path):
+    with zipfile.ZipFile(path) as zf:
+        infos = zf.infolist()
+    total = sum(i.file_size for i in infos)
+    tops = set()
+    for i in infos:
+        n = i.filename.replace("\\", "/")
+        first = n.split("/", 1)[0]
+        if first in ("", ".", ".."):
+            continue
+        if "/" in n:
+            tops.add(first)
+        elif n.lower().endswith(".sh"):
+            tops.add(n)
+    return total, sorted(tops)
+
+
+def do_install(name, ctx, update):
+    if not PORT.fullmatch(name):
+        raise Fail("other")
+    if scope_active():
+        raise Fail("busy")
+    hmod, feed = ctx.load()
+    hm = ctx.open(check=False)
+    try:
+        with game_lock():
+            replay()
+        src = find_port(hm, name)
+        fresh = not installed(hm, name)
+        if update and fresh:
+            raise Fail("other")
+        if hm.config["offline"]:
+            raise Fail("network")
+        info = src.port_info(name)
+        source = info.get("source") if isinstance(info.get("source"), dict) else {}
+        size = source.get("size") if isinstance(source.get("size"), int) else 0
+        wanted = runtimes_of(info, port_scripts(installed_info(hm, name)))
+        rt_bytes = 0
+        for rt in wanted:
+            remote = None if rt in BUILTIN else rt_remote(hm, rt)
+            if remote is not None and not current(os.path.join(LIBS, rt), remote["md5"]):
+                rt_bytes += (remote.get("size") if isinstance(remote.get("size"), int) else 0) * (1 + SQUASH_RATIO)
+        need(2 * size + rt_bytes)
+        data = {"op": "install" if fresh else "update", "name": name, "new": []}
+        zip_path = os.path.join(PORTS, name)
+        if size > hmod.config.HM_MAX_TEMP_SIZE and not os.path.lexists(zip_path):
+            data["new"].append(zip_path)
+        journal(name, data)
+        extracted = False
+        unknown = False
+        try:
+            feed.what = "download"
+            with feed.enable_cancellable(True):
+                try:
+                    dl = src.download(name)
+                except hmod.CancelEvent:
+                    raise Fail("cancel")
+            if dl is not None and CANCEL[0]:
+                remove(str(dl["zip_file"]))
+            if CANCEL[0]:
+                raise Fail("cancel")
+            if dl is None:
+                raise Fail("network")
+            try:
+                total, tops = zip_parts(dl["zip_file"])
+            except zipfile.BadZipFile:
+                remove(str(dl["zip_file"]))
+                raise Fail("other")
+            try:
+                need(total + rt_bytes)
+            except Fail:
+                remove(str(dl["zip_file"]))
+                raise
+            for t in tops:
+                p = os.path.join(PORTS, t)
+                if not os.path.lexists(p):
+                    data["new"].append(p)
+                elif os.path.isdir(p) and not os.path.lexists(os.path.join(p, "port.json")):
+                    data["new"].append(os.path.join(p, "port.json"))
+            journal(name, data)
+            with game_lock():
+                try:
+                    feed.what = "install"
+                    with feed.enable_cancellable(False):
+                        rc = hm._install_port(dl, do_delete=True)
+                    if rc != 0:
+                        raise Fail("other")
+                    hm.load_ports()
+                    extracted = True
+                    data["extracted"] = True
+                    journal(name, data)
+                    if CANCEL[0]:
+                        raise Fail("cancel")
+                    now = installed_info(hm, name) or info
+                    for rt in runtimes_of(now, port_scripts(now)):
+                        if rt in BUILTIN:
+                            continue
+                        if rt_remote(hm, rt) is None:
+                            log(f"{name}: unknown runtime {rt}")
+                            unknown = True
+                            continue
+                        try:
+                            fetch_runtime(hm, ctx, rt)
+                        except Fail as err:
+                            raise Fail(err.why if err.why in ("cancel", "space") else "runtime")
+                except BaseException:
+                    settle(hm, name, data, fresh, extracted)
+                    extracted = None
+                    raise
+                extracted = None
+                drop_journal(name)
+                clear_update(name)
+                try:
+                    gc(hm)
+                except Exception as err:
+                    log(f"gc: {err}")
+        except BaseException as err:
+            if extracted is not None:
+                settle(hm, name, data, fresh, False)
+            if isinstance(err, Exception):
+                raise Fail(why_of(err))
+            raise
+        if unknown:
+            raise Fail("unknown-runtime")
+    finally:
+        write_index()
+        write_catalog(hm)
+
+
+def settle(hm, name, data, fresh, extracted):
+    if fresh or not extracted:
+        rollback(data)
+    if not fresh:
+        mark_update(name)
+    drop_journal(name)
+    hm.load_ports()
+
+
+def cmd_install(name, ctx):
+    do_install(name, ctx, False)
+
+
+def cmd_update(name, ctx):
+    do_install(name, ctx, True)
+
+
+def cmd_uninstall(name, ctx):
+    if not PORT.fullmatch(name):
+        raise Fail("other")
+    if scope_active():
+        raise Fail("busy")
+    hm = ctx.open(check=False)
+    try:
+        with game_lock():
+            replay()
+            if not installed(hm, name):
+                raise Fail("other")
+            rc = hm.uninstall_port(name)
+            clear_update(name)
+            hm.load_ports()
+            gc(hm)
+        if rc != 0:
+            raise Fail("other")
+    finally:
+        write_index()
+        write_catalog(hm)
+
+
+def cmd_refresh(name, ctx):
+    need(IMAGES)
+    hmod, feed = ctx.load()
+    feed.what = "refresh"
+    with feed.enable_cancellable(True):
+        try:
+            hm = ctx.open(check=True)
+        except hmod.CancelEvent:
+            raise Fail("cancel")
+    if CANCEL[0]:
+        raise Fail("cancel")
+    write_catalog(hm)
+
+
+def cmd_index(name, ctx):
+    write_index()
+
+
+def cmd_runtime(name, ctx):
+    rt = norm(name)
+    if not RUNTIME.fullmatch(rt):
+        raise Fail("other")
+    if rt in BUILTIN:
+        return
+    fetch_runtime(ctx.open(check=False), ctx, rt)
+
+
+def catalogue_md5(rt):
+    try:
+        with open(RUNTIMES) as f:
+            md5 = json.load(f)[rt]["remote"][os.uname().machine]["md5"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return md5 if isinstance(md5, str) and MD5.fullmatch(md5) else None
+
+
+def cmd_unpack(path, ctx):
+    rt = os.path.basename(path)
+    if (not rt.endswith(".squashfs") or not RUNTIME.fullmatch(rt)
+            or os.path.realpath(os.path.dirname(os.path.abspath(path))) != os.path.realpath(LIBS)):
+        raise Fail("other")
+    final = os.path.join(LIBS, rt)
+    try:
+        if not stat.S_ISREG(os.lstat(final).st_mode):
+            raise Fail("other")
+    except FileNotFoundError:
+        raise Fail("other")
+    md5 = catalogue_md5(rt)
+    if md5 is None:
+        raise Fail("unknown-runtime")
+    if not current(final, md5):
+        raise Fail("md5")
+    os.makedirs(UNPACKED, 0o755, exist_ok=True)
+    unpack_tree(final, md5, ctx.proto)
+
+
+def read_bytes(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except FileNotFoundError:
+        return b""
+
+
+def seed(dst, src):
+    if not os.path.isdir(src) or os.path.islink(src):
+        return
+    for e in sorted(os.listdir(src)):
+        s = os.path.join(src, e)
+        d = os.path.join(dst, e)
+        if stat.S_ISREG(os.lstat(s).st_mode) and not os.path.lexists(d):
+            shutil.copyfile(s, d)
+            os.chmod(d, 0o644)
+
+
+def cmd_sync(name, ctx):
+    try:
+        tree = sorted(os.listdir(TREE))
+    except FileNotFoundError:
+        log(f"no {TREE}")
+        raise Fail("other")
+    os.makedirs(FARM, 0o755, exist_ok=True)
+    wanted = {e: os.path.join(TREE, e) for e in tree if e not in REAL_DIRS and not REAL_FILES.fullmatch(e)}
+    wanted.update({e: os.path.join(USR, e) for e in OWN})
+    stale = None
+    for e in sorted(os.listdir(FARM)):
+        p = os.path.join(FARM, e)
+        st = os.lstat(p)
+        if stat.S_ISLNK(st.st_mode):
+            real = e in REAL_DIRS or REAL_FILES.fullmatch(e)
+            if real or (e in wanted and os.readlink(p) != wanted[e]) or (e not in wanted and not os.path.exists(p)):
+                os.unlink(p)
+            continue
+        if (e in REAL_DIRS and stat.S_ISDIR(st.st_mode)) or (REAL_FILES.fullmatch(e) and stat.S_ISREG(st.st_mode)):
+            continue
+        if stale is None:
+            stale = os.path.join(STALE, str(time.time_ns()))
+            os.makedirs(stale, 0o755)
+        log(f"moved {p} to {stale}")
+        os.rename(p, os.path.join(stale, e))
+    for e, target in sorted(wanted.items()):
+        p = os.path.join(FARM, e)
+        if not os.path.lexists(p):
+            tmp = f"{p}.tmp-{os.getpid()}"
+            remove(tmp)
+            os.symlink(target, tmp)
+            os.replace(tmp, p)
+    for d in REAL_DIRS:
+        p = os.path.join(FARM, d)
+        os.makedirs(p, 0o755, exist_ok=True)
+        seed(p, os.path.join(TREE, d))
+    if stale is not None:
+        for d in sorted(os.listdir(STALE))[:-KEEP_STALE]:
+            remove(os.path.join(STALE, d))
+    fsync_dir(FARM)
+    stamp = read_bytes(os.path.join(USR, "tree.sha256"))
+    if read_bytes(STAMP) != stamp or not os.path.isfile(STAMP):
+        for e in os.listdir(FARM):
+            if e.startswith("device_info_") and e.endswith(".env"):
+                os.unlink(os.path.join(FARM, e))
+        hmod, _ = ctx.load()
+        for fn, src in sorted(hmod.config.HM_SOURCE_DEFAULTS.items()):
+            write_atomic(os.path.join(FARM, "config", fn), src.encode())
+        write_atomic(STAMP, stamp)
+        log(f"synced {FARM} to {TREE}")
+    write_index()
+
+
+COMMANDS = {"sync": (0, cmd_sync), "refresh": (0, cmd_refresh), "index": (0, cmd_index),
+            "install": (1, cmd_install), "update": (1, cmd_update), "uninstall": (1, cmd_uninstall),
+            "runtime": (1, cmd_runtime), "unpack": (1, cmd_unpack)}
+WAITING = ("runtime", "unpack")
+
+
+def run(argv, proto):
+    if len(argv) < 2 or argv[1] not in COMMANDS or len(argv) != 2 + COMMANDS[argv[1]][0] or any(
+            CTRL.search(a) for a in argv[2:]):
+        log(f"usage: {ME} sync|refresh|index|install <name>|update <name>|uninstall <name>|runtime <name>|"
+            f"unpack <file>")
+        return 64
+    cmd = argv[1]
+    arg = argv[2] if len(argv) > 2 else cmd
+    name = os.path.basename(arg) if cmd == "unpack" else arg
+    CANCEL[0] = False
+    signal.signal(signal.SIGTERM, on_term)
+    os.umask(0o022)
+    os.environ.update(HM_TOOLS_DIR=PORTS, HM_PORTS_DIR=PORTS, HM_SCRIPTS_DIR=PORTS, REQUESTS_CA_BUNDLE=CA,
+                      TMPDIR=TMP, controlfolder=FARM)
+    lock = None
+    try:
+        if not os.path.ismount(MOUNT):
+            raise Fail("nodata")
+        os.makedirs(STATE, 0o755, exist_ok=True)
+        os.chdir(PORTS)
+        lock = helper_lock(proto, cmd in WAITING)
+        empty_tmp()
+        COMMANDS[cmd][1](arg, Ctx(proto))
+    except Exception as err:
+        proto.fail(name, why_of(err))
+        return 1
+    finally:
+        if lock is not None:
+            os.close(lock)
+    proto.done(name)
+    return 0
+
+
+def main(argv):
+    proto = os.dup(1)
+    os.dup2(2, 1)
+    sys.stdout = sys.stderr
+    return run(argv, Proto(proto))
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
