@@ -1,0 +1,13 @@
+#!/usr/bin/env python3
+import json
+import os
+import sys
+
+t = os.environ["FAKE_T"]
+with open(f"{t}/inhibit.log", "a") as f:
+    f.write(json.dumps({"args": sys.argv[1:], "pid": os.getpid(),
+                        "stdout": os.readlink(f"/proc/self/fd/1")}) + "\n")
+if os.path.exists(f"{t}/inhibit-refused"):
+    sys.exit(1)
+cmd = [x for x in sys.argv[1:] if not x.startswith("--")]
+sys.exit(os.spawnvp(os.P_WAIT, cmd[0], cmd))

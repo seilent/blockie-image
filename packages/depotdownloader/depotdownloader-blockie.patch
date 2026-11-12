@@ -1,0 +1,977 @@
+diff -ruN a/dd/DepotDownloader/AccountSettingsStore.cs b/dd/DepotDownloader/AccountSettingsStore.cs
+--- a/dd/DepotDownloader/AccountSettingsStore.cs
++++ b/dd/DepotDownloader/AccountSettingsStore.cs
+@@ -7,6 +7,7 @@
+ using System.IO;
+ using System.IO.Compression;
+ using System.IO.IsolatedStorage;
++using System.Threading;
+ using ProtoBuf;
+ 
+ namespace DepotDownloader
+@@ -42,13 +43,24 @@
+         }
+ 
+         public static AccountSettingsStore Instance;
+-        static readonly IsolatedStorageFile IsolatedStorage = IsolatedStorageFile.GetUserStoreForAssembly();
++        static IsolatedStorageFile isolatedStorage;
++        static readonly string ConfigPath = Environment.GetEnvironmentVariable("BLOCKIE_DD_CONFIG");
++        static readonly Lock SaveLock = new();
++
++        static IsolatedStorageFile IsolatedStorage => isolatedStorage ??= IsolatedStorageFile.GetUserStoreForAssembly();
+ 
+         public static void LoadFromFile(string filename)
+         {
+             if (Loaded)
+                 throw new Exception("Config already loaded");
+ 
++            if (ConfigPath != null)
++            {
++                Instance = LoadFromPath(ConfigPath);
++                Instance.FileName = ConfigPath;
++                return;
++            }
++
+             if (IsolatedStorage.FileExists(filename))
+             {
+                 try
+@@ -71,11 +83,93 @@
+             Instance.FileName = filename;
+         }
+ 
+-        public static void Save()
++        static AccountSettingsStore LoadFromPath(string path)
++        {
++            try
++            {
++                var dir = Path.GetDirectoryName(Path.GetFullPath(path));
++                foreach (var stale in Directory.EnumerateFiles(dir, Path.GetFileName(path) + ".tmp-*"))
++                {
++                    File.Delete(stale);
++                }
++            }
++            catch (Exception)
++            {
++            }
++
++            try
++            {
++                if (!File.Exists(path))
++                    return new AccountSettingsStore();
++
++                using var fs = File.OpenRead(path);
++                using var ds = new DeflateStream(fs, CompressionMode.Decompress);
++                return Serializer.Deserialize<AccountSettingsStore>(ds) ?? new AccountSettingsStore();
++            }
++            catch (Exception ex)
++            {
++                Console.Error.WriteLine("Failed to load account settings: {0}", ex.Message);
++                return new AccountSettingsStore();
++            }
++        }
++
++        public static void SaveAtomic(string path, Action<Stream> write, UnixFileMode mode)
++        {
++            var tmp = $"{path}.tmp-{Environment.ProcessId}";
++            lock (SaveLock)
++            {
++                try
++                {
++                    var options = new FileStreamOptions { Mode = FileMode.Create, Access = FileAccess.Write };
++                    if (!OperatingSystem.IsWindows())
++                    {
++                        options.UnixCreateMode = mode;
++                    }
++
++                    using (var fs = new FileStream(tmp, options))
++                    {
++                        using (var ds = new DeflateStream(fs, CompressionMode.Compress, true))
++                        {
++                            write(ds);
++                        }
++
++                        fs.Flush(true);
++                    }
++
++                    if (!OperatingSystem.IsWindows())
++                    {
++                        File.SetUnixFileMode(tmp, mode);
++                    }
++
++                    File.Move(tmp, path, true);
++                }
++                catch (Exception)
++                {
++                    File.Delete(tmp);
++                    throw;
++                }
++            }
++        }
++
++        public static bool Save()
+         {
+             if (!Loaded)
+                 throw new Exception("Saved config before loading");
+ 
++            if (ConfigPath != null)
++            {
++                try
++                {
++                    SaveAtomic(Instance.FileName, ds => Serializer.Serialize(ds, Instance), UnixFileMode.UserRead | UnixFileMode.UserWrite);
++                    return true;
++                }
++                catch (Exception ex)
++                {
++                    Console.Error.WriteLine("Failed to save account settings: {0}", ex.Message);
++                    return false;
++                }
++            }
++
+             try
+             {
+                 using var fs = IsolatedStorage.OpenFile(Instance.FileName, FileMode.Create, FileAccess.Write);
+@@ -85,7 +179,10 @@
+             catch (IOException ex)
+             {
+                 Console.WriteLine("Failed to save account settings: {0}", ex.Message);
++                return false;
+             }
++
++            return true;
+         }
+     }
+ }
+diff -ruN a/dd/DepotDownloader/Channel.cs b/dd/DepotDownloader/Channel.cs
+--- /dev/null
++++ b/dd/DepotDownloader/Channel.cs
+@@ -0,0 +1,262 @@
++// This file is subject to the terms and conditions defined
++// in file 'LICENSE', which is part of this source code package.
++
++using System;
++using System.Globalization;
++using System.IO;
++using System.Runtime.InteropServices;
++using System.Text;
++using System.Text.Json;
++using System.Threading;
++using Microsoft.Win32.SafeHandles;
++
++namespace DepotDownloader
++{
++    class ChannelException(string why, string message) : ContentDownloaderException(message)
++    {
++        public string Why { get; } = why;
++    }
++
++    static class Channel
++    {
++        const int PR_SET_DUMPABLE = 4;
++        const int ENOSPC = 28;
++        const long GOT_MS = 250;
++
++        static FileStream stream;
++        static readonly Lock gate = new();
++        static string noted;
++        static bool failed;
++        static long gotAt;
++        static ulong gotDone;
++        static ulong gotDepot;
++
++        public static bool Enabled => stream != null;
++
++        public static string Noted => noted;
++
++        [DllImport("libc.so.6", EntryPoint = "prctl", SetLastError = true)]
++        static extern int Prctl(int option, nuint arg2, nuint arg3, nuint arg4, nuint arg5);
++
++        public static void Open()
++        {
++            if (OperatingSystem.IsLinux() && Prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) != 0)
++            {
++                Environment.Exit(1);
++            }
++
++            var fd = Environment.GetEnvironmentVariable("BLOCKIE_DD_FD");
++            if (fd == null)
++            {
++                return;
++            }
++
++            if (!int.TryParse(fd, NumberStyles.None, CultureInfo.InvariantCulture, out var n) || n < 3)
++            {
++                Environment.Exit(1);
++            }
++
++            try
++            {
++                stream = new FileStream(new SafeFileHandle((nint)n, true), FileAccess.Write, 1);
++            }
++            catch (Exception)
++            {
++                Environment.Exit(1);
++            }
++        }
++
++        public static void Line(params string[] fields)
++        {
++            if (stream == null)
++            {
++                return;
++            }
++
++            lock (gate)
++            {
++                Write(fields);
++            }
++        }
++
++        static void Write(string[] fields)
++        {
++            try
++            {
++                stream.Write(Encoding.UTF8.GetBytes(string.Join('\t', fields) + "\n"));
++                stream.Flush();
++            }
++            catch (Exception)
++            {
++                Environment.Exit(1);
++            }
++        }
++
++        public static void Note(string why)
++        {
++            Interlocked.CompareExchange(ref noted, why, null);
++        }
++
++        public static void Fail(string why)
++        {
++            lock (gate)
++            {
++                if (failed)
++                {
++                    return;
++                }
++
++                failed = true;
++            }
++
++            Line(("fail " + why).Split(' '));
++        }
++
++        public static void End()
++        {
++            Line("end");
++        }
++
++        public static void Qr(string url)
++        {
++            Line("qr", url);
++        }
++
++        public static void Manifest(uint depot, ulong manifest)
++        {
++            Line("manifest", depot.ToString(CultureInfo.InvariantCulture), manifest.ToString(CultureInfo.InvariantCulture));
++        }
++
++        public static void File(string sha1, ulong size, string path)
++        {
++            Line("file", sha1, size.ToString(CultureInfo.InvariantCulture), path);
++        }
++
++        public static void Total(ulong total)
++        {
++            Line("total", total.ToString(CultureInfo.InvariantCulture));
++        }
++
++        public static void DepotDone(ulong bytes)
++        {
++            lock (gate)
++            {
++                gotDone += bytes;
++                gotDepot = 0;
++            }
++        }
++
++        public static void Got(ulong depotBytes, bool force)
++        {
++            if (stream == null)
++            {
++                return;
++            }
++
++            lock (gate)
++            {
++                if (depotBytes < gotDepot)
++                {
++                    return;
++                }
++
++                gotDepot = depotBytes;
++                var now = Environment.TickCount64;
++                if (!force && now - gotAt < GOT_MS)
++                {
++                    return;
++                }
++
++                gotAt = now;
++                Write(["got", (gotDone + depotBytes).ToString(CultureInfo.InvariantCulture)]);
++            }
++        }
++
++        public static void Beat()
++        {
++            if (stream == null)
++            {
++                return;
++            }
++
++            lock (gate)
++            {
++                var now = Environment.TickCount64;
++                if (now - gotAt < GOT_MS)
++                {
++                    return;
++                }
++
++                gotAt = now;
++                Write(["got", (gotDone + gotDepot).ToString(CultureInfo.InvariantCulture)]);
++            }
++        }
++
++        public static void Exp(string token)
++        {
++            var days = "-";
++            try
++            {
++                var part = token.Split('.')[1].Replace('-', '+').Replace('_', '/');
++                part = part.PadRight(part.Length + (4 - part.Length % 4) % 4, '=');
++                using var doc = JsonDocument.Parse(Convert.FromBase64String(part));
++                var exp = doc.RootElement.GetProperty("exp").GetInt64();
++                var left = (exp - DateTimeOffset.UtcNow.ToUnixTimeSeconds()) / 86400;
++                days = Math.Max(0, left).ToString(CultureInfo.InvariantCulture);
++            }
++            catch (Exception)
++            {
++            }
++
++            Line("exp", days);
++        }
++
++        public static void CheckName(string name)
++        {
++            var bad = name.Length == 0 || name[0] == '/';
++            foreach (var c in name)
++            {
++                bad |= c < 0x20 || c == 0x7f;
++            }
++
++            foreach (var part in name.Split('/'))
++            {
++                bad |= part == "..";
++            }
++
++            if (bad)
++            {
++                throw new ChannelException("other", "Refused a manifest file name.");
++            }
++        }
++
++        public static ContentDownloaderException Wrap(IOException ex, string message)
++        {
++            return NoSpace(ex) ? new ChannelException("space", message) : new ContentDownloaderException(message);
++        }
++
++        public static bool NoSpace(Exception ex)
++        {
++            for (var e = ex; e != null; e = e.InnerException)
++            {
++                if (e is AggregateException agg)
++                {
++                    foreach (var inner in agg.InnerExceptions)
++                    {
++                        if (NoSpace(inner))
++                        {
++                            return true;
++                        }
++                    }
++                }
++
++                if (e is IOException && (e.HResult == ENOSPC || e.HResult == unchecked((int)0x80070070)))
++                {
++                    return true;
++                }
++            }
++
++            return false;
++        }
++    }
++}
+diff -ruN a/dd/DepotDownloader/ContentDownloader.cs b/dd/DepotDownloader/ContentDownloader.cs
+--- a/dd/DepotDownloader/ContentDownloader.cs
++++ b/dd/DepotDownloader/ContentDownloader.cs
+@@ -332,7 +332,7 @@
+             if (steam3 == null)
+                 return;
+ 
+-            steam3.Disconnect();
++            steam3.Disconnect(false);
+         }
+ 
+         public static async Task DownloadPubfileAsync(uint appId, ulong publishedFileId)
+@@ -435,7 +435,7 @@
+                 else
+                 {
+                     var contentName = GetAppName(appId);
+-                    throw new ContentDownloaderException(string.Format("App {0} ({1}) is not available from this account.", appId, contentName));
++                    throw new ChannelException("owned", string.Format("App {0} ({1}) is not available from this account.", appId, contentName));
+                 }
+             }
+ 
+@@ -527,7 +527,7 @@
+                 if (depotIdsFound.Count < depotIdsExpected.Count)
+                 {
+                     var remainingDepotIds = depotIdsExpected.Except(depotIdsFound);
+-                    throw new ContentDownloaderException(string.Format("Depot {0} not listed for app {1}", string.Join(", ", remainingDepotIds), appId));
++                    throw new ChannelException("depot", string.Format("Depot {0} not listed for app {1}", string.Join(", ", remainingDepotIds), appId));
+                 }
+             }
+ 
+@@ -566,6 +566,11 @@
+             {
+                 Console.WriteLine("Depot {0} is not available from this account.", depotId);
+ 
++                if (Channel.Enabled)
++                {
++                    throw new ChannelException("owned depot", $"Depot {depotId} is not available from this account.");
++                }
++
+                 return null;
+             }
+ 
+@@ -575,6 +580,11 @@
+                 if (manifestId == INVALID_MANIFEST_ID && !string.Equals(branch, DEFAULT_BRANCH, StringComparison.OrdinalIgnoreCase))
+                 {
+                     Console.WriteLine("Warning: Depot {0} does not have branch named \"{1}\". Trying {2} branch.", depotId, branch, DEFAULT_BRANCH);
++                    if (Channel.Enabled)
++                    {
++                        throw new ChannelException("branch", $"Depot {depotId} has no branch {branch}.");
++                    }
++
+                     branch = DEFAULT_BRANCH;
+                     manifestId = await GetSteam3DepotManifest(depotId, appId, branch);
+                 }
+@@ -582,6 +592,11 @@
+                 if (manifestId == INVALID_MANIFEST_ID)
+                 {
+                     Console.WriteLine("Depot {0} missing public subsection or manifest section.", depotId);
++                    if (Channel.Enabled)
++                    {
++                        throw new ChannelException("depot", $"Depot {depotId} has no manifest.");
++                    }
++
+                     return null;
+                 }
+             }
+@@ -590,6 +605,11 @@
+             if (!steam3.DepotKeys.TryGetValue(depotId, out var depotKey))
+             {
+                 Console.WriteLine("No valid depot key for {0}, unable to download.", depotId);
++                if (Channel.Enabled)
++                {
++                    throw new ChannelException("owned depot", $"No valid depot key for {depotId}.");
++                }
++
+                 return null;
+             }
+ 
+@@ -598,6 +618,11 @@
+             if (!CreateDirectories(depotId, uVersion, out var installDir))
+             {
+                 Console.WriteLine("Error: Unable to create install directories!");
++                if (Channel.Enabled)
++                {
++                    throw new ChannelException("other", "Unable to create install directories.");
++                }
++
+                 return null;
+             }
+ 
+@@ -695,6 +720,19 @@
+                 }
+             }
+ 
++            if (Config.DownloadManifestOnly && Channel.Enabled)
++            {
++                ulong total = 0;
++                foreach (var file in depotsToDownload.SelectMany(d => d.filteredFiles).Where(f => !f.Flags.HasFlag(EDepotFileFlag.Directory)))
++                {
++                    Channel.File(Convert.ToHexString(file.FileHash).ToLowerInvariant(), file.TotalSize, file.FileName);
++                    total += file.TotalSize;
++                }
++
++                Channel.Total(total);
++                return;
++            }
++
+             foreach (var depotFileData in depotsToDownload)
+             {
+                 await DownloadSteam3AsyncDepotFiles(cts, downloadCounter, depotFileData, allFileNamesAllDepots);
+@@ -784,6 +822,7 @@
+                                 // If we could not get the manifest code, this is a fatal error
+                                 if (manifestRequestCode == 0)
+                                 {
++                                    Channel.Note("depot");
+                                     cts.Cancel();
+                                 }
+                             }
+@@ -825,12 +864,14 @@
+                             if (e.StatusCode == HttpStatusCode.Unauthorized || e.StatusCode == HttpStatusCode.Forbidden)
+                             {
+                                 Console.WriteLine("Encountered {2} for depot manifest {0} {1}. Aborting.", depot.DepotId, depot.ManifestId, (int)e.StatusCode);
++                                Channel.Note("depot");
+                                 break;
+                             }
+ 
+                             if (e.StatusCode == HttpStatusCode.NotFound)
+                             {
+                                 Console.WriteLine("Encountered 404 for depot manifest {0} {1}. Aborting.", depot.DepotId, depot.ManifestId);
++                                Channel.Note("depot");
+                                 break;
+                             }
+ 
+@@ -862,6 +903,22 @@
+ 
+             Console.WriteLine("Manifest {0} ({1})", depot.ManifestId, newManifest.CreationTime);
+ 
++            newManifest.Files.ForEach(file => Channel.CheckName(file.FileName));
++
++            if (Config.DownloadManifestOnly && Channel.Enabled)
++            {
++                Channel.Manifest(depot.DepotId, depot.ManifestId);
++                var listed = newManifest.Files.Where(f => TestIsFileIncluded(f.FileName)).ToList();
++                return new DepotFilesData
++                {
++                    depotDownloadInfo = depot,
++                    depotCounter = depotCounter,
++                    manifest = newManifest,
++                    filteredFiles = listed,
++                    allFileNames = listed.Select(f => f.FileName).ToHashSet()
++                };
++            }
++
+             if (Config.DownloadManifestOnly)
+             {
+                 DumpManifestToTextFile(depot, newManifest);
+@@ -972,6 +1029,9 @@
+             DepotConfigStore.Instance.InstalledManifestIDs[depot.DepotId] = depot.ManifestId;
+             DepotConfigStore.Save();
+ 
++            Channel.DepotDone(depotCounter.sizeDownloaded);
++            Channel.Got(0, true);
++
+             Console.WriteLine("Depot {0} - Downloaded {1} bytes ({2} bytes uncompressed)", depot.DepotId, depotCounter.depotBytesCompressed, depotCounter.depotBytesUncompressed);
+         }
+ 
+@@ -1018,7 +1078,7 @@
+                 }
+                 catch (IOException ex)
+                 {
+-                    throw new ContentDownloaderException(string.Format("Failed to allocate file {0}: {1}", fileFinalPath, ex.Message));
++                    throw Channel.Wrap(ex, string.Format("Failed to allocate file {0}: {1}", fileFinalPath, ex.Message));
+                 }
+ 
+                 neededChunks = new List<DepotManifest.ChunkData>(file.Chunks);
+@@ -1065,6 +1125,7 @@
+                                 fsOld.Seek((long)match.OldChunk.Offset, SeekOrigin.Begin);
+ 
+                                 var adler = Util.AdlerHash(fsOld, (int)match.OldChunk.UncompressedLength);
++                                Channel.Beat();
+                                 if (!adler.SequenceEqual(BitConverter.GetBytes(match.OldChunk.Checksum)))
+                                 {
+                                     neededChunks.Add(match.NewChunk);
+@@ -1089,7 +1150,7 @@
+                                 }
+                                 catch (IOException ex)
+                                 {
+-                                    throw new ContentDownloaderException(string.Format("Failed to resize file to expected size {0}: {1}", fileFinalPath, ex.Message));
++                                    throw Channel.Wrap(ex, string.Format("Failed to resize file to expected size {0}: {1}", fileFinalPath, ex.Message));
+                                 }
+ 
+                                 foreach (var match in copyChunks)
+@@ -1121,7 +1182,7 @@
+                         }
+                         catch (IOException ex)
+                         {
+-                            throw new ContentDownloaderException(string.Format("Failed to allocate file {0}: {1}", fileFinalPath, ex.Message));
++                            throw Channel.Wrap(ex, string.Format("Failed to allocate file {0}: {1}", fileFinalPath, ex.Message));
+                         }
+                     }
+ 
+@@ -1131,12 +1192,16 @@
+ 
+                 if (neededChunks.Count == 0)
+                 {
++                    ulong validated;
+                     lock (depotDownloadCounter)
+                     {
+                         depotDownloadCounter.sizeDownloaded += file.TotalSize;
++                        validated = depotDownloadCounter.sizeDownloaded;
+                         Console.WriteLine("{0,6:#00.00}% {1}", (depotDownloadCounter.sizeDownloaded / (float)depotDownloadCounter.completeDownloadSize) * 100.0f, fileFinalPath);
+                     }
+ 
++                    Channel.Got(validated, false);
++
+                     lock (downloadCounter)
+                     {
+                         downloadCounter.completeDownloadSize -= file.TotalSize;
+@@ -1146,11 +1211,15 @@
+                 }
+ 
+                 var sizeOnDisk = (file.TotalSize - (ulong)neededChunks.Select(x => (long)x.UncompressedLength).Sum());
++                ulong kept;
+                 lock (depotDownloadCounter)
+                 {
+                     depotDownloadCounter.sizeDownloaded += sizeOnDisk;
++                    kept = depotDownloadCounter.sizeDownloaded;
+                 }
+ 
++                Channel.Got(kept, false);
++
+                 lock (downloadCounter)
+                 {
+                     downloadCounter.completeDownloadSize -= sizeOnDisk;
+@@ -1269,6 +1338,8 @@
+                         cdnPool.ReturnBrokenConnection(connection);
+                         Console.WriteLine("Encountered unexpected error downloading chunk {0}: {1}", chunkID, e.Message);
+                     }
++
++                    await Task.Delay(TimeSpan.FromSeconds(1), cts.Token).ConfigureAwait(false);
+                 } while (written == 0);
+ 
+                 if (written == 0)
+@@ -1327,6 +1398,8 @@
+                 Ansi.Progress(downloadCounter.totalBytesUncompressed, downloadCounter.completeDownloadSize);
+             }
+ 
++            Channel.Got(sizeDownloaded, false);
++
+             if (remainingChunks == 0)
+             {
+                 var fileFinalPath = Path.Combine(depot.InstallDir, file.FileName);
+diff -ruN a/dd/DepotDownloader/DepotConfigStore.cs b/dd/DepotDownloader/DepotConfigStore.cs
+--- a/dd/DepotDownloader/DepotConfigStore.cs
++++ b/dd/DepotDownloader/DepotConfigStore.cs
+@@ -34,17 +34,35 @@
+             if (Loaded)
+                 throw new Exception("Config already loaded");
+ 
+-            if (File.Exists(filename))
++            try
+             {
+-                using var fs = File.Open(filename, FileMode.Open);
+-                using var ds = new DeflateStream(fs, CompressionMode.Decompress);
+-                Instance = Serializer.Deserialize<DepotConfigStore>(ds);
++                var dir = Path.GetDirectoryName(Path.GetFullPath(filename));
++                foreach (var stale in Directory.EnumerateFiles(dir, Path.GetFileName(filename) + ".tmp-*"))
++                {
++                    File.Delete(stale);
++                }
+             }
+-            else
++            catch (Exception)
+             {
+-                Instance = new DepotConfigStore();
+             }
+ 
++            try
++            {
++                if (File.Exists(filename))
++                {
++                    using var fs = File.Open(filename, FileMode.Open);
++                    using var ds = new DeflateStream(fs, CompressionMode.Decompress);
++                    Instance = Serializer.Deserialize<DepotConfigStore>(ds);
++                }
++            }
++            catch (Exception ex)
++            {
++                Console.WriteLine("Failed to load depot config: {0}", ex.Message);
++                Instance = null;
++            }
++
++            Instance ??= new DepotConfigStore();
++
+             Instance.FileName = filename;
+         }
+ 
+@@ -53,9 +71,8 @@
+             if (!Loaded)
+                 throw new Exception("Saved config before loading");
+ 
+-            using var fs = File.Open(Instance.FileName, FileMode.Create);
+-            using var ds = new DeflateStream(fs, CompressionMode.Compress);
+-            Serializer.Serialize(ds, Instance);
++            AccountSettingsStore.SaveAtomic(Instance.FileName, ds => Serializer.Serialize(ds, Instance),
++                UnixFileMode.UserRead | UnixFileMode.UserWrite);
+         }
+     }
+ }
+diff -ruN a/dd/DepotDownloader/DepotDownloader.csproj b/dd/DepotDownloader/DepotDownloader.csproj
+--- a/dd/DepotDownloader/DepotDownloader.csproj
++++ b/dd/DepotDownloader/DepotDownloader.csproj
+@@ -1,9 +1,13 @@
+ ﻿<Project Sdk="Microsoft.NET.Sdk">
+   <PropertyGroup>
+     <OutputType>Exe</OutputType>
+-    <TargetFramework>net9.0</TargetFramework>
++    <TargetFramework>net10.0</TargetFramework>
++    <LangVersion>13</LangVersion>
+     <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+-    <RollForward>LatestMajor</RollForward>
++    <RollForward>LatestPatch</RollForward>
++    <UseAppHost>false</UseAppHost>
++    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
++    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+     <Version>3.4.0</Version>
+     <Description>Steam Downloading Utility</Description>
+     <Authors>SteamRE Team</Authors>
+@@ -27,6 +31,9 @@
+     </PackageReference>
+     <PackageReference Include="protobuf-net" Version="3.2.52" />
+     <PackageReference Include="QRCoder" Version="1.6.0" />
+-    <PackageReference Include="SteamKit2" Version="3.2.0" />
++  </ItemGroup>
++
++  <ItemGroup>
++    <ProjectReference Include="..\..\sk\SteamKit2\SteamKit2\SteamKit2.csproj" />
+   </ItemGroup>
+ </Project>
+diff -ruN a/dd/DepotDownloader/Program.cs b/dd/DepotDownloader/Program.cs
+--- a/dd/DepotDownloader/Program.cs
++++ b/dd/DepotDownloader/Program.cs
+@@ -21,6 +21,8 @@
+ 
+         static async Task<int> Main(string[] args)
+         {
++            Channel.Open();
++
+             if (args.Length == 0)
+             {
+                 PrintVersion();
+@@ -70,11 +72,18 @@
+             ContentDownloader.Config.UseQrCode = HasParameter(args, "-qr");
+             ContentDownloader.Config.SkipAppConfirmation = HasParameter(args, "-no-mobile");
+ 
++            if (username == null && ContentDownloader.Config.RememberPassword && !ContentDownloader.Config.UseQrCode &&
++                AccountSettingsStore.Instance.LoginTokens.Count == 1)
++            {
++                username = AccountSettingsStore.Instance.LoginTokens.Keys.First();
++            }
++
+             if (username == null)
+             {
+                 if (ContentDownloader.Config.RememberPassword && !ContentDownloader.Config.UseQrCode)
+                 {
+                     Console.WriteLine("Error: -remember-password can not be used without -username or -qr.");
++                    Channel.Fail("login");
+                     return 1;
+                 }
+             }
+@@ -314,12 +323,26 @@
+                     try
+                     {
+                         await ContentDownloader.DownloadAppAsync(appId, depotManifestIds, branch, os, arch, language, lv, isUGC).ConfigureAwait(false);
++                        Channel.End();
++                    }
++                    catch (ChannelException ex)
++                    {
++                        Console.WriteLine(ex.Message);
++                        Channel.Fail(ex.Why);
++                        return 1;
+                     }
+                     catch (Exception ex) when (
+                         ex is ContentDownloaderException
+                         || ex is OperationCanceledException)
+                     {
+                         Console.WriteLine(ex.Message);
++                        Channel.Fail(Channel.NoSpace(ex) ? "space" : Channel.Noted ?? (ex is OperationCanceledException ? "network" : "other"));
++                        return 1;
++                    }
++                    catch (Exception e) when (Channel.Enabled && Channel.NoSpace(e))
++                    {
++                        Console.WriteLine(e.Message);
++                        Channel.Fail("space");
+                         return 1;
+                     }
+                     catch (Exception e)
+@@ -335,6 +358,7 @@
+                 else
+                 {
+                     Console.WriteLine("Error: InitializeSteam failed");
++                    Channel.Fail(Channel.Noted ?? "network");
+                     return 1;
+                 }
+ 
+@@ -350,6 +374,12 @@
+             {
+                 if (username != null && password == null && (!ContentDownloader.Config.RememberPassword || !AccountSettingsStore.Instance.LoginTokens.ContainsKey(username)))
+                 {
++                    if (Channel.Enabled)
++                    {
++                        Channel.Note("login");
++                        return false;
++                    }
++
+                     if (AccountSettingsStore.Instance.LoginTokens.ContainsKey(username))
+                     {
+                         Console.WriteLine($"Account \"{username}\" has stored credentials. Did you forget to specify -remember-password?");
+diff -ruN a/dd/DepotDownloader/Steam3Session.cs b/dd/DepotDownloader/Steam3Session.cs
+--- a/dd/DepotDownloader/Steam3Session.cs
++++ b/dd/DepotDownloader/Steam3Session.cs
+@@ -444,7 +444,7 @@
+                             _ = AccountSettingsStore.Instance.GuardData.TryGetValue(logonDetails.Username, out var guarddata);
+                             authSession = await steamClient.Authentication.BeginAuthSessionViaCredentialsAsync(new AuthSessionDetails
+                             {
+-                                DeviceFriendlyName = nameof(DepotDownloader),
++                                DeviceFriendlyName = Environment.GetEnvironmentVariable("BLOCKIE_DD_DEVICE") ?? nameof(DepotDownloader),
+                                 Username = logonDetails.Username,
+                                 Password = logonDetails.Password,
+                                 IsPersistentSession = ContentDownloader.Config.RememberPassword,
+@@ -471,7 +471,7 @@
+                         {
+                             var session = await steamClient.Authentication.BeginAuthSessionViaQRAsync(new AuthSessionDetails
+                             {
+-                                DeviceFriendlyName = nameof(DepotDownloader),
++                                DeviceFriendlyName = Environment.GetEnvironmentVariable("BLOCKIE_DD_DEVICE") ?? nameof(DepotDownloader),
+                                 IsPersistentSession = ContentDownloader.Config.RememberPassword,
+                             });
+ 
+@@ -496,6 +496,7 @@
+                         catch (Exception ex)
+                         {
+                             Console.Error.WriteLine("Failed to authenticate with Steam: " + ex.Message);
++                            Channel.Note(AuthFailure(ex));
+                             Abort(false);
+                             return;
+                         }
+@@ -526,8 +527,18 @@
+                             AccountSettingsStore.Instance.GuardData.Remove(result.AccountName);
+                         }
+ 
++                        if (Channel.Enabled)
++                        {
++                            AccountSettingsStore.Instance.LoginTokens.Clear();
++                        }
++
+                         AccountSettingsStore.Instance.LoginTokens[result.AccountName] = result.RefreshToken;
+-                        AccountSettingsStore.Save();
++                        var saved = AccountSettingsStore.Save();
++
++                        if (saved && authSession is QrAuthSession)
++                        {
++                            Channel.Exp(result.RefreshToken);
++                        }
+                     }
+                     catch (TaskCanceledException)
+                     {
+@@ -536,6 +547,7 @@
+                     catch (Exception ex)
+                     {
+                         Console.Error.WriteLine("Failed to authenticate with Steam: " + ex.Message);
++                        Channel.Note(AuthFailure(ex));
+                         Abort(false);
+                         return;
+                     }
+@@ -564,6 +576,7 @@
+             else if (connectionBackoff >= 10)
+             {
+                 Console.WriteLine("Could not connect to Steam after 10 tries");
++                Channel.Note("network");
+                 Abort(false);
+             }
+             else if (!bAborted)
+@@ -603,6 +616,16 @@
+                 bExpectingDisconnectRemote = true;
+                 Abort(false);
+ 
++                if (Channel.Enabled)
++                {
++                    Channel.Note("login");
++                }
++
++                if (Channel.Enabled && !isAccessToken)
++                {
++                    return;
++                }
++
+                 if (!isAccessToken)
+                 {
+                     Console.WriteLine("This account is protected by Steam Guard.");
+@@ -653,6 +676,7 @@
+             if (loggedOn.Result == EResult.ServiceUnavailable)
+             {
+                 Console.WriteLine("Unable to login to Steam3: {0}", loggedOn.Result);
++                Channel.Note("network");
+                 Abort(false);
+ 
+                 return;
+@@ -661,6 +685,7 @@
+             if (loggedOn.Result != EResult.OK)
+             {
+                 Console.WriteLine("Unable to login to Steam3: {0}", loggedOn.Result);
++                Channel.Note(loggedOn.Result == EResult.RateLimitExceeded ? "network" : "other");
+                 Abort();
+ 
+                 return;
+@@ -700,8 +725,24 @@
+             }
+         }
+ 
++        private static string AuthFailure(Exception ex)
++        {
++            if (ex is AuthenticationException auth)
++            {
++                return auth.Result is EResult.Expired or EResult.FileNotFound ? "expired" : "login";
++            }
++
++            return "network";
++        }
++
+         private static void DisplayQrCode(string challengeUrl)
+         {
++            if (Channel.Enabled)
++            {
++                Channel.Qr(challengeUrl);
++                return;
++            }
++
+             // Encode the link as a QR code
+             using var qrGenerator = new QRCodeGenerator();
+             var qrCodeData = qrGenerator.CreateQrCode(challengeUrl, QRCodeGenerator.ECCLevel.L);
+diff -ruN a/dd/DepotDownloader/Util.cs b/dd/DepotDownloader/Util.cs
+--- a/dd/DepotDownloader/Util.cs
++++ b/dd/DepotDownloader/Util.cs
+@@ -92,6 +92,8 @@
+                 {
+                     neededChunks.Add(data);
+                 }
++
++                Channel.Beat();
+             }
+ 
+             return neededChunks;
+diff -ruN a/sk/SteamKit2/SteamKit2/SteamKit2.csproj b/sk/SteamKit2/SteamKit2/SteamKit2.csproj
+--- a/sk/SteamKit2/SteamKit2/SteamKit2.csproj
++++ b/sk/SteamKit2/SteamKit2/SteamKit2.csproj
+@@ -1,7 +1,10 @@
+ ﻿<Project Sdk="Microsoft.NET.Sdk">
+ 
+   <PropertyGroup>
+-    <TargetFramework>net8.0</TargetFramework>
++    <TargetFramework>net10.0</TargetFramework>
++    <LangVersion>12</LangVersion>
++    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
++    <PublicSign>true</PublicSign>
+     <SignAssembly>true</SignAssembly>
+     <Description>.NET library that aims to interoperate with the Steam network.</Description>
+     <PackageReleaseNotes>Release notes are available at https://github.com/SteamRE/SteamKit/releases/tag/3.2.0</PackageReleaseNotes>

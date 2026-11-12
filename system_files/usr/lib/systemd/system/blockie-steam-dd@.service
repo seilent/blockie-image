@@ -1,0 +1,30 @@
+[Unit]
+Description=Steam files for port %i
+CollectMode=inactive-or-failed
+ConditionPathIsMountPoint=/var/lib/blockie/data
+
+[Service]
+Type=exec
+User=blockie-steam
+Group=blockie-steam
+UMask=0027
+PrivateTmp=yes
+StandardInput=null
+StandardOutput=null
+StandardError=null
+LimitCORE=0
+OOMScoreAdjust=1000
+MemoryMax=768M
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/blockie/data/steam /var/lib/blockie/data/steam-dl /run/blockie-steam
+RuntimeMaxSec=6h
+TimeoutStopSec=5s
+KillMode=control-group
+Environment=HOME=/var/lib/blockie/data/steam/home TMPDIR=/tmp
+Environment=SSL_CERT_FILE=/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
+Environment=BLOCKIE_DD_CONFIG=/var/lib/blockie/data/steam/account.config BLOCKIE_DD_DEVICE=Blockie
+Environment=DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1 DOTNET_EnableDiagnostics=0 DOTNET_DbgEnableMiniDump=0
+Environment=DOTNET_GCHeapHardLimit=0x20000000
+ExecStart=/usr/libexec/blockie/blockie-ports steam-unit %i
+ExecStopPost=/usr/bin/rm -f /run/blockie-steam/%i.fifo

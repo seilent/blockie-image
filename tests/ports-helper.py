@@ -858,5 +858,85 @@ def _(c):
     c(r.returncode == 0 and r.stdout.splitlines()[-1:] == ["pm pmmv"], f"open {r.stdout[-200:]!r} {r.stderr[-600:]}")
 
 
+@case("write_atomic takes a mode, 0644 by default")
+def _(c):
+    reset()
+    os.makedirs(STATE)
+    m.write_atomic(f"{STATE}/a", b"x")
+    m.write_atomic(f"{STATE}/b", b"x", 0o600)
+    c(mode(f"{STATE}/a") == 0o644 and mode(f"{STATE}/b") == 0o600, f"{oct(mode(f'{STATE}/a'))} {oct(mode(f'{STATE}/b'))}")
+
+
+@case("remove chmods only the directories the helper owns and never walks a Steam unit root")
+def _(c):
+    reset()
+    top = f"{DATA}/cache/rm-test"
+    write(f"{top}/mine/theirs/f", "x")
+    other = os.getuid() == 0
+    if other:
+        os.chown(f"{top}/mine/theirs", 65534, 65534)
+    os.chmod(f"{top}/mine/theirs", 0o500)
+    os.chmod(f"{top}/mine", 0o500)
+    seen = []
+    real = os.chmod
+
+    def rec(p, md, *a, **k):
+        seen.append(os.path.relpath(p, top))
+        return real(p, md, *a, **k)
+    os.chmod = rec
+    try:
+        m.remove(top)
+    except OSError as err:
+        c(not other, f"remove failed as root: {err}")
+    finally:
+        os.chmod = real
+        if os.path.isdir(top):
+            for root, dirs, files in os.walk(top):
+                real(root, 0o700)
+            m.remove(top)
+    c("mine" in seen and ("mine/theirs" not in seen or not other), f"chmods {seen}")
+    for p in (f"{DATA}/steam-dl/x.part", f"{DATA}/steam"):
+        os.makedirs(p, exist_ok=True)
+        try:
+            m.remove(p)
+            c(False, f"{p} removed")
+        except OSError:
+            pass
+        c(os.path.isdir(p), f"{p} gone")
+
+
+@case("refresh writes apps.tsv with the Steam app id from the store url or inst and clears owned marks; steam.tsv follows")
+def _(c):
+    w = reset()
+    w["ports"]["alpha.zip"]["attr"]["store"] = [{"name": "Steam", "gameurl": "https://store.steampowered.com/app/900001/Invented/"}]
+    w["ports"]["zero.zip"]["attr"]["inst"] = "Run download_depot 900002 900003 in the Steam console."
+    save(w)
+    os.makedirs(f"{STATE}/steam")
+    write(f"{STATE}/steam/alpha.zip.owned", "")
+    rc, lines = call("refresh")
+    apps = rd(f"{STATE}/steam/apps.tsv").splitlines()
+    md5 = {n: p["source"]["md5"] for n, p in w["ports"].items()}
+    c(rc == 0 and f"alpha.zip\t900001\t{md5['alpha.zip']}" in apps and f"zero.zip\t900002\t{md5['zero.zip']}" in apps
+      and f"beta.zip\t-\t{md5['beta.zip']}" in apps, f"apps {apps}")
+    c(not os.path.exists(f"{STATE}/steam/alpha.zip.owned"), "owned mark kept")
+    for args in (("refresh",), ("sync",), ("index",), ("install", "zero.zip"), ("uninstall", "zero.zip")):
+        m.remove(f"{STATE}/steam.tsv")
+        call(*args)
+        c(os.path.isfile(f"{STATE}/steam.tsv") and rd(f"{STATE}/steam.tsv").startswith("signed\t0\n"), f"{args}: steam.tsv")
+
+
+@case("uninstall drops the port's Steam marks and asks the unit to clean, a failing unit does not fail it")
+def _(c):
+    reset()
+    call("install", "zero.zip")
+    os.makedirs(f"{STATE}/steam/zero.zip.replaced")
+    for k in ("got", "owned", "dropped"):
+        write(f"{STATE}/steam/zero.zip.{k}", "{}")
+    rc, lines = call("uninstall", "zero.zip")
+    c(rc == 0 and lines[-1:] == ["done\tzero.zip"], f"{lines[-1:]}")
+    c(not [x for x in os.listdir(f"{STATE}/steam") if x.startswith("zero.zip.")], f"marks {os.listdir(f'{STATE}/steam')}")
+    c(any("the unit's clean failed" in x for x in LOG), f"log {LOG[-3:]}")
+
+
 print(f"ports-helper: {fails} failed" if fails else "ports-helper: python cases ok", flush=True)
 sys.exit(1 if fails else 0)

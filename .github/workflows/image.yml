@@ -250,7 +250,7 @@ jobs:
             esac
             return "$rc"
           }
-          for t in image units blobs audio wifi bt boot-ok bootctl data session hotkeyd power game game-cmd ports ports-helper android android-sched; do
+          for t in image units blobs audio wifi bt boot-ok bootctl data session hotkeyd power game game-cmd ports ports-helper ports-steam android android-sched; do
             suite podman run --rm -v "$PWD/tests:/tests:ro" -v "$PWD/boot:/repo-boot:ro" "$IMAGE:$TAG" "/tests/$t.sh"
           done
           t=westonpack
@@ -271,6 +271,8 @@ jobs:
           suite env BOOT_RULES="$PWD/system_files/usr/share/polkit-1/rules.d/50-blockie-boot.rules" tests/bootctl.sh polkit
           t=network-polkit
           suite env NETWORK_RULES="$PWD/system_files/usr/share/polkit-1/rules.d/50-blockie-network.rules" tests/wifi.sh polkit
+          t=steam-polkit
+          suite env STEAM_RULES="$PWD/system_files/usr/share/polkit-1/rules.d/50-blockie-steam.rules" tests/ports-steam.sh polkit
           t=setd
           suite podman run --rm -v "$PWD/tests:/tests:ro" "$IMAGE:$TAG" \
             bash -c 'dnf -y -q install dbus-daemon > /dev/null && /tests/setd.sh'

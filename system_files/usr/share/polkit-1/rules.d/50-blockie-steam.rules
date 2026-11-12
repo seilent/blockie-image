@@ -1,0 +1,11 @@
+polkit.addRule(function(action, subject) {
+  if (action.id != "org.freedesktop.systemd1.manage-units" || subject.user != "blockie") {
+    return;
+  }
+  var unit = action.lookup("unit");
+  var verb = action.lookup("verb");
+  var units = /^blockie-steam-dd@[a-z0-9][a-z0-9._-]*\.service$/;
+  if (unit && units.test(unit) && (verb == "start" || verb == "stop")) {
+    return polkit.Result.YES;
+  }
+});

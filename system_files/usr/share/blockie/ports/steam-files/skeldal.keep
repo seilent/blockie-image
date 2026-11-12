@@ -1,0 +1,11 @@
+config/skeldal.ini
+controls.ini
+cover.png
+gameinfo.xml
+libs.aarch64/libomni_osk.so
+licenses/LICENSE-OmniOSK.txt
+licenses/LICENSE-Skeldal.txt
+port.json
+screenshot.png
+skeldal
+skeldal.md

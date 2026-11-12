@@ -5,7 +5,9 @@ import fcntl
 import hashlib
 import json
 import os
+import pwd
 import re
+import select
 import shutil
 import signal
 import sqlite3
@@ -15,6 +17,7 @@ import sys
 import time
 import traceback
 import zipfile
+import zlib
 from pathlib import Path
 
 ME = "blockie-ports"
@@ -66,6 +69,40 @@ SCAN = (re.compile(r"libs/([A-Za-z0-9][A-Za-z0-9._+-]*?)\.squashfs"),
         re.compile(r"\b\w*runtime=[\"']?([A-Za-z0-9][A-Za-z0-9._+-]*)", re.I))
 COVERS = ("cover.png", "cover.jpg", "screenshot.png", "screenshot.jpg")
 CANCEL = [False]
+QUIET = [False]
+STEAM_MAP = os.environ.get("BLOCKIE_PORTS_STEAM_MAP", "/usr/share/blockie/ports/steam-map.tsv")
+STEAM_LISTS = os.environ.get("BLOCKIE_PORTS_STEAM_LISTS", "/usr/share/blockie/ports/steam-files")
+STEAM_DD = os.environ.get("BLOCKIE_PORTS_DD", "/usr/libexec/blockie/depotdownloader")
+STEAM_RUN = os.environ.get("BLOCKIE_PORTS_STEAM_RUN", "/run/blockie-steam")
+STEAM_USER = os.environ.get("BLOCKIE_PORTS_STEAM_USER", "blockie-steam")
+HELPER_USER = os.environ.get("BLOCKIE_PORTS_USER", "blockie")
+INHIBIT = os.environ.get("BLOCKIE_PORTS_INHIBIT", "/usr/bin/systemd-inhibit")
+SETPRIV = os.environ.get("BLOCKIE_PORTS_SETPRIV", "/usr/bin/setpriv")
+LOGIN_S = float(os.environ.get("BLOCKIE_PORTS_STEAM_LOGIN_S", "300"))
+STALL_S = float(os.environ.get("BLOCKIE_PORTS_STEAM_STALL_S", "120"))
+BATCH = int(os.environ.get("BLOCKIE_PORTS_STEAM_BATCH", str(256 << 20)))
+STEAM_DIR = os.path.join(DATA, "steam")
+STEAM_DL = os.path.join(DATA, "steam-dl")
+STEAM_HOME = os.path.join(STEAM_DIR, "home")
+STEAM_ACCOUNT = os.path.join(STEAM_DIR, "account.config")
+STEAM_REQ = os.path.join(STEAM_RUN, "req")
+STEAM_STATE = os.path.join(STATE, "steam")
+STEAM_TSV = os.path.join(STATE, "steam.tsv")
+APPS = os.path.join(STEAM_STATE, "apps.tsv")
+INHIBIT_PID = os.path.join(STEAM_STATE, "inhibit.pid")
+ACCOUNT = "account"
+UNIT = "blockie-steam-dd@{}.service"
+OSES = ("windows", "linux", "macos")
+DIGITS = re.compile(r"[0-9]+")
+SHA1 = re.compile(r"[0-9a-f]{40}")
+BRANCH = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+LIST_NAME = re.compile(r"[a-z0-9][a-z0-9._-]*")
+APP_URL = re.compile(r"store\.steampowered\.com/app/([0-9]+)")
+APP_DEPOT = re.compile(r"\b(?:download_depot|depot)\s+([0-9]+)\s+[0-9]+|-app\s+([0-9]+)\s+-depot\s+[0-9]+")
+QR_URL = re.compile(r"https://[\x21-\x7e]{1,504}")
+STEAM_CMDS = ("steam-get", "steam-logout")
+STEAM_TSV_CMDS = ("sync", "refresh", "index", "install", "update", "uninstall") + STEAM_CMDS
+LINE_MAX = 1 << 16
 
 
 class Fail(Exception):
@@ -118,11 +155,12 @@ def fsync_file(path):
         os.close(fd)
 
 
-def write_atomic(path, data):
+def write_atomic(path, data, mode=0o644):
     tmp = f"{path}.tmp-{os.getpid()}"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC | os.O_NOFOLLOW, 0o644)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC | os.O_NOFOLLOW, mode)
     try:
         try:
+            os.fchmod(fd, mode)
             view = memoryview(data)
             while view:
                 view = view[os.write(fd, view):]
@@ -136,6 +174,11 @@ def write_atomic(path, data):
     fsync_dir(os.path.dirname(path))
 
 
+def unit_root(path):
+    real = os.path.realpath(path)
+    return any(real == r or real.startswith(r + "/") for r in (os.path.realpath(STEAM_DIR), os.path.realpath(STEAM_DL)))
+
+
 def remove(path):
     try:
         st = os.lstat(path)
@@ -144,8 +187,13 @@ def remove(path):
     if not stat.S_ISDIR(st.st_mode):
         os.unlink(path)
         return
+    if unit_root(path):
+        raise OSError(errno.EPERM, "a Steam unit root is removed only by the unit")
+    uid = os.getuid()
     for root, dirs, files in os.walk(path):
-        os.chmod(root, stat.S_IMODE(os.lstat(root).st_mode) | 0o700)
+        st = os.lstat(root)
+        if st.st_uid == uid:
+            os.chmod(root, stat.S_IMODE(st.st_mode) | 0o700)
     shutil.rmtree(path)
 
 
@@ -406,14 +454,17 @@ def replay():
             try:
                 with open(p) as f:
                     data = json.load(f)
-                update = data.get("op") == "update"
-                if not (update and data.get("extracted")):
-                    rollback(data)
-                if update and PORT.fullmatch(str(data.get("name"))):
-                    mark_update(data["name"])
+                if data.get("op") == "steam":
+                    steam_replay(data)
+                else:
+                    update = data.get("op") == "update"
+                    if not (update and data.get("extracted")):
+                        rollback(data)
+                    if update and PORT.fullmatch(str(data.get("name"))):
+                        mark_update(data["name"])
                 log(f"replayed the journal of {n}")
-            except (OSError, ValueError, AttributeError, TypeError) as err:
-                log(f"dropped the unreadable journal {n}: {err}")
+            except (OSError, ValueError, AttributeError, TypeError, KeyError, Fail) as err:
+                log(f"dropped the unreadable journal {n}: {type(err).__name__ if QUIET[0] else err}")
         remove(p)
     fsync_dir(TXN)
 
@@ -550,6 +601,7 @@ def write_catalog(hm):
         marks = set(os.listdir(UPDATES))
     except FileNotFoundError:
         marks = set()
+    apps = []
     for src in hm.sources.values():
         for name in src.ports:
             if name in seen:
@@ -558,6 +610,11 @@ def write_catalog(hm):
             info = hm.port_info(name)
             if not info:
                 continue
+            attr = info.get("attr") if isinstance(info.get("attr"), dict) else {}
+            source = info.get("source") if isinstance(info.get("source"), dict) else {}
+            md5 = source.get("md5") if isinstance(source.get("md5"), str) and MD5.fullmatch(source["md5"]) else "-"
+            if PORT.fullmatch(name):
+                apps.append(f"{name}\t{steam_app(attr) or '-'}\t{md5}\n")
             if not hm.match_requirements(info):
                 hidden["reqs"] += 1
                 continue
@@ -565,8 +622,6 @@ def write_catalog(hm):
             if "exp" in attrs and not hm.cfg_data.get("show_experimental", False):
                 hidden["exp"] += 1
                 continue
-            attr = info.get("attr") if isinstance(info.get("attr"), dict) else {}
-            source = info.get("source") if isinstance(info.get("source"), dict) else {}
             size = source.get("size")
             images = hm.port_images(name) or {}
             rows.append((name, text(attr.get("title")) or name, join_list(attr.get("genres")),
@@ -592,6 +647,8 @@ def write_catalog(hm):
     fsync_file(tmp)
     os.replace(tmp, CATALOG)
     fsync_dir(STATE)
+    os.makedirs(STEAM_STATE, 0o755, exist_ok=True)
+    write_atomic(APPS, "".join(apps).encode())
 
 
 def fix_permissions(path_check=None):
@@ -773,7 +830,11 @@ def why_of(err):
         return err.why
     if isinstance(err, OSError) and err.errno == errno.ENOSPC:
         return "space"
-    log(traceback.format_exc())
+    if QUIET[0]:
+        own = [f for f in traceback.extract_tb(err.__traceback__) if f.filename == __file__]
+        log(f"{type(err).__name__} at line {own[-1].lineno if own else '-'}")
+    else:
+        log(traceback.format_exc())
     return "other"
 
 
@@ -949,6 +1010,7 @@ def cmd_uninstall(name, ctx):
             gc(hm)
         if rc != 0:
             raise Fail("other")
+        steam_forget(name)
     finally:
         write_index()
         write_catalog(hm)
@@ -966,6 +1028,11 @@ def cmd_refresh(name, ctx):
     if CANCEL[0]:
         raise Fail("cancel")
     write_catalog(hm)
+    clear_owned()
+    try:
+        steam_op(ACCOUNT, "status")
+    except (Fail, OSError) as err:
+        log(f"steam status: {type(err).__name__}")
 
 
 def cmd_index(name, ctx):
@@ -1083,9 +1150,1139 @@ def cmd_sync(name, ctx):
     write_index()
 
 
+def uid_of(user):
+    try:
+        return pwd.getpwnam(user).pw_uid
+    except KeyError:
+        return None
+
+
+def rel_ok(p):
+    return (isinstance(p, str) and p != "" and not p.startswith("/") and not CTRL.search(p)
+            and all(x not in ("", ".", "..") for x in p.split("/")))
+
+
+def read_lines(path, limit=16 << 20):
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(limit + 1)
+    except OSError:
+        return None
+    if len(raw) > limit:
+        return None
+    try:
+        return raw.decode("utf-8").splitlines()
+    except UnicodeDecodeError:
+        return None
+
+
+def map_list(name, kind):
+    lines = read_lines(os.path.join(STEAM_LISTS, name))
+    if lines is None:
+        return None
+    out = []
+    for e in (x for x in lines if x):
+        if kind == "files" and e.startswith("regex:"):
+            try:
+                re.compile(e[6:])
+            except re.error:
+                return None
+        elif not rel_ok(e):
+            return None
+        out.append(e)
+    return out
+
+
+def map_row(r):
+    if len(r) != 12:
+        return None
+    port, md5, app, os_name, depots, manifests, branch, into, files, move, keep, check = r
+    if not (PORT.fullmatch(port) and (md5 == "-" or MD5.fullmatch(md5)) and DIGITS.fullmatch(app) and os_name in OSES):
+        return None
+    deps = depots.split(",")
+    if not all(DIGITS.fullmatch(d) for d in deps):
+        return None
+    mans = [] if manifests == "-" else manifests.split(",")
+    if mans and (len(mans) != len(deps) or not all(DIGITS.fullmatch(x) for x in mans)):
+        return None
+    if (branch != "-" and not BRANCH.fullmatch(branch)) or not rel_ok(into) or (check != "-" and not rel_ok(check)):
+        return None
+    lists = {}
+    for kind, v in (("files", files), ("move", move), ("keep", keep)):
+        if v == "-":
+            continue
+        entries = map_list(v, kind) if LIST_NAME.fullmatch(v) else None
+        if entries is None:
+            return None
+        lists[kind] = entries
+    if "move" in lists:
+        return None
+    h = hashlib.sha256("\t".join((app, os_name, depots, manifests, branch, into, files, move)).encode())
+    for kind in ("files", "move"):
+        h.update(("\n" + "\n".join(lists.get(kind, []))).encode())
+    return {"port": port, "md5": None if md5 == "-" else md5, "app": app, "os": os_name, "depots": deps,
+            "manifests": mans, "branch": None if branch == "-" else branch, "into": into,
+            "files": None if files == "-" else files, "keep": set(lists.get("keep", [])),
+            "check": None if check == "-" else check, "digest": h.hexdigest()}
+
+
+def load_map():
+    rows = {}
+    lines = read_lines(STEAM_MAP)
+    for n, line in enumerate(lines or [], 1):
+        if not line or line.startswith("#"):
+            continue
+        row = map_row(line.split("\t"))
+        if row is None or row["port"] in rows:
+            log(f"steam map: line {n} dropped")
+            continue
+        rows[row["port"]] = row
+    return rows
+
+
+def steam_app(attr):
+    stores = attr.get("store") if isinstance(attr.get("store"), list) else []
+    for st in stores:
+        for k in ("gameurl", "url"):
+            v = st.get(k) if isinstance(st, dict) else None
+            m = APP_URL.search(v) if isinstance(v, str) else None
+            if m:
+                return m.group(1)
+    inst = attr.get("inst") if isinstance(attr.get("inst"), str) else ""
+    m = APP_URL.search(inst) or APP_DEPOT.search(inst)
+    return next((g for g in m.groups() if g), None) if m else None
+
+
+def read_apps():
+    apps = {}
+    for line in read_lines(APPS) or []:
+        r = line.split("\t")
+        if len(r) == 3 and PORT.fullmatch(r[0]):
+            apps[r[0]] = (r[1] if DIGITS.fullmatch(r[1]) else None, r[2] if MD5.fullmatch(r[2]) else None)
+    return apps
+
+
+def installed_dirs():
+    out = {}
+    try:
+        names = sorted(n for n in os.listdir(PORTS) if utf8(n))
+    except FileNotFoundError:
+        return out
+    for d in names:
+        if d in KEEP or CTRL.search(d):
+            continue
+        try:
+            if not stat.S_ISDIR(os.lstat(os.path.join(PORTS, d)).st_mode):
+                continue
+            with open(os.path.join(PORTS, d, "port.json"), encoding="utf-8") as f:
+                info = json.load(f)
+        except (OSError, ValueError):
+            continue
+        name = info.get("name") if isinstance(info, dict) else None
+        if isinstance(name, str) and PORT.fullmatch(name):
+            out.setdefault(name, set()).add(d)
+    return out
+
+
+def updates_offered():
+    try:
+        names = set(os.listdir(UPDATES))
+    except FileNotFoundError:
+        names = set()
+    if os.path.isfile(CATALOG):
+        try:
+            db = sqlite3.connect(f"file:{CATALOG}?mode=ro", uri=True)
+            try:
+                names |= {r[0] for r in db.execute("SELECT name FROM ports WHERE update_available = 1")}
+            finally:
+                db.close()
+        except sqlite3.Error:
+            pass
+    return names
+
+
+def read_signed():
+    try:
+        with open(os.path.join(STEAM_DL, "signed")) as f:
+            return f.read(64).strip() == "signed 1"
+    except OSError:
+        return False
+
+
+def mark(name, kind):
+    return os.path.join(STEAM_STATE, f"{name}.{kind}")
+
+
+def read_json(path):
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def row_offered(name, row, apps, dirs, updates):
+    if row is None or name not in dirs or name in updates or os.path.lexists(mark(name, "owned")):
+        return False
+    if row["into"].split("/", 1)[0] not in dirs[name]:
+        return False
+    app, md5 = apps.get(name, (None, None))
+    if app is not None and app != row["app"]:
+        return False
+    return row["md5"] is None or row["md5"] == md5
+
+
+def row_got(name, row):
+    got = read_json(mark(name, "got"))
+    if got is None or got.get("digest") != row["digest"] or not isinstance(got.get("placed"), list):
+        return False
+    if row["check"] is not None:
+        return os.path.lexists(os.path.join(PORTS, row["check"]))
+    return any(rel_ok(p) and os.path.lexists(os.path.join(PORTS, p)) for p in got["placed"])
+
+
+def write_steam_tsv():
+    rows = load_map()
+    apps = read_apps()
+    dirs = installed_dirs()
+    updates = updates_offered()
+    lines = [f"signed\t{int(read_signed())}\n"]
+    for name in sorted(dirs):
+        if row_offered(name, rows.get(name), apps, dirs, updates):
+            lines.append(f"port\t{name}\t{'got' if row_got(name, rows[name]) else 'get'}\n")
+    write_atomic(STEAM_TSV, "".join(lines).encode())
+
+
+def clear_owned():
+    try:
+        names = os.listdir(STEAM_STATE)
+    except FileNotFoundError:
+        return
+    for n in names:
+        if n.endswith(".owned"):
+            remove(os.path.join(STEAM_STATE, n))
+
+
+def systemctl(*args, timeout=60, out=False):
+    try:
+        r = subprocess.run([SYSTEMCTL, *args], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                           timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as err:
+        log(f"systemctl {args[0]}: {type(err).__name__}")
+        return None
+    return r.stdout.strip() if out else r.returncode
+
+
+def unit_active(inst):
+    return systemctl("is-active", "--quiet", UNIT.format(inst), timeout=10) == 0
+
+
+def stop_units():
+    systemctl("stop", UNIT.format("*"), timeout=30)
+
+
+def request(inst, data):
+    path = os.path.join(STEAM_REQ, inst)
+    write_atomic(path, json.dumps(data).encode(), 0o640)
+    return path
+
+
+def steam_op(inst, op, **extra):
+    req = request(inst, dict(op=op, port=None if inst == ACCOUNT else inst, **extra))
+    try:
+        if systemctl("start", "--wait", UNIT.format(inst), timeout=600) != 0:
+            raise Fail("other")
+    finally:
+        remove(req)
+
+
+def idle_hold():
+    try:
+        with open(INHIBIT_PID) as f:
+            pid = int(f.read(32))
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            argv = f.read().split(b"\0")
+        if os.path.realpath(f"/proc/{pid}/exe") == os.path.realpath(INHIBIT) and b"--who=blockie-ports" in argv:
+            os.kill(pid, signal.SIGKILL)
+    except (OSError, ValueError):
+        pass
+    remove(INHIBIT_PID)
+    r, w = os.pipe()
+    try:
+        p = subprocess.Popen([SETPRIV, "--pdeathsig", "KILL", "--", INHIBIT, "--what=idle", "--mode=block",
+                              "--who=blockie-ports", "--why=get files", "cat"], stdin=r, stdout=subprocess.DEVNULL,
+                             stderr=sys.stderr, close_fds=True)
+    except OSError as err:
+        log(f"idle hold: {type(err).__name__}, the get goes on without it")
+        os.close(w)
+        return None
+    finally:
+        os.close(r)
+    write_atomic(INHIBIT_PID, f"{p.pid}\n".encode(), 0o600)
+    return p, w
+
+
+def idle_release(hold):
+    if hold is None:
+        return
+    p, w = hold
+    os.close(w)
+    try:
+        rc = p.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        rc = p.wait()
+    if rc != 0:
+        log(f"idle hold ended with {rc}, the get went on without it")
+    remove(INHIBIT_PID)
+
+
+class Run:
+    def __init__(self):
+        self.end = False
+        self.total = None
+        self.fail = None
+        self.rc = None
+        self.stopped = None
+        self.got = False
+        self.signed_in = False
+        self.seen = False
+
+
+def open_fifo(inst):
+    path = os.path.join(STEAM_RUN, f"{inst}.fifo")
+    uid = uid_of(STEAM_USER)
+    end = time.monotonic() + 10
+    while time.monotonic() < end and not CANCEL[0]:
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+        except FileNotFoundError:
+            if not unit_active(inst):
+                return None
+            time.sleep(0.1)
+            continue
+        st = os.fstat(fd)
+        if not stat.S_ISFIFO(st.st_mode) or uid is None or st.st_uid != uid:
+            os.close(fd)
+            log(f"{inst}: the channel is not a FIFO of {STEAM_USER}")
+            raise Fail("other")
+        return fd
+    return None
+
+
+def steam_dd(proto, op, name, login, paths=None, total=None):
+    inst = name
+    run = Run()
+    req = request(inst, {"op": op, "port": name, "login": login, "paths": paths})
+    qr_run = op == "pass" and login == "qr"
+    proto.progress("login" if qr_run else "check" if op == "pass" else "download", 0, total)
+    t0 = time.monotonic()
+    first = None
+    if systemctl("start", UNIT.format(inst), timeout=60) != 0:
+        remove(req)
+        raise Fail("other")
+    try:
+        fd = open_fifo(inst)
+    except Fail:
+        stop_units()
+        remove(req)
+        raise
+    if fd is None:
+        stop_units()
+        remove(req)
+        run.stopped = "cancel" if CANCEL[0] else None
+        return run
+    buf = b""
+    qr_at = last_qr = None
+    signing = qr_run
+    changed = time.monotonic()
+    tick = 0
+    checked = 0.0
+    alive = time.monotonic()
+    fifo = os.path.join(STEAM_RUN, f"{inst}.fifo")
+    poller = select.poll()
+    poller.register(fd, select.POLLIN)
+    try:
+        while True:
+            events = poller.poll(250)
+            eof = False
+            while events:
+                data = os.read(fd, LINE_MAX)
+                if not data:
+                    eof = True
+                    break
+                buf += data
+                if len(buf) > LINE_MAX and b"\n" not in buf:
+                    break
+                *lines, buf = buf.split(b"\n")
+                for raw in lines:
+                    run.seen = True
+                    if first is None:
+                        first = time.monotonic() - t0
+                    changed = time.monotonic()
+                    f = raw.decode("utf-8", "replace").split("\t")
+                    kind = f[0]
+                    if kind == "qr" and signing:
+                        if len(f) == 2 and QR_URL.fullmatch(f[1]) and len(f[1]) <= 512:
+                            now = time.monotonic()
+                            if qr_at is None:
+                                qr_at = now
+                                host = f[1][8:].split("/", 1)[0]
+                                log(f"qr host {host if re.fullmatch(r'[A-Za-z0-9.-]{1,64}', host) else '-'} len {len(f[1])}")
+                                proto.progress("login", 0, int(LOGIN_S))
+                            else:
+                                log(f"qr gap {now - last_qr:.1f} s len {len(f[1])}")
+                            last_qr = now
+                            proto.line("qr", f[1])
+                        else:
+                            log(f"qr refused {len(raw) - 3}")
+                    elif kind == "exp" and len(f) == 2 and signing:
+                        signing = False
+                        run.signed_in = True
+                        log(f"exp {f[1] if DIGITS.fullmatch(f[1]) else '-'}")
+                        proto.progress("check", 0, None)
+                    elif kind == "total" and len(f) == 2 and DIGITS.fullmatch(f[1]):
+                        run.total = int(f[1])
+                    elif kind == "got" and len(f) == 2 and DIGITS.fullmatch(f[1]):
+                        run.got = True
+                        proto.progress("download", min(int(f[1]), total or 0), total)
+                    elif kind == "end" and len(f) == 1:
+                        run.end = True
+                    elif kind == "fail" and len(f) in (2, 3):
+                        run.fail = run.fail or " ".join(f[1:])
+                    elif kind == "rc" and len(f) == 2 and re.fullmatch(r"-?[0-9]+", f[1]):
+                        run.rc = int(f[1])
+                        peak = systemctl("show", "-p", "MemoryPeak", "--value", UNIT.format(inst), timeout=10, out=True)
+                        log(f"{inst} {op}: rc {run.rc}, MemoryPeak {peak or '-'}, first line after "
+                            f"{'-' if first is None else f'{first:.1f} s'}")
+                events = poller.poll(0)
+            if eof:
+                break
+            if len(buf) > LINE_MAX and b"\n" not in buf:
+                log(f"{inst}: a channel line over {LINE_MAX} bytes")
+                run.stopped = "other"
+                systemctl("stop", UNIT.format(inst), timeout=30)
+                break
+            now = time.monotonic()
+            if first is None and now - alive >= 2:
+                alive = now
+                if not unit_active(inst):
+                    break
+                try:
+                    moved = os.stat(fifo).st_ino != os.fstat(fd).st_ino
+                except FileNotFoundError:
+                    moved = False
+                if moved:
+                    poller.unregister(fd)
+                    os.close(fd)
+                    fd = -1
+                    fd = open_fifo(inst) or -1
+                    if fd < 0:
+                        break
+                    poller.register(fd, select.POLLIN)
+            if CANCEL[0]:
+                run.stopped = "cancel"
+            elif signing and qr_at is not None and now - qr_at >= LOGIN_S:
+                run.stopped = "expired"
+            elif not (signing and qr_at is not None) and now - changed >= STALL_S:
+                run.stopped = "network"
+            elif op == "get" and now - checked >= 2:
+                checked = now
+                if free_bytes() <= FLOOR:
+                    run.stopped = "space"
+            if run.stopped:
+                systemctl("stop", UNIT.format(inst), timeout=30)
+                break
+            if signing and qr_at is not None and int(now - qr_at) > tick:
+                tick = int(now - qr_at)
+                proto.progress("login", tick, int(LOGIN_S))
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        remove(req)
+    return run
+
+
+def outcome(run, name, op):
+    if run.stopped:
+        return run.stopped
+    if run.fail:
+        if run.fail == "owned":
+            write_atomic(mark(name, "owned"), b"", 0o600)
+            return "owned"
+        if run.fail == "owned depot":
+            return "owned"
+        if run.fail in ("depot", "branch"):
+            log(f"{name}: fail {run.fail}, the map row does not match Steam")
+            return "other"
+        return run.fail if run.fail in ("login", "expired", "network", "space") else "other"
+    if run.rc == 0 and run.end and (op != "pass" or run.total is not None):
+        return None
+    if run.rc == 0 or not run.seen:
+        return "other"
+    if (op == "pass" or not run.got) and not os.path.lexists(mark(name, "dropped")):
+        try:
+            steam_op(name, "reset", dir="check" if op == "pass" else "part")
+            write_atomic(mark(name, "dropped"), b"", 0o600)
+        except Fail:
+            log(f"{name}: the reset of its .DepotDownloader failed")
+    return "space" if free_bytes() <= FLOOR else "other"
+
+
+def read_list(name):
+    out = {"manifests": [], "files": [], "total": None}
+    for line in read_lines(os.path.join(STEAM_DL, f"{name}.list"), 256 << 20) or []:
+        f = line.split("\t")
+        if f[0] == "manifest" and len(f) == 3 and DIGITS.fullmatch(f[1]) and DIGITS.fullmatch(f[2]):
+            out["manifests"].append((f[1], f[2]))
+        elif f[0] == "file" and len(f) == 4 and SHA1.fullmatch(f[1]) and DIGITS.fullmatch(f[2]) and rel_ok(f[3]):
+            out["files"].append((f[3], int(f[2]), f[1]))
+        elif f[0] == "total" and len(f) == 2 and DIGITS.fullmatch(f[1]):
+            out["total"] = int(f[1])
+        else:
+            return None
+    if out["total"] is None or out["total"] != sum(x[1] for x in out["files"]):
+        return None
+    return out
+
+
+def sha1_file(path):
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        for data in iter(lambda: f.read(1 << 20), b""):
+            h.update(data)
+    return h.hexdigest()
+
+
+def inside_port(row, dst):
+    base = os.path.realpath(os.path.join(PORTS, row["into"].split("/", 1)[0]))
+    parent = os.path.realpath(os.path.dirname(os.path.join(PORTS, dst)))
+    return parent == base or parent.startswith(base + "/")
+
+
+def merge(name, row, lst):
+    got = read_json(mark(name, "got")) or {}
+    ours = {p for p in got.get("placed", []) if isinstance(p, str)}
+    plan = {"fetch": [], "replace": [], "placed": [], "skip": 0}
+    for path, size, sha1 in lst["files"]:
+        dst = f"{row['into']}/{path}"
+        full = os.path.join(PORTS, dst)
+        if not inside_port(row, dst):
+            raise Fail("other")
+        parent = os.path.dirname(full)
+        while parent != PORTS and not os.path.lexists(parent):
+            parent = os.path.dirname(parent)
+        if parent != PORTS and not stat.S_ISDIR(os.lstat(parent).st_mode):
+            raise Fail("exists")
+        try:
+            st = os.lstat(full)
+        except FileNotFoundError:
+            plan["fetch"].append((path, dst, size, sha1))
+            plan["placed"].append((dst, size, sha1))
+            continue
+        if path in row["keep"]:
+            plan["skip"] += 1
+            continue
+        if stat.S_ISREG(st.st_mode) and st.st_size == size and sha1_file(full) == sha1:
+            plan["placed"].append((dst, size, sha1))
+            plan["skip"] += 1
+            continue
+        if stat.S_ISREG(st.st_mode) and dst in ours:
+            plan["fetch"].append((path, dst, size, sha1))
+            plan["replace"].append(dst)
+            plan["placed"].append((dst, size, sha1))
+            continue
+        raise Fail("exists")
+    return plan
+
+
+def floor_check(name, plan):
+    need_b = sum(x[2] for x in plan["fetch"])
+    part = os.path.join(STEAM_DL, f"{name}.part")
+    have = 0
+    for x in plan["fetch"]:
+        try:
+            st = os.lstat(os.path.join(part, x[0]))
+        except OSError:
+            continue
+        if stat.S_ISREG(st.st_mode):
+            have += min(st.st_blocks * 512, x[2])
+    peak = BATCH + max((x[2] for x in plan["fetch"]), default=0)
+    if free_bytes() <= max(0, need_b - have) + FLOOR + peak:
+        raise Fail("space")
+
+
+def aside(name, dst):
+    return os.path.join(STEAM_STATE, f"{name}.replaced", dst)
+
+
+def place(name, path, dst, n):
+    full = os.path.join(PORTS, dst)
+    src = os.open(os.path.join(STEAM_DL, f"{name}.part", path), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        st = os.fstat(src)
+        if not stat.S_ISREG(st.st_mode):
+            raise Fail("other")
+        try:
+            os.makedirs(os.path.dirname(full), 0o755, exist_ok=True)
+        except (FileExistsError, NotADirectoryError):
+            raise Fail("exists")
+        mode = 0o755 if st.st_mode & 0o111 else 0o644
+        tmp = os.path.join(os.path.dirname(full), f".blockie-tmp-{os.getpid()}-{n}")
+        out = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, mode)
+        try:
+            try:
+                os.fchmod(out, mode)
+                while os.sendfile(out, src, None, 1 << 24):
+                    pass
+            finally:
+                os.close(out)
+            os.link(tmp, full)
+        except FileExistsError:
+            raise Fail("exists")
+        finally:
+            remove(tmp)
+    finally:
+        os.close(src)
+
+
+def copy_all(proto, name, entries, replaced):
+    done = 0
+    batch = []
+    size = 0
+    for n, (path, dst, sz, sha1) in enumerate(entries):
+        if CANCEL[0]:
+            raise Fail("cancel")
+        if not inside_port_dst(dst):
+            raise Fail("other")
+        full = os.path.join(PORTS, dst)
+        if dst in replaced and os.path.lexists(full) and not os.path.lexists(aside(name, dst)):
+            os.makedirs(os.path.dirname(aside(name, dst)), 0o755, exist_ok=True)
+            os.rename(full, aside(name, dst))
+        place(name, path, dst, n)
+        batch.append(path)
+        size += sz
+        if size >= BATCH or n == len(entries) - 1:
+            os.sync()
+            steam_op(name, "drop", paths=batch)
+            done += len(batch)
+            batch = []
+            size = 0
+            if proto is not None:
+                proto.progress("copy", done, len(entries))
+
+
+def inside_port_dst(dst):
+    if not rel_ok(dst):
+        return False
+    base = os.path.realpath(os.path.join(PORTS, dst.split("/", 1)[0]))
+    parent = os.path.realpath(os.path.dirname(os.path.join(PORTS, dst)))
+    return dst.split("/", 1)[0] not in KEEP and (parent == base or parent.startswith(base + "/"))
+
+
+def finish(name, data):
+    write_atomic(mark(name, "got"), json.dumps({"digest": data["digest"],
+                                                "placed": [x[0] for x in data["placed"]]}).encode(), 0o600)
+    remove(os.path.join(STEAM_STATE, f"{name}.replaced"))
+    remove(mark(name, "dropped"))
+    steam_op(name, "clean")
+
+
+def steam_replay(data):
+    name = data.get("name")
+    if not isinstance(name, str) or not PORT.fullmatch(name) or not isinstance(data.get("digest"), str):
+        raise ValueError("a steam journal without a port or digest")
+    copies = [tuple(c) for c in data["copies"]]
+    replaced = set(data["replaced"])
+    if not all(len(c) == 4 and rel_ok(c[0]) and inside_port_dst(c[1]) for c in copies):
+        raise ValueError("a steam journal entry outside the port")
+    if not all(os.path.isdir(os.path.join(PORTS, c[1].split("/", 1)[0])) for c in copies):
+        raise ValueError("a steam journal for a port dir that is gone")
+    for d in sorted({os.path.dirname(os.path.join(PORTS, c[1])) for c in copies}):
+        os.makedirs(d, 0o755, exist_ok=True)
+        for e in os.listdir(d):
+            m = re.fullmatch(r"\.blockie-tmp-([0-9]+)-[0-9]+", e)
+            if m and (int(m.group(1)) == os.getpid() or not os.path.exists(f"/proc/{m.group(1)}")):
+                remove(os.path.join(d, e))
+    todo = []
+    drops = []
+    for path, dst, size, sha1 in copies:
+        full = os.path.join(PORTS, dst)
+        if not os.path.lexists(os.path.join(STEAM_DL, f"{name}.part", path)):
+            continue
+        try:
+            st = os.lstat(full)
+        except FileNotFoundError:
+            todo.append((path, dst, size, sha1))
+            continue
+        if stat.S_ISREG(st.st_mode) and st.st_size == size and sha1_file(full) == sha1:
+            drops.append(path)
+            continue
+        if dst in replaced and not os.path.lexists(aside(name, dst)):
+            os.makedirs(os.path.dirname(aside(name, dst)), 0o755, exist_ok=True)
+            os.rename(full, aside(name, dst))
+        else:
+            os.unlink(full)
+        todo.append((path, dst, size, sha1))
+    if drops:
+        os.sync()
+        steam_op(name, "drop", paths=drops)
+    if todo:
+        copy_all(None, name, todo, set())
+    finish(name, data)
+
+
+def steam_get(proto, name):
+    row = load_map().get(name)
+    if not row_offered(name, row, read_apps(), installed_dirs(), updates_offered()):
+        raise Fail("other")
+    login = "token" if read_signed() else "qr"
+    qr_used = login == "qr"
+    while True:
+        run = steam_dd(proto, "pass", name, login)
+        why = outcome(run, name, "pass")
+        if why == "login" and not qr_used:
+            login, qr_used = "qr", True
+            continue
+        if why:
+            return why
+        if run.signed_in:
+            clear_owned()
+        lst = read_list(name)
+        if lst is None:
+            return "other"
+        plan = merge(name, row, lst)
+        if not plan["fetch"]:
+            break
+        floor_check(name, plan)
+        paths = None if len(plan["fetch"]) == len(lst["files"]) else [x[0] for x in plan["fetch"]]
+        run = steam_dd(proto, "get", name, "token", paths, sum(x[2] for x in plan["fetch"]))
+        why = outcome(run, name, "get")
+        if why == "login" and not qr_used:
+            login, qr_used = "qr", True
+            continue
+        if why:
+            return why
+        break
+    entries = plan["fetch"]
+    proto.progress("copy", 0, len(entries))
+    os.sync()
+    data = {"op": "steam", "name": name, "digest": row["digest"], "placed": plan["placed"],
+            "replaced": plan["replace"], "copies": entries}
+    with game_lock():
+        journal(f"steam-{name}", data)
+        if entries:
+            copy_all(proto, name, entries, set(plan["replace"]))
+        finish(name, data)
+        drop_journal(f"steam-{name}")
+    return None
+
+
+def cmd_steam_get(name, ctx):
+    if not PORT.fullmatch(name):
+        raise Fail("other")
+    if scope_active():
+        raise Fail("busy")
+    if offline():
+        raise Fail("network")
+    os.makedirs(STEAM_STATE, 0o755, exist_ok=True)
+    stop_units()
+    steam_op(ACCOUNT, "clean")
+    with game_lock():
+        replay()
+    hold = idle_hold()
+    try:
+        why = steam_get(ctx.proto, name)
+    finally:
+        idle_release(hold)
+    if why == "cancel":
+        try:
+            steam_op(name, "clean")
+        except Fail:
+            log(f"{name}: clean after the stop failed, the next get resumes in the part dir")
+    if why:
+        raise Fail(why)
+
+
+def cmd_steam_logout(name, ctx):
+    os.makedirs(STEAM_STATE, 0o755, exist_ok=True)
+    stop_units()
+    steam_op(ACCOUNT, "logout")
+    clear_owned()
+
+
+def steam_forget(name):
+    try:
+        for kind in ("got", "owned", "dropped"):
+            remove(mark(name, kind))
+        remove(os.path.join(STEAM_STATE, f"{name}.replaced"))
+        steam_op(name, "clean")
+    except (Fail, OSError) as err:
+        log(f"{name}: the unit's clean failed, {type(err).__name__}")
+
+
+def unit_me():
+    return os.getuid()
+
+
+def unit_request(inst):
+    fd = os.open(os.path.join(STEAM_REQ, inst), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != uid_of(HELPER_USER) or st.st_size > 64 << 20:
+            raise ValueError("the request is not a regular file of the helper")
+        with os.fdopen(os.dup(fd), "rb") as f:
+            req = json.loads(f.read())
+    finally:
+        os.close(fd)
+    if not isinstance(req, dict) or not isinstance(req.get("op"), str):
+        raise ValueError("a request without an operation")
+    paths = req.get("paths")
+    if paths is not None and not (isinstance(paths, list) and all(rel_ok(p) for p in paths)):
+        raise ValueError("a request path is not relative")
+    return req
+
+
+def unit_own(path):
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return True
+    return stat.S_ISDIR(st.st_mode) and st.st_uid == unit_me()
+
+
+def unit_tokens():
+    try:
+        with open(STEAM_ACCOUNT, "rb") as f:
+            data = zlib.decompress(f.read(1 << 20), -15)
+    except (OSError, zlib.error):
+        return 0
+    n = 0
+    i = 0
+
+    def varint():
+        nonlocal i
+        v = shift = 0
+        while True:
+            b = data[i]
+            i += 1
+            v |= (b & 0x7f) << shift
+            if not b & 0x80:
+                return v
+            shift += 7
+            if shift > 63:
+                raise ValueError("varint")
+
+    try:
+        while i < len(data):
+            key = varint()
+            field, kind = key >> 3, key & 7
+            if kind == 0:
+                varint()
+            elif kind in (1, 5):
+                i += 8 if kind == 1 else 4
+            elif kind == 2:
+                size = varint()
+                n += field == 4
+                i += size
+            else:
+                raise ValueError("wire type")
+            if i > len(data):
+                raise ValueError("truncated")
+    except (IndexError, ValueError):
+        return 0
+    return n
+
+
+def unit_signed():
+    flag = os.path.join(STEAM_DL, "signed")
+    tmp = f"{flag}.tmp-{os.getpid()}"
+    with open(tmp, "w") as f:
+        f.write(f"signed {int(unit_tokens() == 1)}\n")
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, flag)
+
+
+def unit_list(port):
+    paths = set()
+    for line in read_lines(os.path.join(STEAM_DL, f"{port}.list"), 256 << 20) or []:
+        f = line.split("\t")
+        if f[0] == "file" and len(f) == 4:
+            paths.add(f[3])
+    return paths
+
+
+def unit_rmtree(path):
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if st.st_uid != unit_me():
+        raise ValueError(f"{os.path.basename(path)} is not the unit's")
+    if stat.S_ISDIR(st.st_mode):
+        shutil.rmtree(path)
+    else:
+        os.unlink(path)
+
+
+def unit_clean(port):
+    names = os.listdir(STEAM_DL)
+    if port is not None:
+        for kind in ("part", "check"):
+            p = os.path.join(STEAM_DL, f"{port}.{kind}")
+            if os.path.lexists(p):
+                if not unit_own(p):
+                    raise ValueError(f"{port}.{kind} is not the unit's")
+                os.rename(p, os.path.join(STEAM_DL, f"{port}.del-{time.time_ns()}-{kind}"))
+        for n in os.listdir(STEAM_DL):
+            if n == f"{port}.list" or n.startswith(f"{port}.list.tmp-"):
+                os.unlink(os.path.join(STEAM_DL, n))
+        names = os.listdir(STEAM_DL)
+    for n in names:
+        if ".del-" in n and (port is None or n.startswith(f"{port}.del-")):
+            unit_rmtree(os.path.join(STEAM_DL, n))
+
+
+def unit_drop(port, paths):
+    listed = unit_list(port)
+    if not all(p in listed for p in paths):
+        raise ValueError("a drop path is not in the list")
+    top = os.open(os.path.join(STEAM_DL, f"{port}.part"), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        for p in paths:
+            *dirs, leaf = p.split("/")
+            fd = os.dup(top)
+            try:
+                for d in dirs:
+                    nfd = os.open(d, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+                    os.close(fd)
+                    fd = nfd
+                try:
+                    os.unlink(leaf, dir_fd=fd)
+                except FileNotFoundError:
+                    pass
+            finally:
+                os.close(fd)
+    finally:
+        os.close(top)
+
+
+def unit_prune(work, keep):
+    for root, dirs, files in os.walk(work):
+        rel = os.path.relpath(root, work)
+        if rel == ".":
+            dirs[:] = [d for d in dirs if d != ".DepotDownloader"]
+        for e in files + [d for d in dirs if os.path.islink(os.path.join(root, d))]:
+            p = e if rel == "." else f"{rel}/{e}"
+            if p not in keep:
+                os.unlink(os.path.join(root, e))
+
+
+def unit_args(req, row, work, port):
+    args = ["-app", row["app"], "-os", row["os"], "-depot", *row["depots"]]
+    if req["op"] == "pass":
+        args += ["-manifest-only"]
+        if row["manifests"]:
+            args += ["-manifest", *row["manifests"]]
+        if row["files"]:
+            args += ["-filelist", os.path.join(STEAM_LISTS, row["files"])]
+    else:
+        mans = {}
+        for line in read_lines(os.path.join(STEAM_DL, f"{port}.list"), 256 << 20) or []:
+            f = line.split("\t")
+            if f[0] == "manifest" and len(f) == 3:
+                mans[f[1]] = f[2]
+        if any(d not in mans for d in row["depots"]):
+            raise ValueError("the list lacks a manifest for a depot")
+        args += ["-manifest", *(mans[d] for d in row["depots"])]
+        paths = req.get("paths")
+        if paths:
+            listed = unit_list(port)
+            if not all(p in listed and not p.startswith("regex:") for p in paths):
+                raise ValueError("a get path is not in the list")
+            filelist = os.path.join(os.environ.get("TMPDIR", "/tmp"), f"blockie-filelist-{os.getpid()}")
+            with open(filelist, "w") as f:
+                f.write("".join(p + "\n" for p in paths))
+            args += ["-filelist", filelist]
+        elif row["files"]:
+            args += ["-filelist", os.path.join(STEAM_LISTS, row["files"])]
+    if row["branch"]:
+        args += ["-beta", row["branch"]]
+    args += ["-dir", work, "-max-downloads", "4", "-remember-password"]
+    if req["op"] == "pass" and req.get("login") == "qr":
+        args += ["-qr"]
+    return args
+
+
+def unit_fifo(port):
+    path = os.path.join(STEAM_RUN, f"{port}.fifo")
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    os.mkfifo(path, 0o640)
+    end = time.monotonic() + 10
+    while True:
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+            break
+        except OSError as err:
+            if err.errno != errno.ENXIO or time.monotonic() >= end:
+                raise
+            time.sleep(0.1)
+    fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) & ~os.O_NONBLOCK)
+    return fd
+
+
+def unit_send(fd, line):
+    view = memoryview(line.encode() + b"\n")
+    while view:
+        view = view[os.write(fd, view):]
+
+
+def unit_dd(req, row, port):
+    op = req["op"]
+    fifo = unit_fifo(port)
+    rc = 1
+    try:
+        work = os.path.join(STEAM_DL, f"{port}.{'check' if op == 'pass' else 'part'}")
+        try:
+            if not unit_own(work):
+                raise ValueError(f"{os.path.basename(work)} is not a directory of the unit")
+            if op == "get":
+                keep = unit_list(port)
+                if not keep:
+                    raise ValueError("no list for the get")
+                if os.path.isdir(work):
+                    unit_prune(work, keep)
+            args = unit_args(req, row, work, port)
+        except (OSError, ValueError) as err:
+            log(f"{port} {op}: refused, {err}")
+            unit_send(fifo, "fail\tother")
+            return 1
+        r, w = os.pipe()
+        try:
+            p = subprocess.Popen([STEAM_DD, *args], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, pass_fds=(w,), cwd=STEAM_HOME,
+                                 env=dict(os.environ, BLOCKIE_DD_FD=str(w)))
+        finally:
+            os.close(w)
+        manifests, files, total, end, bad = [], [], None, False, False
+        with os.fdopen(r, "rb") as f:
+            while True:
+                raw = f.readline(LINE_MAX)
+                if not raw:
+                    break
+                line = raw.decode("utf-8", "replace").rstrip("\n")
+                fields = line.split("\t")
+                kind = fields[0]
+                if not raw.endswith(b"\n"):
+                    bad = True
+                elif kind == "file" and len(fields) == 4 and SHA1.fullmatch(fields[1]) and DIGITS.fullmatch(fields[2]) \
+                        and rel_ok(fields[3]):
+                    files.append(line)
+                    continue
+                elif kind == "manifest" and len(fields) == 3 and all(DIGITS.fullmatch(x) for x in fields[1:]):
+                    manifests.append(line)
+                    continue
+                elif kind == "total" and len(fields) == 2 and DIGITS.fullmatch(fields[1]):
+                    total = int(fields[1])
+                elif kind == "end" and len(fields) == 1:
+                    end = True
+                elif not (kind == "qr" or (kind in ("got", "exp") and len(fields) == 2) or
+                          (kind == "fail" and len(fields) in (2, 3))):
+                    bad = True
+                if bad:
+                    p.kill()
+                    unit_send(fifo, "fail\tother")
+                    break
+                try:
+                    unit_send(fifo, line)
+                except OSError:
+                    p.kill()
+                    break
+        rc = p.wait()
+        if op == "pass" and not bad and rc == 0 and end and total is not None:
+            if total != sum(int(x.split("\t")[2]) for x in files):
+                unit_send(fifo, "fail\tother")
+                rc = 1
+            else:
+                lst = os.path.join(STEAM_DL, f"{port}.list")
+                tmp = f"{lst}.tmp-{os.getpid()}"
+                with open(tmp, "w") as f:
+                    f.write("".join(x + "\n" for x in manifests + files + [f"total\t{total}"]))
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.chmod(tmp, 0o640)
+                os.replace(tmp, lst)
+                unit_rmtree(work)
+        unit_send(fifo, f"rc\t{rc}")
+        return 0 if rc == 0 and not bad else 1
+    finally:
+        os.close(fifo)
+
+
+def unit_main(argv):
+    if len(argv) != 1 or not (argv[0] == ACCOUNT or PORT.fullmatch(argv[0])):
+        log("usage: blockie-ports steam-unit <port>|account")
+        return 64
+    inst = argv[0]
+    os.umask(0o027)
+    os.makedirs(STEAM_HOME, 0o700, exist_ok=True)
+    try:
+        req = unit_request(inst)
+        op = req["op"]
+        if req.get("port") != (None if inst == ACCOUNT else inst):
+            raise ValueError("the request names another port")
+        if inst == ACCOUNT:
+            if op == "status":
+                return 0
+            if op == "logout":
+                for n in os.listdir(STEAM_DIR):
+                    if n == "account.config" or n.startswith("account.config."):
+                        os.unlink(os.path.join(STEAM_DIR, n))
+                unit_rmtree(STEAM_HOME)
+                return 0
+            if op == "clean":
+                unit_clean(None)
+                return 0
+            raise ValueError(f"no account operation {op}")
+        if op == "clean":
+            unit_clean(inst)
+            return 0
+        if op == "drop":
+            unit_drop(inst, req.get("paths") or [])
+            return 0
+        if op == "reset":
+            if req.get("dir") not in ("check", "part"):
+                raise ValueError("a reset of an unknown dir")
+            work = os.path.join(STEAM_DL, f"{inst}.{req['dir']}")
+            if not unit_own(work):
+                raise ValueError(f"{inst}.{req['dir']} is not the unit's")
+            unit_rmtree(os.path.join(work, ".DepotDownloader"))
+            return 0
+        if op in ("pass", "get"):
+            row = load_map().get(inst)
+            app = read_apps().get(inst, (None, None))[0]
+            if row is None or (app is not None and app != row["app"]):
+                raise ValueError("the port has no Steam row")
+            return unit_dd(req, row, inst)
+        raise ValueError(f"no port operation {op}")
+    except (OSError, ValueError) as err:
+        log(f"{inst}: {type(err).__name__} {err}")
+        return 1
+    finally:
+        try:
+            unit_signed()
+        except OSError as err:
+            log(f"signed: {type(err).__name__}")
+
+
 COMMANDS = {"sync": (0, cmd_sync), "refresh": (0, cmd_refresh), "index": (0, cmd_index),
             "install": (1, cmd_install), "update": (1, cmd_update), "uninstall": (1, cmd_uninstall),
-            "runtime": (1, cmd_runtime), "unpack": (1, cmd_unpack)}
+            "runtime": (1, cmd_runtime), "unpack": (1, cmd_unpack), "steam-get": (1, cmd_steam_get),
+            "steam-logout": (0, cmd_steam_logout)}
 WAITING = ("runtime", "unpack")
 
 
@@ -1093,12 +2290,13 @@ def run(argv, proto):
     if len(argv) < 2 or argv[1] not in COMMANDS or len(argv) != 2 + COMMANDS[argv[1]][0] or any(
             CTRL.search(a) for a in argv[2:]):
         log(f"usage: {ME} sync|refresh|index|install <name>|update <name>|uninstall <name>|runtime <name>|"
-            f"unpack <file>")
+            f"unpack <file>|steam-get <name>|steam-logout")
         return 64
     cmd = argv[1]
     arg = argv[2] if len(argv) > 2 else cmd
     name = os.path.basename(arg) if cmd == "unpack" else arg
     CANCEL[0] = False
+    QUIET[0] = cmd in STEAM_CMDS
     signal.signal(signal.SIGTERM, on_term)
     os.umask(0o022)
     os.environ.update(HM_TOOLS_DIR=PORTS, HM_PORTS_DIR=PORTS, HM_SCRIPTS_DIR=PORTS, REQUESTS_CA_BUNDLE=CA,
@@ -1111,9 +2309,17 @@ def run(argv, proto):
         os.chdir(PORTS)
         lock = helper_lock(proto, cmd in WAITING)
         empty_tmp()
-        COMMANDS[cmd][1](arg, Ctx(proto))
+        try:
+            COMMANDS[cmd][1](arg, Ctx(proto))
+        finally:
+            if cmd in STEAM_TSV_CMDS:
+                try:
+                    write_steam_tsv()
+                except Exception as err:
+                    log(f"steam.tsv: {type(err).__name__}")
     except Exception as err:
-        proto.fail(name, why_of(err))
+        why = why_of(err)
+        proto.fail(name, "other" if cmd == "steam-logout" else why)
         return 1
     finally:
         if lock is not None:
@@ -1123,6 +2329,8 @@ def run(argv, proto):
 
 
 def main(argv):
+    if argv[1:2] == ["steam-unit"]:
+        return unit_main(argv[2:])
     proto = os.dup(1)
     os.dup2(2, 1)
     sys.stdout = sys.stderr

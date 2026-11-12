@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+
+T = os.environ["FAKE_T"]
+BIN = os.environ["PORTS_BIN"]
+UNITS = f"{T}/units"
+RUN = os.environ["BLOCKIE_PORTS_STEAM_RUN"]
+os.makedirs(UNITS, exist_ok=True)
+a = sys.argv[1:]
+if a[:1] == ["--user"]:
+    sys.exit(int(open(f"{T}/scope-rc").read()))
+with open(f"{T}/systemctl.log", "a") as f:
+    f.write(json.dumps(a) + "\n")
+
+
+def inst_of(unit):
+    m = re.fullmatch(r"blockie-steam-dd@(.+)\.service", unit)
+    if not m:
+        sys.exit(5)
+    return m.group(1)
+
+
+def pid_of(i):
+    try:
+        with open(f"{UNITS}/{i}.pid") as f:
+            pid = int(f.read())
+        with open(f"/proc/{pid}/stat") as f:
+            if f.read().rsplit(")", 1)[1].split()[0] == "Z":
+                return None
+        return pid
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def post(i):
+    for p in (f"{RUN}/{i}.fifo", f"{UNITS}/{i}.pid"):
+        try:
+            os.unlink(p)
+        except FileNotFoundError:
+            pass
+
+
+def stop(i):
+    pid = pid_of(i)
+    if pid is None:
+        return
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    end = time.monotonic() + 5
+    while pid_of(i) is not None and time.monotonic() < end:
+        time.sleep(0.05)
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    while pid_of(i) is not None:
+        time.sleep(0.05)
+    post(i)
+
+
+def wrapper(i):
+    user = os.environ.get("FAKE_UNIT_USER")
+    pre = ["setpriv", f"--reuid={user}", f"--regid={user}", "--clear-groups", "--"] if user else []
+    with open(f"{T}/unit.log", "a") as log:
+        return subprocess.Popen([*pre, BIN, "steam-unit", i], stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                umask=0o027)
+
+
+cmd = a[0]
+if cmd == "--supervise":
+    i = a[1]
+    rc = wrapper(i).wait()
+    with open(f"{UNITS}/{i}.rc", "w") as f:
+        f.write(str(rc))
+    post(i)
+    sys.exit(rc)
+if cmd == "start":
+    i = inst_of(a[-1])
+    end = time.monotonic() + 10
+    while pid_of(i) is not None and time.monotonic() < end:
+        time.sleep(0.02)
+    if os.path.exists(f"{T}/start-fails"):
+        sys.exit(1)
+    if os.path.exists(f"{T}/start-noexec") and "--wait" not in a:
+        sys.exit(0)
+    if "--wait" in a:
+        rc = wrapper(i).wait()
+        post(i)
+        sys.exit(0 if rc == 0 else 1)
+    p = subprocess.Popen([sys.executable, __file__, "--supervise", i], start_new_session=True,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    with open(f"{UNITS}/{i}.pid", "w") as f:
+        f.write(str(p.pid))
+    time.sleep(0.05)
+    sys.exit(0)
+if cmd == "stop":
+    for u in a[1:]:
+        if u == "blockie-steam-dd@*.service":
+            for n in os.listdir(UNITS):
+                if n.endswith(".pid"):
+                    stop(n[:-4])
+        else:
+            stop(inst_of(u))
+    sys.exit(0)
+if cmd == "is-active":
+    sys.exit(0 if pid_of(inst_of(a[-1])) is not None else 3)
+if cmd == "show":
+    print("1048576")
+    sys.exit(0)
+sys.exit(1)

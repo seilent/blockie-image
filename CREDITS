@@ -68,6 +68,20 @@ https://github.com/mdqinc/SDL_GameControllerDB (Zlib, LICENSE-gamecontrollerdb.t
 /usr/share/licenses/portmaster/. requests' certs.py returns the system CA bundle instead of importing certifi.
 LICENSE-charset_normalizer.txt is the LICENSE of https://github.com/jawah/charset_normalizer (3.0.1, 5dd7aa0).
 utils/patcher.txt is Blockie's own.
+packages/depotdownloader: DepotDownloader (https://github.com/SteamRE/DepotDownloader, 3.4.0 c553ef4, SteamRE,
+GPL-1.0-or-later: the GPLv2 text with no version stated) and SteamKit2 (https://github.com/SteamRE/SteamKit, 3.2.0
+c31ce16, SteamRE, LGPL-2.1-only), both built from source for .NET 10 with depotdownloader-blockie.patch. The NuGet
+assemblies ship as published on nuget.org, pinned by content hash in the lock files: protobuf-net 3.2.52 (Marc Gravell,
+Apache-2.0), QRCoder 1.6.0 (Raffael Herrmann, MIT), ZstdSharp.Port 0.8.5 (Oleg Stepanischev, MIT), System.IO.Hashing
+9.0.4 and Microsoft.Win32.Registry 5.0.0 (Microsoft, MIT). Microsoft.Windows.CsWin32 0.3.183 (Microsoft, MIT) generates
+code that is compiled in. The texts under /usr/share/licenses/depotdownloader/: dotnet-runtime-LICENSE.TXT is
+LICENSE.TXT of https://github.com/dotnet/runtime (v9.0.4 and v5.0.0, the same text) for System.IO.Hashing and
+Microsoft.Win32.Registry; ZstdSharp-LICENSE.txt, CsWin32-LICENSE.txt, protobuf-net-Licence.txt and QRCoder-LICENSE.txt
+are the LICENSE files of oleg-st/ZstdSharp (0.8.5), microsoft/CsWin32 (v0.3.183), protobuf-net/protobuf-net (3.2.52,
+line endings made LF) and codebude/QRCoder (v1.6.0); Apache-2.0.txt is the Apache License 2.0 text.
+system_files/usr/share/blockie/ports/steam-map.tsv and steam-files/: made from the PortMaster-New catalogue and port
+zips (https://github.com/PortsMaster/PortMaster-New, MIT, ports.json of 2026-11-02_1442), with depot ids from public
+Steam app data.
 system_files/usr/share/blockie/retroarch/core: the gambatte.opt and mgba.opt option values come from the settings of
 https://github.com/BruhMeh/Ayaneo-Handheld-Scripts (168d1c9), values only.
 system_files/usr/share/blockie/portmaster/mod_Blockie.txt: modeled on PortMaster's mod_nuubOS.txt
