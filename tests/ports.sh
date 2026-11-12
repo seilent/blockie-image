@@ -35,6 +35,20 @@ res() {
   fi
 }
 
+ok=0
+python3 -I -B - "$helper" << 'EOF' || ok=1
+import ast, os, sys
+
+sys.path[:0] = ["/usr/share/blockie/portmaster/PortMaster/pylibs", "/usr/share/blockie/portmaster/PortMaster/exlibs"]
+import requests.certs
+
+ca = next(n.value.value for n in ast.parse(open(sys.argv[1]).read()).body
+          if isinstance(n, ast.Assign) and [t.id for t in n.targets if isinstance(t, ast.Name)] == ["CA"])
+assert requests.certs.where() == ca, (requests.certs.where(), ca)
+assert os.path.isfile(ca) and b"BEGIN CERTIFICATE" in open(ca, "rb").read(), ca
+EOF
+res $ok "the CA bundle requests and the helper name is a file in the image"
+
 export FAKE=$t/fake
 mkdir -p "$FAKE/bin" "$t/run" "$pdir/sub" "$pdir/dir.sh" "$data/ports-home" "$data/cache/ports-tmp/run" \
   /etc/blockie/sessions.d /run/blockie-gpu

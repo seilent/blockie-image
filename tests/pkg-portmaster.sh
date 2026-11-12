@@ -152,7 +152,7 @@ p=$pm/utils/patcher.txt
 bash -n "$p" || fail "patcher.txt syntax"
 grep -qF -- '--choose' "$p" && grep -qF -- '--progress' "$p" && grep -qF -- '--close' "$p" || fail "patcher.txt is not Blockie's"
 ! grep -qF LOVE_RUN "$p" || fail "patcher.txt runs the LOVE patcher"
-grep -qx '    return "/etc/pki/tls/certs/ca-bundle.crt"' "$pm/exlibs/requests/certs.py" || fail "requests certs"
+grep -qx '    return "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem"' "$pm/exlibs/requests/certs.py" || fail "requests certs"
 
 [[ $(find "$t$lic" -mindepth 1 -printf '%f\n' | LC_ALL=C sort | paste -sd' ') == "$(sorted LICENSE LICENSE-charset_normalizer.txt LICENSE-gamecontrollerdb.txt "${lics[@]}")" ]] ||
   fail "licence files"
@@ -204,6 +204,6 @@ sys.path[:0] = [sys.argv[1] + "/pylibs", sys.argv[1] + "/exlibs"]
 import harbourmaster
 import requests.certs
 
-assert requests.certs.where() == "/etc/pki/tls/certs/ca-bundle.crt"
+assert requests.certs.where() == "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem"
 EOF
 echo "pkg-$name: ok"

@@ -37,8 +37,8 @@ are left out.
 
 %prep
 %setup -q -n PortMaster-GUI-%{commit}
-sed -i 's|^from certifi import where$|def where():\n    return "/etc/pki/tls/certs/ca-bundle.crt"|' PortMaster/exlibs/requests/certs.py
-grep -qx '    return "/etc/pki/tls/certs/ca-bundle.crt"' PortMaster/exlibs/requests/certs.py
+sed -i 's|^from certifi import where$|def where():\n    return "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem"|' PortMaster/exlibs/requests/certs.py
+grep -qx '    return "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem"' PortMaster/exlibs/requests/certs.py
 
 %install
 pm=%{buildroot}%{pmroot}/PortMaster
