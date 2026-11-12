@@ -7,6 +7,9 @@
     <allowTearing>no</allowTearing>
     <xwaylandPersistence>no</xwaylandPersistence>
   </core>
+  <theme>
+    <maximizedDecoration>none</maximizedDecoration>
+  </theme>
   <focus>
     <followMouse>no</followMouse>
     <raiseOnFocus>no</raiseOnFocus>

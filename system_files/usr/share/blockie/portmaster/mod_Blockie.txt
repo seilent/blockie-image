@@ -67,6 +67,12 @@ if [[ "${0##*/}" == westonwrap*.sh ]]; then
   export SEATD_VTBOUND=0
   export WRAPPED_LIBRARY_PATH_MALI="$(_blockie_join "${WRAPPED_LIBRARY_PATH_MALI-}" "${BLOCKIE_GPULIB-}" "$BLOCKIE_PORTS_COMPAT")"
   export LD_LIBRARY_PATH="$(_blockie_join "${LD_LIBRARY_PATH-}" "${BLOCKIE_GPULIB-}" "$BLOCKIE_PORTS_COMPAT")"
+  BLOCKIE_WLEGL="$(cd -- "$(dirname -- "$0")" > /dev/null 2>&1 && pwd -P)/lib_aarch64/extra_wayland/libwayland-egl.so.1"
+  if [[ ${strace-} == *LD_PRELOAD=* ]]; then
+    strace="${strace/LD_PRELOAD=/"LD_PRELOAD=$BLOCKIE_WLEGL:"}"
+  else
+    export weston_preload="$(_blockie_join "$BLOCKIE_WLEGL" "${weston_preload-}")"
+  fi
   if [[ ${1-} != cleanup ]] && (( $# >= 5 )); then
     _blockie_xlocks
     _blockie_xwatch < /dev/null &

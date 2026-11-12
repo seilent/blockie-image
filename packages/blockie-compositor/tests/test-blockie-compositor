@@ -68,6 +68,7 @@ def text(path):
 check(root.tag == "labwc_config", "rc.xml root is labwc_config")
 check(text("core/allowTearing") == "no", "tearing is off")
 check(text("core/adaptiveSync") == "no", "adaptive sync is off")
+check(text("theme/maximizedDecoration") == "none", "maximized windows reserve no titlebar")
 binds = {b.get("key"): [(a.get("name"), a.get("command")) for a in b.findall("action")] for b in root.findall("keyboard/keybind")}
 check(len(root.findall("keyboard/keybind")) == len(binds) == 4, "four keybinds, one per key")
 check(binds.get("XF86Launch9") == [("None", None)], "one empty keybind, so no default keybinds")
