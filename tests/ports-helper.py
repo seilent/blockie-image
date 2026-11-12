@@ -339,6 +339,12 @@ def _(c):
     c(rc == 0, f"{lines}")
     cat = catalog()
     c(set(cat) == {"alpha.zip", "love.zip", "unk.zip", "zero.zip"}, f"names {sorted(cat)}")
+    db = sqlite3.connect(f"{STATE}/catalog.db")
+    try:
+        c(db.execute("PRAGMA user_version").fetchone()[0] == 1 and
+          db.execute("PRAGMA journal_mode").fetchone()[0] == "delete", "catalog.db user_version or journal mode")
+    finally:
+        db.close()
     c(any("hidden: 1 by requirements, 1 experimental" in x for x in LOG), f"log {LOG}")
     a = cat.get("alpha.zip", {})
     want = {"title": "Alpha", "genres": "action", "porter": "Invented Porter", "description": "line one\nline two",

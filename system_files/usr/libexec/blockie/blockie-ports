@@ -543,6 +543,8 @@ def write_catalog(hm):
     remove(tmp)
     db = sqlite3.connect(tmp)
     try:
+        db.execute("PRAGMA journal_mode=DELETE")
+        db.execute("PRAGMA user_version=1")
         db.execute("CREATE TABLE ports (name TEXT PRIMARY KEY, title TEXT, genres TEXT, porter TEXT, "
                    "description TEXT, inst TEXT, size INTEGER, availability TEXT, runtimes TEXT, "
                    "installed INTEGER, update_available INTEGER, screenshot TEXT, cover TEXT)")
