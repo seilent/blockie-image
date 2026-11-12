@@ -160,7 +160,7 @@ jq -e '. == {
   }}' /etc/containers/policy.json > /dev/null || fail "policy.json is not exactly the planned policy"
 [[ -s /usr/share/blockie/keys/blockie.pub ]] || fail "public key missing"
 grep -qx 'SystemMaxUse=200M' /usr/lib/systemd/journald.conf.d/50-blockie.conf || fail "journal size not capped"
-cmp -s <(printf '[Service]\nExecStart=\nExecStart=-udevadm trigger --type=devices --action=add --subsystem-match=input\nExecStart=-udevadm trigger --type=devices --action=add --subsystem-match=drm --subsystem-match=dma_heap\nExecStart=-udevadm trigger --type=devices --action=add --subsystem-match=misc --sysname-match=mali0\n') \
+cmp -s <(printf '[Service]\nExecStart=\nExecStart=-udevadm trigger --type=devices --action=add --subsystem-match=input\nExecStart=-udevadm trigger --type=devices --action=add --subsystem-match=drm --subsystem-match=dma_heap\nExecStart=-udevadm trigger --type=devices --action=add --subsystem-match=misc --sysname-match=mali0 --sysname-match=uinput\n') \
   /usr/lib/systemd/system/systemd-udev-trigger.service.d/50-blockie.conf || fail "coldplug drop-in"
 cmp -s <(printf '[zram0]\nzram-size = ram\ncompression-algorithm = zstd\nswap-priority = 100\n') \
   /usr/lib/systemd/zram-generator.conf || fail "zram-generator.conf"
