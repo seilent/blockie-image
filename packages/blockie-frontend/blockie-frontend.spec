@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 %global _build_id_links none
-%global commit 1f5e45b7b8660a0c4002f51027bddf9927df2597
-%global shortcommit 1f5e45b
+%global commit 1fd9e70a44956493e9c4dcec07ec3122ea8e2f17
+%global shortcommit 1fd9e70
 %global qrdir qrcodegen-720f62bd
 
 Name:           blockie-frontend
@@ -31,6 +31,8 @@ BuildRequires:  pkgconf-pkg-config
 BuildRequires:  libxkbcommon-devel
 BuildRequires:  libcurl-devel
 BuildRequires:  pkgconfig(dbus-1)
+BuildRequires:  turbojpeg-devel
+BuildRequires:  pkgconfig(libturbojpeg)
 BuildRequires:  unzip
 
 %description
@@ -81,6 +83,7 @@ BLOCKIE_FE_CACHE=$PWD/.fe-cache BLOCKIE_FE_OUT=$PWD/.fe-out BLOCKIE_FE_JOBS=%{_s
 %license LICENSE third-party/*
 %{_libexecdir}/blockie/blockie-frontend
 %{_libexecdir}/blockie/blockie-powermenu
+%{_libexecdir}/blockie/blockie-portmsg
 %{_userunitdir}/blockie-frontend.service
 %{_datadir}/blockie/fonts/
 %{_datadir}/blockie/schema.d/20-frontend.json

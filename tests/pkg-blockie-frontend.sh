@@ -10,7 +10,7 @@ rpms=("$out"/blockie-frontend-*.rpm)
 [[ $(rpm -qp --qf '%{NAME} %{ARCH}' "${rpms[0]}") == "blockie-frontend aarch64" ]] || fail "name or arch"
 lic=/usr/share/licenses/blockie-frontend
 fonts=/usr/share/blockie/fonts
-want=$(printf '%s\n' /usr/libexec/blockie/blockie-frontend /usr/libexec/blockie/blockie-powermenu /usr/lib/systemd/user/blockie-frontend.service "$fonts" \
+want=$(printf '%s\n' /usr/libexec/blockie/blockie-frontend /usr/libexec/blockie/blockie-powermenu /usr/libexec/blockie/blockie-portmsg /usr/lib/systemd/user/blockie-frontend.service "$fonts" \
   "$fonts/selawk.ttf" "$fonts/selawkb.ttf" "$fonts/selawkl.ttf" "$fonts/selawksl.ttf" /usr/share/blockie/schema.d/20-frontend.json "$lic/Selawik-LICENSE.txt" "$lic/sqlite-NOTICE" "$lic" "$lic/LICENSE" "$lic/fribidi-COPYING" "$lic/harfbuzz-COPYING" \
   "$lic/libspng-LICENSE" "$lic/qrcodegen.h" "$lic/stb_truetype.h" "$lic/zlib-LICENSE" "$lic/xdg-shell-NOTICE" "$lic/wlr-layer-shell-NOTICE" "$lic/presentation-time-NOTICE" | LC_ALL=C sort)
 [[ $(rpm -qpl "${rpms[0]}" | LC_ALL=C sort) == "$want" ]] || fail "file list: $(rpm -qpl "${rpms[0]}" | tr '\n' ' ')"
@@ -21,12 +21,15 @@ bin=$t/usr/libexec/blockie/blockie-frontend
 unit=$t/usr/lib/systemd/user/blockie-frontend.service
 modes=$(rpm -qp --qf '[%{FILEMODES:perms} %{FILENAMES}\n]' "${rpms[0]}")
 grep -qxF -- '-rwxr-xr-x /usr/libexec/blockie/blockie-frontend' <<< "$modes" || fail "binary mode"
+grep -qxF -- '-rwxr-xr-x /usr/libexec/blockie/blockie-portmsg' <<< "$modes" || fail "portmsg mode"
 grep -qxF -- '-rw-r--r-- /usr/lib/systemd/user/blockie-frontend.service' <<< "$modes" || fail "unit mode"
 grep -qx 'ExecStart=/usr/libexec/blockie/blockie-frontend' "$unit" || fail "unit ExecStart is not the binary"
 grep -qx 'Slice=blockie-emulation.slice' "$unit" || fail "unit is not in blockie-emulation.slice"
 ! grep -q '^\[Install\]' "$unit" || fail "unit has an [Install] section"
 [[ $(head -c 4 "$bin" | od -An -tx1 | tr -d ' \n') == 7f454c46 ]] || fail "blockie-frontend is not ELF"
 [[ $(od -An -tx1 -j18 -N2 "$bin" | tr -d ' \n') == b700 ]] || fail "blockie-frontend is not aarch64"
+pm=$t/usr/libexec/blockie/blockie-portmsg
+[[ $(head -c 4 "$pm" | od -An -tx1 | tr -d ' \n') == 7f454c46 && $(od -An -tx1 -j18 -N2 "$pm" | tr -d ' \n') == b700 ]] || fail "blockie-portmsg is not an aarch64 ELF"
 hdr=$(LC_ALL=C readelf -hW "$bin")
 dyn=$(LC_ALL=C readelf -dW "$bin")
 phdr=$(LC_ALL=C readelf -lW "$bin")
@@ -39,7 +42,7 @@ grep -Eq ' __[A-Za-z0-9_]+_chk(@| |$)' <<< "$syms" || fail "blockie-frontend has
 grep -q 'Additional permission under GNU GPL version 3 section 7' "$t$lic/LICENSE" || fail "LICENSE lacks the additional permission"
 reqs=$(rpm -qpR "${rpms[0]}")
 want_reqs=$(printf '%s\n' 'ld-linux-aarch64.so.1()(64bit)' 'libc.so.6()(64bit)' 'libcurl.so.4()(64bit)' 'libdbus-1.so.3()(64bit)' 'libgcc_s.so.1()(64bit)' \
-  'libm.so.6()(64bit)' 'libstdc++.so.6()(64bit)' 'libwayland-client.so.0()(64bit)' 'libxkbcommon.so.0()(64bit)' 'rtld(GNU_HASH)' |
+  'libm.so.6()(64bit)' 'libstdc++.so.6()(64bit)' 'libturbojpeg.so.0()(64bit)' 'libwayland-client.so.0()(64bit)' 'libxkbcommon.so.0()(64bit)' 'rtld(GNU_HASH)' |
   LC_ALL=C sort)
 got_reqs=$(awk '!/^rpmlib\(/ && !/^[^(]*\([^)]+\)\(64bit\)$/' <<< "$reqs" | LC_ALL=C sort)
 [[ $got_reqs == "$want_reqs" ]] || fail "requires: $(tr '\n' ' ' <<< "$got_reqs")"
