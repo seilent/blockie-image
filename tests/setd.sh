@@ -318,6 +318,11 @@ check([r["message"] for r in rules] == ["the session switcher needs a button",
       and all(r["keys"] == buttons for r in rules),
       f"R-switch and R-game load over the 8 keys: {rules}")
 check(not [line for line in logs if "rule" in line], f"the shipped rules load with no log: {logs}")
+clocks = keys["power.clocks"]
+check(clocks["type"] == "s" and clocks["default"] == "trip72-big1443"
+      and clocks["enum"] == ["trip72-big1443", "trip65", "trip72", "trip80"] and clocks["group"] == "power"
+      and clocks["label"] == "Clocks" and clocks["map"] is True,
+      f"power.clocks loads with its four ids, default trip72-big1443, group power, map true: {clocks}")
 
 
 def stored():
@@ -345,7 +350,7 @@ s = m.Store(keys, rules)
 s.publish()
 check(read("buttons") == default_map and oct(os.stat(os.path.join(run, "buttons")).st_mode & 0o777) == "0o644",
       f"the buttons map holds the defaults in 13 lines, 0644: {read('buttons')}")
-check(read("settings") == ["version 1"] + [f"{k} {defaults[k]}" for k in sorted(buttons)]
+check(read("settings") == ["version 1"] + [f"{k} {defaults[k]}" for k in sorted(buttons)] + ["power.clocks trip72-big1443"]
       and oct(os.stat(os.path.join(run, "settings")).st_mode & 0o777) == "0o644",
       f"the settings map holds every map key in sorted order with its effective value: {read('settings')}")
 check(refused(lambda: s.set("buttons.home.tap", "back"), "Invalid") and stored() is None, "an unknown word is Invalid")
@@ -386,6 +391,12 @@ check(s.reset(buttons) == ["buttons.extra1.hold", "buttons.extra3.tap", "buttons
 s.publish()
 check(read("buttons") == default_map, "after the full Reset the map holds the defaults again")
 check(not [f for f in os.listdir(run) if f.startswith(".")], "no temp file left in the map dir")
+check(refused(lambda: s.set("power.clocks", "trip90"), "Invalid") and s.get("power.clocks") == "trip72-big1443",
+      "power.clocks refuses an id outside its enum, the default stays")
+check(s.set("power.clocks", "trip80") and s.get("power.clocks") == "trip80", "power.clocks takes trip80")
+s.publish()
+check("power.clocks trip80" in read("settings") and "power.clocks trip72-big1443" not in read("settings"),
+      f"the settings map carries power.clocks after a Set: {read('settings')}")
 
 with open(store, "w") as f:
     json.dump({"buttons.home.hold": "none", "buttons.extra3.tap": "none", "buttons.extra2.tap": "switcher",
@@ -604,6 +615,17 @@ EOF
   [[ $r == 0 && $(bm) == "$dmap" && $(bc) == $((n + 2)) ]] &&
     ! grep -q '"buttons\.' "$t/store/settings.json" && ! ls -A "$t/run" | grep -q '^\.'
   res $? "bus: a reset of all 8 restores the default map, Changed for the two keys that changed, no temp file"
+  [[ $(grep -c '^power\.clocks ' "$t/run/settings") == 1 ]] && grep -qx 'power.clocks trip72-big1443' "$t/run/settings"
+  res $? "bus: the settings map holds power.clocks at its default trip72-big1443"
+  "$cli" set power.clocks trip65
+  r=$?
+  sleep 0.3
+  [[ $r == 0 && $("$cli" get power.clocks) == trip65 ]] && grep -qx 'power.clocks trip65' "$t/run/settings"
+  res $? "bus: blockie-set set power.clocks trip65 lands in the settings map"
+  "$cli" set power.clocks trip90 2> "$t/err"
+  [[ $? != 0 ]] && grep -q 'power.clocks is one of trip72-big1443, trip65, trip72, trip80' "$t/err" &&
+    grep -qx 'power.clocks trip65' "$t/run/settings"
+  res $? "bus: an id outside the enum is refused, the map keeps trip65"
 
   gg() {
     DBUS_SESSION_BUS_ADDRESS=$BLOCKIE_SETD_BUS gdbus call --session --dest net.seilent.Blockie.Settings \

@@ -52,7 +52,7 @@ sys.exit(0 if (k["type"] == "s" and k["default"] == "policy" and k["enum"] == ["
 PY
 res $? "schema: android.perf is a string, default policy, enum policy or off, group android, labelled Android performance"
 
-SCHED_BIN=$lx/blockie-android-sched RESTORE_BIN=$lx/blockie-android-sched-restore T=$t \
+SCHED_BIN=$lx/blockie-android-sched RESTORE_BIN=${RESTORE_BIN:-$lx/blockie-android-sched-restore} T=$t \
   timeout -k 10 600 python3 "$here/android-sched.py" > "$t/py.out" 2>&1
 rc=$?
 cat "$t/py.out"

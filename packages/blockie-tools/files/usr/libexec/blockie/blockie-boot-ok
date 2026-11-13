@@ -101,6 +101,13 @@ for u in $BLOCKIE_BOOT_OK_ACTIVE; do
 done
 for u in $BLOCKIE_BOOT_OK_NOT_EXIT1; do
   [[ $(systemctl show -p ExecMainStatus --value "$u") != 1 ]] || die "not confirmed: $u exited 1"
+  r=$(systemctl show -p Result --value "$u" || true)
+  case $r in
+    timeout | signal | core-dump | watchdog) die "not confirmed: $u ended with Result=$r" ;;
+  esac
+done
+for f in ${BLOCKIE_BOOT_OK_NO_FILE:-}; do
+  [[ ! -e $f ]] || die "not confirmed: $f exists"
 done
 
 if [[ $mode == ok && -e $product && $arm == default ]]; then

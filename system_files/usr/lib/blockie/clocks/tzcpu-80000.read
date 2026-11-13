@@ -1,0 +1,12 @@
+[tscpu_read]4
+trip_0=117000 0 mtktscpu-sysrst
+trip_1=95000 0 cpu00
+trip_2=85000 0 cpu03
+trip_3=80000 0 cpu_adaptive_0
+trip_4=63000 0 no-cooler
+trip_5=60000 0 no-cooler
+trip_6=55000 0 no-cooler
+trip_7=50000 0 no-cooler
+trip_8=45000 0 no-cooler
+trip_9=40000 0 no-cooler
+interval=40

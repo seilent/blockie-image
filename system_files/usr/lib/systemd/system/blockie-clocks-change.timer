@@ -1,0 +1,13 @@
+[Unit]
+Description=Apply a pending clocks profile once a minute
+After=blockie-clocks.service
+Requisite=blockie-clocks.service
+PartOf=blockie-clocks.service
+
+[Timer]
+OnActiveSec=60s
+OnUnitInactiveSec=60s
+Unit=blockie-clocks-change.service
+
+[Install]
+WantedBy=multi-user.target

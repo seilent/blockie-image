@@ -1,0 +1,12 @@
+[Unit]
+Description=Apply a changed clocks profile
+After=blockie-clocks.service
+Requisite=blockie-clocks.service
+PartOf=blockie-clocks.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+SuccessExitStatus=2
+ExecStart=/usr/libexec/blockie/blockie-clocks change
+TimeoutStartSec=60s

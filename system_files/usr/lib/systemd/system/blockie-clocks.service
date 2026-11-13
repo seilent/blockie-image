@@ -1,0 +1,17 @@
+[Unit]
+Description=Apply the clocks profile
+Wants=blockie-setd.service blockie-clocks-change.service
+After=blockie-setd.service
+Before=waydroid-container.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+SuccessExitStatus=2
+ExecStart=/usr/libexec/blockie/blockie-clocks apply
+ExecStop=/usr/libexec/blockie/blockie-clocks restore
+TimeoutStartSec=60s
+TimeoutStopSec=5s
+
+[Install]
+WantedBy=multi-user.target

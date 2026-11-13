@@ -1,0 +1,891 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+me=blockie-clocks
+root=${BLOCKIE_CLOCKS_ROOT:-}
+conf=$root/usr/lib/blockie/clocks.conf
+data=$root/usr/lib/blockie/clocks
+map=$root/run/blockie-set/settings
+run=$root/run/blockie-clocks
+state=$run/state
+writing=$run/writing
+zones=$run/zones
+failed=$run/failed
+kitfailed=$root/run/blockie-thermal-failed
+lock=$root/run/blockie-perf.lock
+cpufreq=$root/sys/devices/system/cpu/cpufreq
+upbound=$root/sys/kernel/ged/hal/custom_upbound_gpu_freq
+tzcpu=$root/proc/driver/thermal/tzcpu
+thermal=$root/sys/class/thermal
+modorder=$root/blockie/lib/modules.second
+pin_line_65000=65a437e8c13bd90ea81c6705132ef20de8c08c570f91ec622a6b9b0dc7f13e5c
+pin_line_72000=c816c0f41754076d816f4a657f70891fcefe83f9e8b8a88f1588c1d90f85ed64
+pin_line_80000=f615073360ae3e76d6e8bf0bec23719829e2af51f1d869ecf764cc52d3b7f22f
+pin_read_boot=f4b453ba263dc535de803067ee3f6cd3a34d42630a31863cbd8d6831ef4d378a
+pin_read_65000=2ce9bd9831a0ff96bfa0b238fc0c53393de23639c4d313397e7f43737690a401
+pin_read_72000=1fbceabd5f718da7339f73a9eb2b3bc790729dcf89591657d76b3c48815cf446
+pin_read_80000=2b8930731d6895afd25fcad857822ef91717cc6b7bd77a79756d182959315ef6
+knobs="policy6 policy0 upbound"
+
+declare -A trip=() cap=() top=() low=() avail=() now=()
+ids=()
+default=
+W=
+L=
+caps=
+fp=
+z=
+RV=
+why=
+tzwhy=
+wmsg=
+res=
+pwhy=
+mode=
+
+log() {
+  echo "$me: $*"
+}
+
+rd() {
+  local v=
+  { read -r v < "$1"; } 2> /dev/null
+  printf '%s' "$v"
+}
+
+rdv() {
+  RV=
+  { read -r RV < "$1"; } 2> /dev/null
+}
+
+num() {
+  [[ $1 =~ ^[0-9]+$ ]]
+}
+
+sum() {
+  local s
+  s=$(sha256sum 2> /dev/null < "$1") || return 1
+  printf '%s' "${s%% *}"
+}
+
+node() {
+  case $1 in
+    policy0 | policy6) printf '%s' "$cpufreq/$1/scaling_max_freq" ;;
+    upbound) printf '%s' "$upbound" ;;
+  esac
+}
+
+above() {
+  if [[ $1 == upbound ]]; then
+    (( $3 != 0 && ($2 == 0 || $2 < $3) ))
+  else
+    (( $2 > $3 ))
+  fi
+}
+
+linepin() {
+  local n=pin_line_$1
+  [[ $(sum "$data/trip-$1.line") == "${!n}" ]]
+}
+
+load() {
+  local line sec= k v n=0 p f s
+  if [[ ! -r $conf ]]; then
+    why="no $conf"
+    return 1
+  fi
+  while IFS= read -r line || [[ -n $line ]]; do
+    n=$((n + 1))
+    [[ -n $line ]] || continue
+    if [[ $line =~ ^\[([a-z0-9][a-z0-9-]*)\]$ ]]; then
+      sec=${BASH_REMATCH[1]}
+      if [[ -n ${trip[$sec]+x} ]]; then
+        why="line $n: [$sec] twice"
+        return 1
+      fi
+      ids+=("$sec")
+      trip[$sec]=
+    elif [[ $line =~ ^([a-z0-9]+)=([^[:space:]]*)$ ]]; then
+      k=${BASH_REMATCH[1]}
+      v=${BASH_REMATCH[2]}
+      case $sec:$k in
+        :default) default=$v ;;
+        ?*:trip) trip[$sec]=$v ;;
+        ?*:policy0 | ?*:policy6 | ?*:upbound) cap[$sec:$k]=$v ;;
+        *)
+          why="line $n: $k is not a key here"
+          return 1
+          ;;
+      esac
+    else
+      why="line $n is not understood"
+      return 1
+    fi
+  done < "$conf"
+  for p in policy0 policy6; do
+    top[$p]=$(rd "$cpufreq/$p/cpuinfo_max_freq")
+    if ! num "${top[$p]}"; then
+      why="$p cpuinfo_max_freq reads '${top[$p]}'"
+      return 1
+    fi
+    avail[$p]=" $(rd "$cpufreq/$p/scaling_available_frequencies") "
+    low[$p]=
+    for f in ${avail[$p]}; do
+      if ! num "$f"; then
+        why="$p scaling_available_frequencies holds '$f'"
+        return 1
+      fi
+      [[ -n ${low[$p]} ]] && (( f >= ${low[$p]} )) || low[$p]=$f
+    done
+    if [[ -z ${low[$p]} ]]; then
+      why="$p has no available frequencies"
+      return 1
+    fi
+  done
+  top[upbound]=0
+  if [[ -z $default || -z ${trip[$default]+x} ]]; then
+    why="the default '$default' names no profile"
+    return 1
+  fi
+  for s in "${ids[@]}"; do
+    v=${trip[$s]}
+    case $v in
+      65000 | 72000 | 80000) ;;
+      *)
+        why="[$s] trip '$v' is not one of 65000, 72000, 80000"
+        return 1
+        ;;
+    esac
+    if ! linepin "$v"; then
+      why="[$s] trip-$v.line does not hash to its pin"
+      return 1
+    fi
+    for p in policy0 policy6; do
+      [[ -n ${cap[$s:$p]+x} ]] || continue
+      v=${cap[$s:$p]}
+      if ! num "$v" || (( v > ${top[$p]} )) || [[ ${avail[$p]} != *" $v "* ]]; then
+        why="[$s] $p=$v is not a step of $p at or under ${top[$p]}"
+        return 1
+      fi
+    done
+    v=${cap[$s:upbound]:-0}
+    if ! num "$v" || (( v > 29 )); then
+      why="[$s] upbound=$v is not a GED index 0 to 29"
+      return 1
+    fi
+  done
+}
+
+want() {
+  local k v first= r
+  W=
+  {
+    read -r first
+    while read -r k v; do
+      [[ $k != power.clocks ]] || W=$v
+    done
+  } 2> /dev/null < "$map"
+  if [[ $first != "version 1" ]]; then
+    r="no settings map at $map"
+  elif [[ -z $W ]]; then
+    r="no power.clocks line in $map"
+  elif [[ -z ${trip[$W]+x} ]]; then
+    r="power.clocks $W is not in $conf"
+  else
+    return 0
+  fi
+  W=$default
+  if [[ $(rd "$run/fallback") != "$r" ]]; then
+    log "$r, $default applies"
+    printf '%s\n' "$r" > "$run/fallback"
+  fi
+}
+
+unrefuse() {
+  local v
+  [[ -e $run/refused ]] || return 0
+  v=$(rd "$run/refused")
+  [[ $v != "$W" ]] || return 0
+  rm -f "$run/refused"
+  log "the trip of $v may be written again: power.clocks reads $W"
+}
+
+refused() {
+  [[ -f $run/refused && $(rd "$run/refused") == "$W" ]]
+}
+
+refuse() {
+  printf '%s\n' "$W" > "$run/refused" && chmod 0644 "$run/refused"
+  log "trip ${trip[$W]} refused for $W: no trip write for it until power.clocks changes or the next boot"
+}
+
+wv() {
+  printf '%s' "${cap[$W:$1]:-${top[$1]}}"
+}
+
+fv() {
+  if [[ -n $caps && -n ${trip[$caps]+x} ]]; then
+    printf '%s' "${cap[$caps:$1]:-${top[$1]}}"
+  else
+    printf '%s' "${top[$1]}"
+  fi
+}
+
+lowers() {
+  [[ -n ${cap[$W:$1]+x} && ${cap[$W:$1]} != "${top[$1]}" ]]
+}
+
+reads() {
+  local k s l2=
+  caps=
+  { read -r _; read -r l2; } 2> /dev/null < "$state"
+  [[ $l2 != "caps "* ]] || caps=${l2#caps }
+  for k in $knobs; do
+    now[$k]=$(rd "$(node "$k")")
+  done
+  L=
+  fp=
+  tzwhy="tzcpu matches no pinned read"
+  [[ -e $tzcpu ]] || tzwhy="no $tzcpu"
+  s=$(head -n 12 "$tzcpu" 2> /dev/null | sha256sum)
+  case ${s%% *} in
+    "$pin_read_boot" | "$pin_read_65000") L=65000 ;;
+    "$pin_read_72000") L=72000 ;;
+    "$pin_read_80000") L=80000 ;;
+  esac
+}
+
+capsneed() {
+  local k
+  if [[ $caps != "$W" ]]; then
+    why="caps ${caps:-none}, want $W"
+    return 0
+  fi
+  for k in $knobs; do
+    if ! num "${now[$k]}"; then
+      why="$k reads '${now[$k]}'"
+      return 0
+    fi
+    if above "$k" "${now[$k]}" "$(wv "$k")"; then
+      why="$k reads ${now[$k]}, over $(wv "$k")"
+      return 0
+    fi
+  done
+  return 1
+}
+
+lowdue() {
+  local k
+  for k in $knobs; do
+    ! lowers "$k" || return 0
+  done
+  return 1
+}
+
+raisesdone() {
+  local k
+  for k in $knobs; do
+    ! lowers "$k" || continue
+    if [[ ${now[$k]} != "${top[$k]}" ]]; then
+      why="$k reads ${now[$k]:-nothing}, under ${top[$k]}"
+      return 1
+    fi
+  done
+  curzero
+}
+
+curzero() {
+  local c
+  for c in "$thermal"/cooling_device*; do
+    rdv "$c/cur_state"
+    if [[ $RV != 0 ]]; then
+      why="${c##*/} cur_state ${RV:-unread}"
+      return 1
+    fi
+  done
+}
+
+zone() {
+  local d n=0
+  z=
+  for d in "$thermal"/thermal_zone*; do
+    rdv "$d/type"
+    [[ $RV == mtktscpu ]] || continue
+    z=$d
+    n=$((n + 1))
+  done
+  if (( n != 1 )); then
+    why="$n mtktscpu zones"
+    return 1
+  fi
+}
+
+ztypes() {
+  local d
+  for d in "$thermal"/thermal_zone*; do
+    rdv "$d/type"
+    printf '%s\n' "$RV"
+  done | LC_ALL=C sort
+}
+
+cool() {
+  local lim=$(( ($1 < $2 ? $1 : $2) - 5000 ))
+  zone || return 1
+  rdv "$z/temp"
+  if ! num "$RV" || (( RV > lim )); then
+    why="mtktscpu ${RV:-unread}, the trip write wants $lim or under"
+    return 1
+  fi
+}
+
+zoneok() {
+  local -a f got=() need
+  local i e
+  read -r -a f 2> /dev/null < "$data/trip-$1.line"
+  if (( ${#f[@]} != 32 )); then
+    why="trip-$1.line is not 32 fields"
+    return 1
+  fi
+  zone || return 1
+  for i in 0 1 2 3; do
+    rdv "$z/trip_point_${i}_temp"
+    if [[ $RV != "${f[1 + 3 * i]}" ]]; then
+      why="trip_point_${i}_temp ${RV:-unread}, want ${f[1 + 3 * i]}"
+      return 1
+    fi
+    rdv "$z/trip_point_${i}_type"
+    if [[ $RV != active ]]; then
+      why="trip_point_${i}_type ${RV:-unread}, want active"
+      return 1
+    fi
+  done
+  if [[ -e $z/trip_point_4_temp ]]; then
+    why="a trip_point_4 on the zone"
+    return 1
+  fi
+  for e in "$z"/cdev*; do
+    [[ ${e##*/} =~ ^cdev[0-9]+$ ]] || continue
+    rdv "$e/type"
+    i=$RV
+    rdv "${e}_trip_point"
+    got+=("$i $RV")
+  done
+  need=("${f[3]} 0" "${f[6]} 1" "${f[9]} 2" "${f[12]} 3")
+  if [[ $(printf '%s\n' "${got[@]}" | LC_ALL=C sort) != "$(printf '%s\n' "${need[@]}" | LC_ALL=C sort)" ]]; then
+    why="links $(printf '[%s]' "${got[@]}")"
+    return 1
+  fi
+}
+
+accept() {
+  local s n=pin_read_$1
+  if [[ $(ztypes) != "$(cat "$zones" 2> /dev/null)" ]]; then
+    why="the zone types differ from before the write"
+    return 1
+  fi
+  s=$(head -n 12 "$tzcpu" 2> /dev/null | sha256sum)
+  s=${s%% *}
+  if [[ $s != "${!n}" && ( $1 != 65000 || $s != "$pin_read_boot" ) ]]; then
+    why="tzcpu does not read the $1 form"
+    return 1
+  fi
+  zoneok "$1" && curzero
+}
+
+modok() {
+  local magic v stage set k o
+  if [[ ! -r $modorder ]]; then
+    why="module order: no $modorder"
+    return 1
+  fi
+  {
+    read -r magic v stage set _
+    if [[ $magic != blockie-modorder ]]; then
+      why="module order: magic '$magic'"
+      return 1
+    fi
+    if [[ $v != 1 ]]; then
+      why="module order: version '$v'"
+      return 1
+    fi
+    if [[ $stage != second ]]; then
+      why="module order: stage '$stage'"
+      return 1
+    fi
+    case $set in
+      v01 | v02) ;;
+      *)
+        why="module order: set '$set'"
+        return 1
+        ;;
+    esac
+    while read -r k o; do
+      [[ $k != thermal_monitor.ko && $k != */thermal_monitor.ko ]] || return 0
+    done
+  } < "$modorder"
+  why="module order: no thermal_monitor.ko line"
+  return 1
+}
+
+fproven() {
+  if [[ -z $fp ]]; then
+    fp=1
+    if [[ -z $L ]]; then
+      why="trip unknown: $tzwhy"
+    elif ! modok; then
+      :
+    elif zoneok "$L"; then
+      fp=0
+    fi
+  fi
+  return "$fp"
+}
+
+wr() {
+  local e r b x
+  e=$(printf '%s' "$2" | LC_ALL=C dd of="$1" bs=4096 count=1 iflag=fullblock conv=nocreat 2>&1)
+  r=$?
+  b=$(sed -n 's/^\([0-9][0-9]*\) bytes\{0,1\} .*/\1/p' <<< "$e" | head -n 1)
+  x=$(grep -m 1 '^dd: ' <<< "$e")
+  wmsg="rc $r bytes ${b:-unread} of ${#2}${x:+: $x}"
+  [[ $r == 0 && $b == "${#2}" ]]
+}
+
+twr() {
+  local f=$data/trip-$1.line e r b x s
+  if ! linepin "$1"; then
+    wmsg="trip-$1.line does not hash to its pin"
+    return 1
+  fi
+  s=$(($(wc -c < "$f")))
+  e=$(LC_ALL=C dd if="$f" of="$tzcpu" bs=4096 count=1 conv=nocreat 2>&1)
+  r=$?
+  b=$(sed -n 's/^\([0-9][0-9]*\) bytes\{0,1\} .*/\1/p' <<< "$e" | head -n 1)
+  x=$(grep -m 1 '^dd: ' <<< "$e")
+  wmsg="rc $r bytes ${b:-unread} of $s${x:+: $x}"
+  [[ $r == 0 && $b == "$s" ]]
+}
+
+capw() {
+  local n i=0
+  n=$(node "$1")
+  wrote+=("$1")
+  if ! wr "$n" "$2"; then
+    pwhy="$1 $2: write failed ($wmsg)"
+    log "$pwhy"
+    return 1
+  fi
+  while :; do
+    rdv "$n"
+    if num "$RV" && ! above "$1" "$RV" "$2"; then
+      log "$1 $2 written, reads $RV$( (( i == 0 )) || echo " after $((i * 100)) ms")"
+      return 0
+    fi
+    (( i < 10 )) || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  pwhy="$1 $2 written, reads ${RV:-nothing} after 1 s"
+  log "$pwhy"
+  return 1
+}
+
+undo() {
+  local i k v
+  for (( i = ${#wrote[@]} - 1; i >= 0; i-- )); do
+    k=${wrote[i]}
+    v=$(fv "$k")
+    if wr "$(node "$k")" "$v"; then
+      log "$k back to $v"
+    else
+      log "$k back to $v: write failed ($wmsg)"
+    fi
+  done
+}
+
+mark() {
+  printf '%s %s\n' "$1" "$2" > "$writing.new" && chmod 0644 "$writing.new" && mv -f "$writing.new" "$writing"
+}
+
+savezones() {
+  ztypes > "$zones.new" && chmod 0644 "$zones.new" && mv -f "$zones.new" "$zones"
+}
+
+await() {
+  local i
+  for i in 1 2 3 4 5 6 7; do
+    sleep 1
+    if accept "$1"; then
+      log "trip $1 accepted on try $i"
+      return 0
+    fi
+  done
+  log "trip $1 not accepted after 7 tries: $why"
+  return 1
+}
+
+lowest() {
+  local p
+  for p in policy0 policy6; do
+    if wr "$(node "$p")" "${low[$p]}"; then
+      log "$p at its lowest step ${low[$p]}, reads $(rd "$(node "$p")")"
+    else
+      log "$p at its lowest step ${low[$p]}: write failed ($wmsg)"
+    fi
+  done
+  { : > "$failed" && chmod 0644 "$failed"; } 2> /dev/null
+  if [[ -f $failed ]]; then
+    rm -f "$writing"
+  fi
+  systemctl --no-block stop blockie-clocks-change.timer blockie-clocks.path
+  if [[ -f $failed ]]; then
+    log "trip failed: both policies at their lowest steps until the reboot, $failed made"
+  else
+    log "trip failed: both policies at their lowest steps, $failed could not be made, $writing stays"
+  fi
+}
+
+refall() {
+  mark "$1" "$1"
+  if twr "$1"; then
+    log "trip $1 written again ($wmsg)"
+  else
+    log "trip $1 written again: refused ($wmsg)"
+  fi
+  if await "$1"; then
+    rm -f "$writing"
+    L=$1
+    fp=0
+    pwhy="trip back at $1"
+    return 2
+  fi
+  lowest
+  return 1
+}
+
+tripstep() {
+  local f=$L
+  if refused; then
+    pwhy="trip $1 refused this boot for $W (its acceptance failed)"
+    return 1
+  fi
+  if ! fproven || ! curzero || ! cool "$f" "$1"; then
+    pwhy="trip $1 waits: $why"
+    ! fproven || hot=yes
+    log "$pwhy"
+    return 1
+  fi
+  if ! savezones || ! mark "$1" "$f"; then
+    pwhy="trip $1 waits: $zones or $writing cannot be written"
+    log "$pwhy"
+    return 1
+  fi
+  if twr "$1"; then
+    log "trip $1 written over $f ($wmsg)"
+    if await "$1"; then
+      rm -f "$writing"
+      L=$1
+      fp=0
+      return 0
+    fi
+  else
+    log "trip $1 write refused ($wmsg)"
+  fi
+  refall "$f"
+  if (( $? == 2 )); then
+    refuse
+    return 2
+  fi
+  return 3
+}
+
+step3() {
+  local k cz= all=yes
+  ! curzero || cz=yes
+  for k in $knobs; do
+    ! lowers "$k" || continue
+    [[ $cz != yes || ${now[$k]} != "${top[$k]}" ]] || continue
+    if fproven; then
+      capw "$k" "${top[$k]}" || return 1
+    else
+      all=
+      pwhy="$k at ${now[$k]:-unread} waits for its raise: $why"
+    fi
+  done
+  [[ -z $all ]] || caps=$W
+}
+
+sequence() {
+  local k x=${trip[$W]} cn= hot= wrote=()
+  res=pending
+  pwhy=
+  ! capsneed || cn=yes
+  if [[ $cn == yes ]]; then
+    for k in $knobs; do
+      lowers "$k" || continue
+      if ! capw "$k" "${cap[$W:$k]}"; then
+        undo
+        return 2
+      fi
+    done
+  fi
+  if [[ -z $L ]]; then
+    pwhy="trip unknown: $tzwhy"
+  elif (( x < L )); then
+    tripstep "$x"
+    case $? in
+      2) return 2 ;;
+      3)
+        res=failed
+        return 1
+        ;;
+    esac
+  fi
+  if [[ $cn == yes ]] && ! step3; then
+    undo
+    return 2
+  fi
+  if [[ -n $L ]] && (( x > L )); then
+    tripstep "$x"
+    case $? in
+      2) return 2 ;;
+      3)
+        res=failed
+        return 1
+        ;;
+    esac
+  fi
+  if [[ $caps == "$W" && $L == "$x" ]]; then
+    res=applied
+    return 0
+  fi
+  [[ $mode != apply || $hot != yes ]] || res=deferred
+  return 2
+}
+
+locked() {
+  local a= b=
+  res=pending
+  pwhy=
+  if [[ -e $writing ]]; then
+    read -r a b _ 2> /dev/null < "$writing"
+    log "found $writing reading '$a $b'"
+    case $a in
+      65000 | 72000 | 80000) ;;
+      *) a= ;;
+    esac
+    case $b in
+      65000 | 72000 | 80000) ;;
+      *) b=65000 ;;
+    esac
+    if [[ -n $a ]] && await "$a"; then
+      rm -f "$writing"
+    else
+      reads
+      refall "$b"
+      if (( $? == 2 )); then
+        [[ $a != "${trip[$W]}" ]] || refuse
+        res=pending
+        return 2
+      fi
+      res=failed
+      return 1
+    fi
+  fi
+  reads
+  sequence
+}
+
+settle() {
+  local s=$1 t
+  [[ $1 == failed ]] || s="$1 $W"
+  [[ -z $caps ]] || s+=$'\n'"caps $caps"
+  [[ $(cat "$state" 2> /dev/null) != "$s" ]] || return 0
+  t=$(mktemp "$state.XXXXXX") || return 1
+  printf '%s\n' "$s" > "$t"
+  chmod 0644 "$t"
+  mv -f "$t" "$state"
+  case $1 in
+    applied) log "applied $W p0max=$(rd "$(node policy0)") p6max=$(rd "$(node policy6)") upbound=$(rd "$upbound") trip3=$L" ;;
+    failed) log "failed" ;;
+    *) log "$1 $W${2:+: $2}" ;;
+  esac
+}
+
+grab() {
+  [[ -e $lock ]] || (umask 077 && : >> "$lock")
+  exec 9>> "$lock" || return 1
+  if ! flock -w 10 9; then
+    exec 9>&-
+    return 1
+  fi
+}
+
+refail() {
+  if [[ -e $failed || -e $kitfailed ]]; then
+    log "a failure file appeared while the pass waited for the perf lock, nothing written until the reboot"
+    exit 1
+  fi
+}
+
+prologue() {
+  if ! install -d -m 0755 "$run"; then
+    log "cannot make $run, nothing written"
+    exit 2
+  fi
+  if [[ -e $failed ]]; then
+    log "$failed exists, nothing written until the reboot"
+    exit 1
+  fi
+  if [[ -e $kitfailed ]]; then
+    log "$kitfailed exists, nothing written until the reboot"
+    exit 1
+  fi
+}
+
+nodes() {
+  local p f
+  for p in policy0 policy6; do
+    for f in scaling_max_freq cpuinfo_max_freq scaling_available_frequencies; do
+      if [[ ! -e $cpufreq/$p/$f ]]; then
+        why=$cpufreq/$p/$f
+        return 1
+      fi
+    done
+  done
+  if [[ ! -e $upbound ]]; then
+    why=$upbound
+    return 1
+  fi
+}
+
+apply() {
+  local i=0 rc
+  mode=apply
+  prologue
+  if ! grab; then
+    log "$lock is held, nothing written"
+    exit 2
+  fi
+  refail
+  until nodes; do
+    if (( i == 10 )); then
+      log "$why missing after 10 s, nothing written"
+      exit 2
+    fi
+    sleep 1
+    i=$((i + 1))
+  done
+  if ! load; then
+    log "$conf: $why, nothing written"
+    exit 2
+  fi
+  want
+  unrefuse
+  locked
+  rc=$?
+  exec 9>&-
+  settle "$res" "$pwhy"
+  exit "$rc"
+}
+
+change() {
+  local rc t0 w x go
+  mode=change
+  prologue
+  if ! load; then
+    log "$conf: $why, nothing written"
+    exit 2
+  fi
+  while :; do
+    want
+    unrefuse
+    reads
+    res=pending
+    go=
+    if [[ -e $writing ]]; then
+      go=yes
+    elif capsneed; then
+      if lowdue; then
+        go=yes
+      elif raisesdone; then
+        caps=$W
+      elif fproven; then
+        go=yes
+      else
+        settle pending "a raise waits, F unproven: $why"
+        exit 2
+      fi
+    fi
+    if [[ -z $go ]]; then
+      x=${trip[$W]}
+      if [[ -z $L ]]; then
+        settle pending "trip unknown: $tzwhy"
+        exit 2
+      elif [[ $L == "$x" ]]; then
+        settle applied
+        exit 0
+      elif refused; then
+        settle pending "trip $x refused this boot for $W (its acceptance failed)"
+        exit 2
+      elif ! curzero || ! cool "$L" "$x" || ! fproven; then
+        settle pending "trip $x waits: $why"
+        exit 2
+      fi
+    fi
+    if ! grab; then
+      settle pending "$lock is held"
+      exit 2
+    fi
+    refail
+    t0=${EPOCHREALTIME//[!0-9]/}
+    locked
+    rc=$?
+    exec 9>&-
+    log "the perf lock held $(((${EPOCHREALTIME//[!0-9]/} - t0) / 1000)) ms"
+    settle "$res" "$pwhy"
+    (( rc != 1 )) || exit 1
+    w=$W
+    want
+    [[ $W != "$w" ]] || exit "$rc"
+    log "power.clocks reads $W after the pass for $w, once more"
+  done
+}
+
+restore() {
+  local p v rc=0
+  if [[ -e $failed || -e $kitfailed ]]; then
+    log "a failure file exists, the lowest steps stay until the reboot"
+    exit 0
+  fi
+  for p in policy6 policy0; do
+    v=$(rd "$cpufreq/$p/cpuinfo_max_freq")
+    if ! num "$v"; then
+      log "$p cpuinfo_max_freq reads '$v', not restored"
+      rc=1
+    elif wr "$(node "$p")" "$v"; then
+      log "$p back to $v"
+    else
+      log "$p back to $v: write failed ($wmsg)"
+      rc=1
+    fi
+  done
+  if wr "$upbound" 0; then
+    log "upbound back to 0"
+  else
+    log "upbound back to 0: write failed ($wmsg)"
+    rc=1
+  fi
+  exit "$rc"
+}
+
+case $#:${1:-} in
+  1:apply) apply ;;
+  1:change) change ;;
+  1:restore) restore ;;
+  1:status) cat "$state" 2> /dev/null ;;
+  *)
+    echo "usage: $me apply | change | restore | status" >&2
+    exit 2
+    ;;
+esac
