@@ -250,7 +250,7 @@ jobs:
             esac
             return "$rc"
           }
-          for t in image units blobs audio wifi bt boot-ok clocks bootctl data session hotkeyd power game game-cmd ports ports-helper ports-steam android android-sched; do
+          for t in image units blobs audio wifi bt boot-ok clocks bootctl data session hotkeyd power game game-cmd ports ports-helper ports-steam steam-lib android android-sched; do
             suite podman run --rm -v "$PWD/tests:/tests:ro" -v "$PWD/boot:/repo-boot:ro" "$IMAGE:$TAG" "/tests/$t.sh"
           done
           t=westonpack

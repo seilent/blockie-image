@@ -2,6 +2,8 @@
 import contextlib
 import errno
 import fcntl
+import functools
+import gzip
 import hashlib
 import json
 import os
@@ -14,6 +16,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import zipfile
@@ -103,6 +106,55 @@ QR_URL = re.compile(r"https://[\x21-\x7e]{1,504}")
 STEAM_CMDS = ("steam-get", "steam-logout")
 STEAM_TSV_CMDS = ("sync", "refresh", "index", "install", "update", "uninstall") + STEAM_CMDS
 LINE_MAX = 1 << 16
+STEAM_LIB_USR = os.environ.get("BLOCKIE_PORTS_STEAM_LIB", "/usr/share/blockie/steam")
+ENGINES = os.path.join(STEAM_LIB_USR, "engines.tsv")
+CORRECTIONS = os.path.join(STEAM_LIB_USR, "corrections.tsv")
+RUNNERS = os.path.join(STEAM_LIB_USR, "runners.d")
+LIB_DIR = os.path.join(STEAM_DL, "lib")
+LIB_TSV = os.path.join(LIB_DIR, "library.tsv")
+LIB_SCAN = os.path.join(LIB_DIR, "scan")
+SCANFAIL = os.path.join(LIB_DIR, "scanfail.tsv")
+LOGINS = os.path.join(LIB_DIR, "logins.tsv")
+GAMES = os.path.join(DATA, "steam-games")
+GAMES_STATE = os.path.join(GAMES, ".blockie")
+CLASSES_TSV = os.path.join(GAMES_STATE, "classes.tsv")
+GAMES_TSV = os.path.join(GAMES_STATE, "library.tsv")
+DLCDROP = os.path.join(GAMES_STATE, "dlcdrop.tsv")
+LIB_OSES = ("windows", "linux")
+LIB_TYPES = ("game", "demo")
+ENGINE_HEAD = ["class", "os", "match", "root", "deny", "deny_status"]
+CORRECTION_HEAD = ["app", "gid", "class"]
+CLASS = re.compile(r"[a-z0-9][a-z0-9-]*")
+WORD = re.compile(r"[A-Za-z][A-Za-z0-9_-]*")
+LANG = re.compile(r"[a-z][a-z_-]*")
+TOKEN = re.compile(r"[A-Za-z0-9_-]+")
+OSLIST = re.compile(r"[A-Za-z0-9_-]+(?:,[A-Za-z0-9_-]+)*")
+PATTERN = re.compile(r"[A-Za-z0-9_.*% -]+(?:/[A-Za-z0-9_.*% -]+)*/?")
+SHA256 = re.compile(r"[0-9a-f]{64}")
+RESULT = re.compile(r"-|[a-z]+")
+SCANFAIL_KINDS = ("owned", "network", "rate", "other")
+LOGIN_OPS = ("library", "scan", "pass", "get")
+BACKOFF_S = 600
+BACKOFF_MAX_S = 86400
+LIBRARY_S = 600
+LOGINS_KEEP = 64
+PATHS_MAX = 64 << 20
+LIBRARY_MAX = 64 << 20
+RUN_BOUND_S = 6 * 3600
+ARCHES = ("32", "64")
+LIB_INST = "lib"
+LIB_OPS = ("library", "scan")
+LIB_KINDS = ("app", "owned", "lang", "depot", "art")
+SCAN_APPS = 40
+SCAN_S = float(os.environ.get("BLOCKIE_PORTS_STEAM_SCAN_S", "120"))
+LIBRARY_RUN_S = float(os.environ.get("BLOCKIE_PORTS_STEAM_LIBRARY_S", "300"))
+ART = os.path.join(GAMES_STATE, "art")
+ART_TSV = os.path.join(GAMES_STATE, "art.tsv")
+ART_URL = "https://shared.steamstatic.com/store_item_assets/steam/apps/{}/{}"
+ART_PATH = re.compile(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*")
+ART_MAX = 50
+ART_BYTES = 4 << 20
+CURL = os.environ.get("BLOCKIE_PORTS_CURL", "curl")
 
 
 class Fail(Exception):
@@ -241,8 +293,8 @@ def scope_active():
         return False
 
 
-def open_lock(path):
-    return os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o644)
+def open_lock(path, mode=0o644):
+    return os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, mode)
 
 
 def helper_lock(proto, wait):
@@ -1438,6 +1490,10 @@ def idle_release(hold):
     remove(INHIBIT_PID)
 
 
+def owned_depot(f):
+    return len(f) == 4 and f[1:3] == ["owned", "depot"] and bool(DIGITS.fullmatch(f[3]))
+
+
 class Run:
     def __init__(self):
         self.end = False
@@ -1471,12 +1527,14 @@ def open_fifo(inst):
     return None
 
 
-def steam_dd(proto, op, name, login, paths=None, total=None):
+def steam_dd(proto, op, name, login, paths=None, total=None, extra=None, on_line=None):
     inst = name
     run = Run()
-    req = request(inst, {"op": op, "port": name, "login": login, "paths": paths})
+    req = request(inst, {"op": op, "port": name, "login": login, "paths": paths, **(extra or {})})
     qr_run = op == "pass" and login == "qr"
-    proto.progress("login" if qr_run else "check" if op == "pass" else "download", 0, total)
+    stall = max(STALL_S, (SCAN_S if op == "scan" else LIBRARY_RUN_S) + 30) if op in LIB_OPS else STALL_S
+    if op in ("pass", "get"):
+        proto.progress("login" if qr_run else "check" if op == "pass" else "download", 0, total)
     t0 = time.monotonic()
     first = None
     if systemctl("start", UNIT.format(inst), timeout=60) != 0:
@@ -1549,8 +1607,10 @@ def steam_dd(proto, op, name, login, paths=None, total=None):
                         proto.progress("download", min(int(f[1]), total or 0), total)
                     elif kind == "end" and len(f) == 1:
                         run.end = True
-                    elif kind == "fail" and len(f) in (2, 3):
+                    elif kind == "fail" and (len(f) in (2, 3) or owned_depot(f)):
                         run.fail = run.fail or " ".join(f[1:])
+                    elif kind in ("scan", "scanned", "scanfail") and on_line is not None:
+                        on_line(f)
                     elif kind == "rc" and len(f) == 2 and re.fullmatch(r"-?[0-9]+", f[1]):
                         run.rc = int(f[1])
                         peak = systemctl("show", "-p", "MemoryPeak", "--value", UNIT.format(inst), timeout=10, out=True)
@@ -1585,7 +1645,7 @@ def steam_dd(proto, op, name, login, paths=None, total=None):
                 run.stopped = "cancel"
             elif signing and qr_at is not None and now - qr_at >= LOGIN_S:
                 run.stopped = "expired"
-            elif not (signing and qr_at is not None) and now - changed >= STALL_S:
+            elif not (signing and qr_at is not None) and now - changed >= stall:
                 run.stopped = "network"
             elif op == "get" and now - checked >= 2:
                 checked = now
@@ -1611,8 +1671,10 @@ def outcome(run, name, op):
         if run.fail == "owned":
             write_atomic(mark(name, "owned"), b"", 0o600)
             return "owned"
-        if run.fail == "owned depot":
+        if run.fail == "owned depot" or owned_depot(["fail", *run.fail.split(" ")]):
             return "owned"
+        if run.fail == "rate":
+            return "network"
         if run.fail in ("depot", "branch"):
             log(f"{name}: fail {run.fail}, the map row does not match Steam")
             return "other"
@@ -1922,6 +1984,628 @@ def steam_forget(name):
         log(f"{name}: the unit's clean failed, {type(err).__name__}")
 
 
+@functools.lru_cache(maxsize=1024)
+def glob_re(comp):
+    return re.compile("".join("[^/]*" if ch == "*" else "([^/]+)" if ch == "%" else re.escape(ch) for ch in comp))
+
+
+def engine_row(r):
+    if len(r) != 6:
+        return None
+    cls, os_name, match, root, deny, status = r
+    if not (CLASS.fullmatch(cls) and os_name in LIB_OSES and root in ("0", "1", "2")
+            and status in ("-", "firm", "provisional") and (status == "-") == (deny == "-")):
+        return None
+    items = [x.split("|") for x in match.split(",")]
+    if not all(PATTERN.fullmatch(a) and rel_ok(a.rstrip("/")) for item in items for a in item):
+        return None
+    if "%" in match and not all("%" in a for a in items[0]):
+        return None
+    names = [] if deny == "-" else deny.split(",")
+    if not all(PATTERN.fullmatch(n) and "/" not in n and "%" not in n and rel_ok(n) for n in names):
+        return None
+    return {"class": cls, "os": os_name, "items": items, "root": int(root),
+            "deny": [glob_re(n.lower()) for n in names], "status": status}
+
+
+def load_engines():
+    rows = []
+    for n, line in enumerate(read_lines(ENGINES) or [], 1):
+        r = line.split("\t")
+        if (n == 1 and r == ENGINE_HEAD) or not line:
+            continue
+        row = engine_row(r)
+        if row is None:
+            log(f"engines: line {n} dropped")
+            continue
+        rows.append(row)
+    return rows
+
+
+def load_corrections():
+    rows = []
+    for n, line in enumerate(read_lines(CORRECTIONS) or [], 1):
+        r = line.split("\t")
+        if (n == 1 and r == CORRECTION_HEAD) or not line:
+            continue
+        cls, _, os_name = r[2].partition(":") if len(r) == 3 else ("", "", "")
+        if len(r) != 3 or not DIGITS.fullmatch(r[0]) or not (r[1] == "-" or DIGITS.fullmatch(r[1])) or not (
+                r[2] == "none" or (CLASS.fullmatch(cls) and os_name in LIB_OSES)):
+            log(f"corrections: line {n} dropped")
+            continue
+        rows.append({"app": r[0], "gid": None if r[1] == "-" else r[1],
+                     "class": None if r[2] == "none" else (cls, os_name)})
+    return rows
+
+
+def runner_confs():
+    try:
+        names = sorted(n for n in os.listdir(RUNNERS) if n.endswith(".conf"))
+    except FileNotFoundError:
+        return []
+    return [os.path.join(RUNNERS, n) for n in names]
+
+
+def load_offered():
+    out = []
+    for p in runner_confs():
+        for line in read_lines(p) or []:
+            key, sep, value = line.partition("=")
+            if not sep or key != "CLASSES":
+                continue
+            for x in value.strip().strip("\"'").split():
+                cls, _, os_name = x.partition(":")
+                if CLASS.fullmatch(cls) and os_name in LIB_OSES and x not in out:
+                    out.append(x)
+    return out
+
+
+def table_hash():
+    h = hashlib.sha256()
+    for p in (ENGINES, CORRECTIONS, *runner_confs()):
+        data = read_bytes(p)
+        h.update(f"{os.path.basename(p)}\t{len(data)}\n".encode() + data)
+    return h.hexdigest()
+
+
+def lib_view(paths):
+    tree = {"": (set(), set())}
+    case = {"": ""}
+    names = set()
+    for p in paths:
+        parts = [x for x in p.replace("\\", "/").split("/") if x]
+        if not parts:
+            continue
+        low = [x.lower() for x in parts]
+        names.add(low[-1])
+        d = ""
+        for i, x in enumerate(low[:-1]):
+            sub = f"{d}/{x}" if d else x
+            tree[d][1].add(x)
+            if sub not in tree:
+                tree[sub] = (set(), set())
+                case[sub] = "/".join(parts[:i + 1])
+            d = sub
+        tree[d][0].add(low[-1])
+    depth = {0: [""]}
+    for k in sorted(tree):
+        if k:
+            depth.setdefault(k.count("/") + 1, []).append(k)
+    return {"tree": tree, "case": case, "names": names, "depth": depth}
+
+
+def glob_all(view, d, comps, isdir):
+    files, subs = view["tree"].get(d, ((), ()))
+    last = len(comps) == 1
+    pool = files if last and not isdir else subs
+    c = comps[0]
+    if "*" in c or "%" in c:
+        rx = glob_re(c)
+        hits = [(n, h.group(1) if rx.groups else None) for n in pool for h in (rx.fullmatch(n),) if h]
+    else:
+        hits = [(c, None)] if c in pool else []
+    for n, stem in hits:
+        if last:
+            yield stem
+        else:
+            for s in glob_all(view, f"{d}/{n}" if d else n, comps[1:], isdir):
+                yield stem if stem is not None else s
+
+
+def alt_all(view, root, alt):
+    return glob_all(view, root, alt.rstrip("/").lower().split("/"), alt.endswith("/"))
+
+
+def alt_hit(view, root, alt):
+    for _ in alt_all(view, root, alt):
+        return True
+    return False
+
+
+def row_at(view, row, root):
+    stems = [None]
+    if "%" in row["items"][0][0]:
+        stems = sorted({s for a in row["items"][0] for s in alt_all(view, root, a)
+                        if s and "*" not in s and "%" not in s})
+    return any(all(any(alt_hit(view, root, a if s is None else a.replace("%", s)) for a in item)
+                   for item in row["items"]) for s in stems)
+
+
+def row_root(view, row):
+    for depth in range(row["root"] + 1):
+        for r in view["depth"].get(depth, ()):
+            if row_at(view, row, r):
+                return view["case"][r]
+    return None
+
+
+def view_class(view, os_name, table):
+    for row in table:
+        if row["os"] != os_name:
+            continue
+        root = row_root(view, row)
+        if root is None:
+            continue
+        if any(rx.fullmatch(n) for rx in row["deny"] for n in view["names"]):
+            return f"{row['class']}-native", root, row["status"]
+        return row["class"], root, row["status"]
+    return None
+
+
+def classify(paths, os_name, table):
+    return view_class(lib_view(paths), os_name, table)
+
+
+def engine_root(view, cls, os_name, table):
+    rows = [r for r in table if r["class"] == cls.removesuffix("-native") and r["os"] == os_name]
+    for row in rows:
+        root = row_root(view, row)
+        if root is not None:
+            return root, row["status"]
+    return "", rows[0]["status"] if rows else "-"
+
+
+def app_classes(app, views, builds, table, fixes):
+    out = {}
+    for os_name, view in views.items():
+        hit = view_class(view, os_name, table)
+        out[os_name] = list(hit) if hit else ["unknown", "", "-"]
+    for fx in sorted((x for x in fixes if x["app"] == app), key=lambda x: x["gid"] is not None):
+        for os_name in out:
+            if fx["gid"] is not None and fx["gid"] not in {g for _, g, _ in builds[os_name]}:
+                continue
+            if fx["class"] is None:
+                out[os_name] = ["none", "", "-"]
+            elif fx["class"][1] == os_name:
+                out[os_name] = [fx["class"][0], *engine_root(views[os_name], fx["class"][0], os_name, table)]
+    return out
+
+
+def lib_pick(classes, table, offered):
+    rank = {}
+    for i, row in enumerate(table):
+        rank.setdefault(f"{row['class']}:{row['os']}", i)
+
+    def key(os_name):
+        return rank.get(f"{classes[os_name][0].removesuffix('-native')}:{os_name}", len(table)), os_name
+    order = sorted(classes, key=key)
+    for os_name in order:
+        if f"{classes[os_name][0]}:{os_name}" in offered:
+            return os_name
+    return next((o for o in order if classes[o][0] not in ("unknown", "none")), None)
+
+
+def lib_line(f):
+    k, n = f[0], len(f)
+    if k == "app":
+        return (n == 4 and bool(DIGITS.fullmatch(f[1]) and WORD.fullmatch(f[2])) and f[3] != ""
+                and not CTRL.search(f[3]) and len(f[3].encode()) <= 256)
+    if k == "owned":
+        return n == 2 and bool(DIGITS.fullmatch(f[1]))
+    if k == "lang":
+        return (n == 3 and bool(DIGITS.fullmatch(f[1]))
+                and (f[2] == "-" or all(LANG.fullmatch(x) for x in f[2].split(","))))
+    if k == "depot":
+        return (n == 11 and all(DIGITS.fullmatch(x) for x in f[1:3]) and (f[3] == "-" or bool(OSLIST.fullmatch(f[3])))
+                and (f[4] == "-" or bool(TOKEN.fullmatch(f[4]))) and (f[5] == "-" or bool(LANG.fullmatch(f[5])))
+                and f[6] in ("0", "1") and all(x == "-" or DIGITS.fullmatch(x) for x in f[7:10])
+                and bool(DIGITS.fullmatch(f[10])))
+    if k == "art":
+        return (n == 3 and bool(DIGITS.fullmatch(f[1]) and ART_PATH.fullmatch(f[2])) and rel_ok(f[2])
+                and len(f[2]) <= 256)
+    return False
+
+
+def parse_library(lines):
+    lib = {"apps": {}, "owned": set()}
+    for n, line in enumerate(lines, 1):
+        f = line.split("\t")
+        if not lib_line(f):
+            raise ValueError(f"library line {n} out of form")
+        if f[0] == "owned":
+            lib["owned"].add(f[1])
+            continue
+        info = lib["apps"].setdefault(f[1], {"type": None, "name": None, "langs": [], "depots": [], "art": None})
+        if f[0] == "app":
+            info.update(type=f[2].lower(), name=f[3])
+        elif f[0] == "lang":
+            info["langs"] = [] if f[2] == "-" else f[2].split(",")
+        elif f[0] == "art":
+            info["art"] = f[2]
+        else:
+            info["depots"].append({"depot": f[2], "os": [] if f[3] == "-" else f[3].lower().split(","),
+                                   "arch": None if f[4] == "-" else f[4], "lang": None if f[5] == "-" else f[5],
+                                   "lowviolence": f[6] == "1", "from": None if f[7] == "-" else f[7],
+                                   "dlc": None if f[8] == "-" else f[8], "gid": None if f[9] == "-" else f[9],
+                                   "size": int(f[10])})
+    return lib
+
+
+def read_library():
+    try:
+        with open(LIB_TSV, "rb") as f:
+            raw = f.read(LIBRARY_MAX + 1)
+    except FileNotFoundError:
+        return None
+    except OSError as err:
+        raise ValueError(f"library unreadable, {type(err).__name__}") from err
+    if len(raw) > LIBRARY_MAX:
+        raise ValueError("library over its size")
+    try:
+        lines = raw.decode("utf-8").split("\n")
+    except UnicodeDecodeError as err:
+        raise ValueError("library not UTF-8") from err
+    if lines and lines[-1] == "":
+        lines.pop()
+    return parse_library(lines)
+
+
+def licence_hash(lib):
+    return hashlib.sha256("".join(f"{x}\n" for x in sorted(lib["owned"], key=int)).encode()).hexdigest()
+
+
+def lib_usable(d):
+    return (d["from"] is None and not d["lowviolence"] and d["gid"] is not None and d["arch"] in (None, *ARCHES)
+            and (not d["os"] or any(o in OSES for o in d["os"])))
+
+
+def lib_oses(info):
+    base = [d for d in info["depots"] if lib_usable(d) and d["dlc"] is None]
+    return [o for o in LIB_OSES if any(o in d["os"] or (o == "windows" and not d["os"]) for d in base)]
+
+
+def lib_kept(info):
+    return info["type"] in LIB_TYPES and bool(lib_oses(info))
+
+
+def lib_choices(info):
+    base = [d for d in info["depots"] if lib_usable(d) and d["dlc"] is None]
+    sets = {}
+    for lang in sorted(set(info["langs"]) | {d["lang"] for d in base if d["lang"]}):
+        sets.setdefault(frozenset(d["depot"] for d in base if d["lang"] == lang), []).append(lang)
+    return {"+".join(v): k for k, v in sets.items()} or {"-": frozenset()}
+
+
+def lib_default(info, choices):
+    for cid in sorted(choices):
+        if "english" in cid.split("+"):
+            return cid
+    langs = [d for d in info["depots"] if lib_usable(d) and d["dlc"] is None and d["lang"]]
+    if langs:
+        low = min(langs, key=lambda d: int(d["depot"]))["depot"]
+        for cid in sorted(choices):
+            if low in choices[cid]:
+                return cid
+    return sorted(choices)[0]
+
+
+def lib_choice(app, info, choices):
+    pick = read_lines(os.path.join(GAMES_STATE, f"{app}.lang"), 4096)
+    if pick and pick[0] in choices:
+        return pick[0]
+    return lib_default(info, choices)
+
+
+def lib_build(info, os_name, langset, langs, owned, drops):
+    ds = [d for d in info["depots"] if lib_usable(d) and (not d["os"] or os_name in d["os"])
+          and (d["dlc"] is None or (d["dlc"] in owned and d["depot"] not in drops))]
+    picked = [d for d in ds if d["dlc"] is None and (not d["lang"] or d["depot"] in langset)]
+    arch = next((a for a in ("64", "32") if any(d["arch"] == a for d in picked)), None)
+    ds = [d for d in ds if d["arch"] in (None, arch)]
+    groups = ([d for d in ds if d["dlc"] is None and not d["lang"] and d["arch"] is None],
+              [d for d in ds if d["dlc"] is None and not d["lang"] and d["arch"] is not None],
+              [d for d in ds if d["dlc"] is None and d["depot"] in langset],
+              [d for d in ds if d["dlc"] is not None and (not d["lang"] or d["lang"] in langs)])
+    return [(d["depot"], d["gid"], d["size"]) for g in groups for d in sorted(g, key=lambda d: int(d["depot"]))]
+
+
+def lib_builds(app, info, lib, drops=frozenset()):
+    choices = lib_choices(info)
+    choice = lib_choice(app, info, choices)
+    langs = set() if choice == "-" else set(choice.split("+"))
+    builds = {o: lib_build(info, o, choices[choice], langs, lib["owned"], drops) for o in lib_oses(info)}
+    return choice, choices, {o: b for o, b in builds.items() if b}
+
+
+def paths_file(depot, gid):
+    return os.path.join(LIB_SCAN, f"{depot}_{gid}.paths.gz")
+
+
+def read_paths(depot, gid):
+    try:
+        with gzip.open(paths_file(depot, gid), "rb") as f:
+            raw = f.read(PATHS_MAX + 1)
+        if len(raw) > PATHS_MAX:
+            return None
+        lines = raw.decode("utf-8").split("\n")
+    except (OSError, EOFError, zlib.error, UnicodeDecodeError):
+        return None
+    if lines and lines[-1] == "":
+        lines.pop()
+    out = []
+    for line in lines:
+        size, sep, name = line.partition("\t")
+        if not (sep and DIGITS.fullmatch(size) and rel_ok(name.replace("\\", "/"))):
+            return None
+        out.append((name, int(size)))
+    return out
+
+
+def lib_merged(lists):
+    view = {}
+    for entries in lists:
+        for name, size in entries:
+            view[name.replace("\\", "/")] = size
+    return view
+
+
+def read_scanfail():
+    rows = {}
+    for line in read_lines(SCANFAIL) or []:
+        f = line.split("\t")
+        if (len(f) == 7 and DIGITS.fullmatch(f[0]) and DIGITS.fullmatch(f[1]) and f[2] in SCANFAIL_KINDS
+                and DIGITS.fullmatch(f[3]) and DIGITS.fullmatch(f[4]) and SHA256.fullmatch(f[5])
+                and f[6] in ("0", "1")):
+            rows[(f[0], f[1])] = {"kind": f[2], "at": int(f[3]), "backoff": int(f[4]), "lic": f[5],
+                                  "open": f[6] == "1"}
+    return rows
+
+
+def scanfail_skip(rows, depot, gid):
+    e = rows.get((depot, gid))
+    return e is not None and not e["open"]
+
+
+def read_dlcdrop():
+    rows = []
+    for line in read_lines(DLCDROP) or []:
+        f = line.split("\t")
+        if len(f) == 3 and DIGITS.fullmatch(f[0]) and DIGITS.fullmatch(f[1]) and SHA256.fullmatch(f[2]):
+            rows.append(tuple(f))
+    return rows
+
+
+def dlcdrop_active(app, lic):
+    return {r[1] for r in read_dlcdrop() if r[0] == app and r[2] == lic}
+
+
+def dlcdrop_add(app, depot, lic):
+    rows = [r for r in read_dlcdrop() if r[2] == lic and r[:2] != (app, depot)] + [(app, depot, lic)]
+    os.makedirs(GAMES_STATE, 0o755, exist_ok=True)
+    write_atomic(DLCDROP, "".join("\t".join(r) + "\n" for r in rows).encode())
+
+
+def lib_index():
+    try:
+        lib = read_library()
+    except ValueError as err:
+        log(f"steam-lib index: {err}, classes.tsv and library.tsv kept")
+        raise Fail("other")
+    if lib is None:
+        lib = {"apps": {}, "owned": set()}
+    os.makedirs(GAMES_STATE, 0o755, exist_ok=True)
+    table, fixes, offered = load_engines(), load_corrections(), load_offered()
+    lic = licence_hash(lib)
+    failed = read_scanfail()
+    ports = {}
+    for name, row in sorted(load_map().items()):
+        ports.setdefault(row["app"], name)
+    classes_out, games = [f"hash\t{table_hash()}\n"], []
+    done = total = 0
+    for app in sorted(lib["apps"], key=int):
+        info = lib["apps"][app]
+        kept = lib_kept(info)
+        if not kept and app not in ports:
+            continue
+        choice, choices, builds = lib_builds(app, info, lib, dlcdrop_active(app, lic))
+        views, pending = {}, False
+        for os_name, build in builds.items():
+            lists = [read_paths(d, g) for d, g, _ in build]
+            if all(x is not None for x in lists):
+                views[os_name] = lib_view(lib_merged(lists))
+            elif any(x is None and not scanfail_skip(failed, d, g) for x, (d, g, _) in zip(lists, build)):
+                pending = True
+        if kept:
+            total += 1
+            done += not pending
+        classes = app_classes(app, views, builds, table, fixes)
+        for os_name in sorted(classes):
+            cls, root, status = classes[os_name]
+            pairs = ",".join(f"{d}:{g}" for d, g, _ in builds[os_name])
+            classes_out.append(f"{app}\t{os_name}\t{cls}\t{root or '.'}\t{status}\t{pairs}\n")
+        pick = lib_pick(classes, table, offered)
+        if not ((pick is not None and f"{classes[pick][0]}:{pick}" in offered) or app in ports):
+            continue
+        size_os = pick or next(iter(builds), None)
+        size = sum(s for _, _, s in builds.get(size_os, []))
+        games.append("\t".join(("app", app, info["name"] or "-", classes[pick][0] if pick else "unknown", choice,
+                                ",".join(sorted(choices)), str(size), "get", ports.get(app, "-"))) + "\n")
+    write_atomic(CLASSES_TSV, "".join(classes_out).encode())
+    write_atomic(GAMES_TSV, f"signed\t{int(read_signed())}\nscan\t{done}\t{total}\n{''.join(games)}".encode())
+
+
+def lib_todo(app, info, lib, lic, failed, full=True):
+    out = []
+    for build in lib_builds(app, info, lib, dlcdrop_active(app, lic))[2].values():
+        for d, g, _ in build:
+            if (d, g) not in out and not scanfail_skip(failed, d, g) and not (
+                    read_paths(d, g) is not None if full else os.path.exists(paths_file(d, g))):
+                out.append((d, g))
+    return out
+
+
+def lib_read():
+    try:
+        return read_library()
+    except ValueError as err:
+        log(f"steam-lib: {err}")
+        raise Fail("other")
+
+
+def lib_counts():
+    lines = read_lines(GAMES_TSV, LIBRARY_MAX) or []
+    f = lines[1].split("\t") if len(lines) > 1 else []
+    if len(f) == 3 and f[0] == "scan" and all(DIGITS.fullmatch(x) for x in f[1:]):
+        return int(f[1]), int(f[2])
+    return 0, 0
+
+
+def lib_outcome(run):
+    if run.stopped:
+        return run.stopped
+    if run.fail:
+        return "network" if run.fail == "rate" else run.fail if run.fail in ("login", "bound", "network") else "other"
+    return None if run.rc == 0 and run.end else "other"
+
+
+def lib_scan(proto):
+    lib = lib_read()
+    if lib is None:
+        return None
+    lic, failed = licence_hash(lib), read_scanfail()
+    ports = {row["app"] for row in load_map().values()}
+
+    def pick(full):
+        batch = {}
+        for app in sorted(lib["apps"], key=int):
+            if len(batch) == SCAN_APPS:
+                break
+            info = lib["apps"][app]
+            if lib_kept(info) or app in ports:
+                todo = lib_todo(app, info, lib, lic, failed, full)
+                if todo:
+                    batch[app] = set(todo)
+        return batch
+    done, total = lib_counts()
+    batch = pick(False) or (pick(True) if done < total else {})
+    if not batch:
+        return None
+    proto.progress("scan", done, total)
+
+    def finished(f):
+        nonlocal done
+        if f[0] == "scan" or len(f) < 3:
+            return
+        for todo in batch.values():
+            if tuple(f[1:3]) in todo:
+                todo.discard(tuple(f[1:3]))
+                if not todo:
+                    done += 1
+                    proto.progress("scan", min(done, total), total)
+    return lib_outcome(steam_dd(proto, "scan", LIB_INST, "token", extra={"apps": list(batch)}, on_line=finished))
+
+
+def lib_art_get(app, path):
+    dst = os.path.join(ART, f"{app}.jpg")
+    tmp = f"{dst}.tmp-{os.getpid()}"
+    ok = False
+    try:
+        p = subprocess.Popen([CURL, "-fsS", "--proto", "=https", "--max-time", "30", "--max-filesize", str(ART_BYTES),
+                              "-o", tmp, ART_URL.format(app, path)], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        p = None
+    if p is not None:
+        end = time.monotonic() + 60
+        while p.poll() is None and not CANCEL[0] and time.monotonic() < end:
+            time.sleep(0.1)
+        if p.poll() is None:
+            p.kill()
+        ok = p.wait() == 0
+    if CANCEL[0]:
+        remove(tmp)
+        raise Fail("cancel")
+    try:
+        with open(tmp, "rb") as f:
+            data = f.read(ART_BYTES + 1)
+    except OSError:
+        data = b""
+    remove(tmp)
+    if not ok or len(data) > ART_BYTES or not data.startswith(b"\xff\xd8\xff"):
+        return False
+    write_atomic(dst, data)
+    return True
+
+
+def lib_art():
+    lib = lib_read()
+    if lib is None:
+        return
+    os.makedirs(ART, 0o755, exist_ok=True)
+    tried = {}
+    for line in read_lines(ART_TSV) or []:
+        f = line.split("\t")
+        if len(f) == 2 and f[0] in lib["apps"] and SHA256.fullmatch(f[1]):
+            tried[f[0]] = f[1]
+    listed = [f[1] for f in (x.split("\t") for x in read_lines(GAMES_TSV, LIBRARY_MAX) or []) if f[0] == "app"]
+    tries = got = 0
+    try:
+        for app in listed:
+            info = lib["apps"].get(app)
+            if info is None or not info["art"] or os.path.exists(os.path.join(ART, f"{app}.jpg")):
+                continue
+            key = hashlib.sha256(json.dumps(info, sort_keys=True).encode()).hexdigest()
+            if tried.get(app) == key:
+                continue
+            if tries == ART_MAX or CANCEL[0]:
+                break
+            if scope_active():
+                raise Fail("busy")
+            tries += 1
+            if lib_art_get(app, info["art"]):
+                got += 1
+                tried.pop(app, None)
+            else:
+                tried[app] = key
+    finally:
+        write_atomic(ART_TSV, "".join(f"{a}\t{k}\n" for a, k in sorted(tried.items())).encode())
+        log(f"steam-lib art: {got} of {tries} fetched")
+
+
+def cmd_steam_lib(name, ctx):
+    if name == "index":
+        lib_index()
+        return
+    if name not in ("refresh", "scan", "art"):
+        raise Fail("other")
+    if scope_active():
+        raise Fail("busy")
+    if offline():
+        raise Fail("network")
+    os.makedirs(GAMES_STATE, 0o755, exist_ok=True)
+    if name == "art":
+        lib_art()
+        return
+    stop_units()
+    if name == "refresh":
+        why = lib_outcome(steam_dd(ctx.proto, "library", LIB_INST, "token"))
+    else:
+        why = lib_scan(ctx.proto)
+    lib_index()
+    if why:
+        raise Fail(why)
+
+
 def unit_me():
     return os.getuid()
 
@@ -2191,7 +2875,7 @@ def unit_dd(req, row, port):
                 elif kind == "end" and len(fields) == 1:
                     end = True
                 elif not (kind == "qr" or (kind in ("got", "exp") and len(fields) == 2) or
-                          (kind == "fail" and len(fields) in (2, 3))):
+                          (kind == "fail" and (len(fields) in (2, 3) or owned_depot(fields)))):
                     bad = True
                 if bad:
                     p.kill()
@@ -2223,9 +2907,323 @@ def unit_dd(req, row, port):
         os.close(fifo)
 
 
+@contextlib.contextmanager
+def unit_lib_lock():
+    os.makedirs(LIB_DIR, 0o750, exist_ok=True)
+    fd = open_lock(os.path.join(LIB_DIR, "lock"), 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def next_backoff(prev_kind, prev_backoff, kind):
+    if kind not in ("network", "rate"):
+        return 0
+    if prev_kind == kind:
+        return min(max(prev_backoff, BACKOFF_S) * 2, BACKOFF_MAX_S)
+    return BACKOFF_S
+
+
+def write_scanfail(rows):
+    write_atomic(SCANFAIL, "".join(
+        f"{d}\t{g}\t{e['kind']}\t{e['at']}\t{e['backoff']}\t{e['lic']}\t{int(e['open'])}\n"
+        for (d, g), e in sorted(rows.items())).encode(), 0o640)
+
+
+def scanfail_due(e, lic, now):
+    if e["kind"] in ("owned", "other"):
+        return e["lic"] != lic
+    return now < e["at"] or now >= e["at"] + e["backoff"]
+
+
+def unit_write_paths(depot, gid, entries):
+    data = gzip.compress("".join(f"{size}\t{name}\n" for name, size in entries).encode(), mtime=0)
+    with unit_lib_lock():
+        os.makedirs(LIB_SCAN, 0o750, exist_ok=True)
+        write_atomic(paths_file(depot, gid), data, 0o640)
+
+
+def unit_scan_result(depot, gid, kind, lic, now):
+    with unit_lib_lock():
+        rows = read_scanfail()
+        prev = rows.pop((depot, gid), None)
+        if kind is not None:
+            rows[(depot, gid)] = {"kind": kind, "at": now, "lic": lic, "open": False,
+                                  "backoff": next_backoff(prev and prev["kind"], prev and prev["backoff"], kind)}
+        write_scanfail(rows)
+
+
+def unit_library_done(lines, now):
+    data = "".join(x + "\n" for x in lines).encode()
+    if len(data) > LIBRARY_MAX:
+        raise ValueError("the library is over its size")
+    lib = parse_library(lines)
+    lic = licence_hash(lib)
+    named = {(d["depot"], d["gid"]) for info in lib["apps"].values() for d in info["depots"] if d["gid"]}
+    with unit_lib_lock():
+        write_atomic(LIB_TSV, data, 0o640)
+        rows = {}
+        for k, e in read_scanfail().items():
+            if k in named:
+                rows[k] = dict(e, open=True) if not e["open"] and scanfail_due(e, lic, now) else e
+        write_scanfail(rows)
+        try:
+            names = os.listdir(LIB_SCAN)
+        except FileNotFoundError:
+            names = []
+        for n in names:
+            d, _, rest = n.partition("_")
+            if rest.endswith(".paths.gz") and (d, rest.removesuffix(".paths.gz")) in named:
+                continue
+            p = os.path.join(LIB_SCAN, n)
+            try:
+                if ".tmp-" in n and os.lstat(p).st_mtime > now - RUN_BOUND_S:
+                    continue
+                os.unlink(p)
+            except FileNotFoundError:
+                pass
+
+
+def read_logins():
+    rows = []
+    for line in read_lines(LOGINS) or []:
+        f = line.split("\t")
+        if (len(f) == 5 and f[0] in LOGIN_OPS and DIGITS.fullmatch(f[1]) and RESULT.fullmatch(f[2])
+                and DIGITS.fullmatch(f[3]) and DIGITS.fullmatch(f[4])):
+            rows.append({"op": f[0], "start": int(f[1]), "result": f[2], "at": int(f[3]), "backoff": int(f[4])})
+    return rows
+
+
+def write_logins(rows):
+    write_atomic(LOGINS, "".join(f"{r['op']}\t{r['start']}\t{r['result']}\t{r['at']}\t{r['backoff']}\n"
+                                 for r in rows[-LOGINS_KEEP:]).encode(), 0o640)
+
+
+def login_bound(rows, op, now):
+    for r in rows:
+        if r["start"] > now:
+            continue
+        if op == "library" and r["op"] == "library" and now < r["start"] + LIBRARY_S:
+            return True
+        if r["at"] > now:
+            continue
+        if r["result"] == "rate" and now < r["at"] + r["backoff"]:
+            return True
+        if r["result"] == "network" and op in LIB_OPS and r["op"] in LIB_OPS and now < r["at"] + r["backoff"]:
+            return True
+    return False
+
+
+def unit_login(op, now):
+    with unit_lib_lock():
+        rows = read_logins()
+        if login_bound(rows, op, now):
+            raise Fail("bound")
+        rows.append({"op": op, "start": now, "result": "-", "at": now, "backoff": 0})
+        write_logins(rows)
+    return now
+
+
+def unit_login_end(op, start, result, now):
+    with unit_lib_lock():
+        rows = read_logins()
+        i = next((i for i in range(len(rows) - 1, -1, -1)
+                  if rows[i]["op"] == op and rows[i]["start"] == start and rows[i]["result"] == "-"), None)
+        if i is None:
+            return
+        prev = next((r for r in reversed(rows[:i]) if r["result"] != "-"), None)
+        if prev is not None and now - prev["at"] - prev["backoff"] > BACKOFF_MAX_S:
+            prev = None
+        rows[i] = dict(rows[i], result=result, at=now,
+                       backoff=next_backoff(prev and prev["result"], prev and prev["backoff"], result))
+        write_logins(rows)
+
+
+def unit_lib_pairs(req):
+    apps = req.get("apps")
+    if not (isinstance(apps, list) and all(isinstance(a, str) and DIGITS.fullmatch(a) for a in apps)):
+        raise ValueError("a scan request without app ids")
+    lib = read_library()
+    if lib is None:
+        return [], None
+    lic, failed = licence_hash(lib), read_scanfail()
+    pairs, seen = [], set()
+    for app in apps[:SCAN_APPS]:
+        info = lib["apps"].get(app)
+        if info is None:
+            continue
+        for d, g in lib_todo(app, info, lib, lic, failed):
+            if (d, g) not in seen:
+                seen.add((d, g))
+                pairs.append((app, d, g))
+    stale = [paths_file(d, g) for _, d, g in pairs if os.path.lexists(paths_file(d, g))]
+    if stale:
+        with unit_lib_lock():
+            for path in stale:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(path)
+    return pairs, lic
+
+
+def unit_lib_run(fifo, op, pairs, lic):
+    args = ["-blockie-library"]
+    listfile = None
+    if op == "scan":
+        listfile = os.path.join(os.environ.get("TMPDIR", "/tmp"), f"blockie-scan-{os.getpid()}")
+        with open(listfile, "w") as f:
+            f.write("".join(f"{a}\t{d}\t{g}\n" for a, d, g in pairs))
+        args = ["-blockie-scan", listfile]
+    r, w = os.pipe()
+    try:
+        p = subprocess.Popen([STEAM_DD, *args, "-remember-password"], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, pass_fds=(w,), cwd=STEAM_HOME,
+                             env=dict(os.environ, BLOCKIE_DD_FD=str(w)))
+    finally:
+        os.close(w)
+    bounded = []
+
+    def at_bound():
+        bounded.append(True)
+        p.kill()
+    timer = threading.Timer(SCAN_S if op == "scan" else LIBRARY_RUN_S, at_bound)
+    timer.daemon = True
+    timer.start()
+    want = {(d, g) for _, d, g in pairs or []}
+    kept, cur, end, bad, fail, rate, reported, eof = [], None, False, False, None, False, set(), False
+    try:
+        with os.fdopen(r, "rb") as f:
+            while True:
+                raw = f.readline(LINE_MAX)
+                if not raw:
+                    eof = True
+                    break
+                line = raw.decode("utf-8", "replace").rstrip("\n")
+                fields = line.split("\t")
+                kind, n = fields[0], len(fields)
+                send = False
+                if not raw.endswith(b"\n"):
+                    bad = True
+                elif op == "library" and kind in LIB_KINDS:
+                    bad = not lib_line(fields)
+                    kept.append(line)
+                elif op == "scan" and kind == "path":
+                    if cur is None or n != 3 or not DIGITS.fullmatch(fields[1]):
+                        bad = True
+                    elif cur[1] is not None and rel_ok(fields[2].replace("\\", "/")):
+                        cur[1].append((fields[2], int(fields[1])))
+                    else:
+                        cur = (cur[0], None)
+                elif op == "scan" and kind in ("scan", "scanned", "scanfail"):
+                    pair = tuple(fields[1:3])
+                    if n != (4 if kind == "scanfail" else 3) or pair not in want:
+                        bad = True
+                    elif kind == "scan" and cur is None:
+                        cur = (pair, [])
+                    elif kind == "scanned" and cur is not None and cur[0] == pair:
+                        if cur[1] is None:
+                            unit_scan_result(*pair, "other", lic, int(time.time()))
+                            line = "\t".join(("scanfail", *pair, "other"))
+                        else:
+                            unit_write_paths(*pair, cur[1])
+                            unit_scan_result(*pair, None, lic, int(time.time()))
+                        reported.add(pair)
+                        cur = None
+                    elif kind == "scanfail" and cur is None and fields[3] in SCANFAIL_KINDS:
+                        unit_scan_result(*pair, fields[3], lic, int(time.time()))
+                        rate = rate or fields[3] == "rate"
+                        reported.add(pair)
+                    else:
+                        bad = True
+                    send = not bad
+                elif kind == "end" and n == 1:
+                    end = True
+                    send = op == "scan"
+                elif kind == "fail" and n in (2, 3):
+                    fail = fail or fields[1]
+                    send = True
+                else:
+                    bad = True
+                if bad:
+                    p.kill()
+                    unit_send(fifo, "fail\tother")
+                    break
+                if send:
+                    unit_send(fifo, line)
+    finally:
+        if not eof:
+            p.kill()
+        rc = p.wait()
+        timer.cancel()
+        if listfile is not None:
+            remove(listfile)
+    done = end and (rc == 0 or bool(bounded))
+    if op == "library" and done and not bad and not fail:
+        try:
+            unit_library_done(kept, int(time.time()))
+        except (OSError, ValueError) as err:
+            log(f"lib library: refused, {err}")
+            unit_send(fifo, "fail\tother")
+            return 1, "other"
+        unit_send(fifo, "end")
+        return 0, "ok"
+    stuck = next(((d, g) for _, d, g in pairs or [] if (d, g) not in reported), None) if not (end or fail) else None
+    if stuck is not None:
+        unit_scan_result(*stuck, "network", lic, int(time.time()))
+        unit_send(fifo, "\t".join(("scanfail", *stuck, "network")))
+    if bad:
+        return 1, "other"
+    if fail:
+        return 1, fail if RESULT.fullmatch(fail) else "other"
+    if op == "library" and bounded:
+        log("lib library: stopped at its bound")
+        unit_send(fifo, "fail\tnetwork")
+        return 1, "network"
+    if op == "scan" and (done or bounded):
+        if not end:
+            unit_send(fifo, "end")
+        return 0, "rate" if rate else "ok" if reported or end else "network"
+    return 1, "other"
+
+
+def unit_lib(req):
+    op = req["op"]
+    fifo = unit_fifo(LIB_INST)
+    try:
+        pairs = lic = None
+        if op == "scan":
+            try:
+                pairs, lic = unit_lib_pairs(req)
+            except (OSError, ValueError) as err:
+                log(f"lib scan: refused, {err}")
+                unit_send(fifo, "fail\tother")
+                unit_send(fifo, "rc\t1")
+                return 1
+            if not pairs:
+                unit_send(fifo, "end")
+                unit_send(fifo, "rc\t0")
+                return 0
+        try:
+            start = unit_login(op, int(time.time()))
+        except Fail as err:
+            unit_send(fifo, f"fail\t{err.why}")
+            unit_send(fifo, "rc\t1")
+            return 1
+        rc, result = 1, "other"
+        try:
+            rc, result = unit_lib_run(fifo, op, pairs, lic)
+        finally:
+            unit_login_end(op, start, result, int(time.time()))
+        unit_send(fifo, f"rc\t{rc}")
+        return rc
+    finally:
+        os.close(fifo)
+
+
 def unit_main(argv):
-    if len(argv) != 1 or not (argv[0] == ACCOUNT or PORT.fullmatch(argv[0])):
-        log("usage: blockie-ports steam-unit <port>|account")
+    if len(argv) != 1 or not (argv[0] in (ACCOUNT, LIB_INST) or PORT.fullmatch(argv[0])):
+        log("usage: blockie-ports steam-unit <port>|account|lib")
         return 64
     inst = argv[0]
     os.umask(0o027)
@@ -2248,6 +3246,10 @@ def unit_main(argv):
                 unit_clean(None)
                 return 0
             raise ValueError(f"no account operation {op}")
+        if inst == LIB_INST:
+            if op not in LIB_OPS:
+                raise ValueError(f"no library operation {op}")
+            return unit_lib(req)
         if op == "clean":
             unit_clean(inst)
             return 0
@@ -2282,7 +3284,7 @@ def unit_main(argv):
 COMMANDS = {"sync": (0, cmd_sync), "refresh": (0, cmd_refresh), "index": (0, cmd_index),
             "install": (1, cmd_install), "update": (1, cmd_update), "uninstall": (1, cmd_uninstall),
             "runtime": (1, cmd_runtime), "unpack": (1, cmd_unpack), "steam-get": (1, cmd_steam_get),
-            "steam-logout": (0, cmd_steam_logout)}
+            "steam-logout": (0, cmd_steam_logout), "steam-lib": (1, cmd_steam_lib)}
 WAITING = ("runtime", "unpack")
 
 
@@ -2290,13 +3292,13 @@ def run(argv, proto):
     if len(argv) < 2 or argv[1] not in COMMANDS or len(argv) != 2 + COMMANDS[argv[1]][0] or any(
             CTRL.search(a) for a in argv[2:]):
         log(f"usage: {ME} sync|refresh|index|install <name>|update <name>|uninstall <name>|runtime <name>|"
-            f"unpack <file>|steam-get <name>|steam-logout")
+            f"unpack <file>|steam-get <name>|steam-logout|steam-lib index|refresh|scan|art")
         return 64
     cmd = argv[1]
     arg = argv[2] if len(argv) > 2 else cmd
     name = os.path.basename(arg) if cmd == "unpack" else arg
     CANCEL[0] = False
-    QUIET[0] = cmd in STEAM_CMDS
+    QUIET[0] = cmd in STEAM_CMDS or cmd == "steam-lib"
     signal.signal(signal.SIGTERM, on_term)
     os.umask(0o022)
     os.environ.update(HM_TOOLS_DIR=PORTS, HM_PORTS_DIR=PORTS, HM_SCRIPTS_DIR=PORTS, REQUESTS_CA_BUNDLE=CA,

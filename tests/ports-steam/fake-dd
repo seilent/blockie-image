@@ -10,7 +10,8 @@ args = sys.argv[1:]
 fd = int(os.environ["BLOCKIE_DD_FD"])
 world = json.load(open(os.environ["FAKE_DD"]))
 log = os.environ["FAKE_DD_LOG"]
-op = "pass" if "-manifest-only" in args else "get"
+op = ("library" if "-blockie-library" in args else "scan" if "-blockie-scan" in args else
+      "pass" if "-manifest-only" in args else "get")
 counter = os.path.join(os.path.dirname(log), f"dd-{op}.count")
 n = int(open(counter).read()) if os.path.exists(counter) else 0
 with open(counter, "w") as f:
@@ -21,6 +22,9 @@ config = os.environ["BLOCKIE_DD_CONFIG"]
 filelist = None
 if "-filelist" in args:
     with open(args[args.index("-filelist") + 1]) as f:
+        filelist = f.read().splitlines()
+if "-blockie-scan" in args:
+    with open(args[args.index("-blockie-scan") + 1]) as f:
         filelist = f.read().splitlines()
 print(f"Logging 'invented-account' into Steam3... {world.get('token', 'tok-invented-0000')}", flush=True)
 print(f"invented-account {world.get('token', 'tok-invented-0000')}", file=sys.stderr, flush=True)
@@ -90,6 +94,41 @@ if step.get("fail"):
     finish(1)
 if step.get("loop"):
     time.sleep(step["loop"])
+if op == "library":
+    for line in world.get("lines", []):
+        out(line)
+    for line in step.get("extra", []):
+        out(line)
+    if step.get("noend"):
+        finish(0)
+    out("end")
+    finish(step.get("rc", 0))
+if op == "scan":
+    time.sleep(step.get("delay", 0))
+    for line in step.get("extra", []):
+        out(line)
+    scans = world.get("scans", {})
+    for i, (a, d, g) in enumerate(x.split("\t") for x in filelist if x):
+        if i == 0 and step.get("stall_first"):
+            out("scan", d, g)
+            time.sleep(step["stall_first"])
+            continue
+        s = scans.get(d, {})
+        if "fail" in s:
+            out("scanfail", d, g, s["fail"])
+            if s["fail"] == "rate":
+                break
+            continue
+        out("scan", d, g)
+        for p in s.get("paths", ["invented.bin"]):
+            out(p if "\t" in p else f"path\t1\t{p}")
+        out("scanned", d, g)
+    if step.get("hang"):
+        time.sleep(step["hang"])
+    if step.get("noend"):
+        finish(0)
+    out("end")
+    finish(step.get("rc", 0))
 depots = after("-depot")
 mans = after("-manifest")
 work = after("-dir")[0]

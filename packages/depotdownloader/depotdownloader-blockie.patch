@@ -144,18 +144,20 @@ diff -ruN a/dd/DepotDownloader/AccountSettingsStore.cs b/dd/DepotDownloader/Acco
 diff -ruN a/dd/DepotDownloader/Channel.cs b/dd/DepotDownloader/Channel.cs
 --- /dev/null
 +++ b/dd/DepotDownloader/Channel.cs
-@@ -0,0 +1,262 @@
+@@ -0,0 +1,322 @@
 +// This file is subject to the terms and conditions defined
 +// in file 'LICENSE', which is part of this source code package.
 +
 +using System;
 +using System.Globalization;
 +using System.IO;
++using System.Linq;
 +using System.Runtime.InteropServices;
 +using System.Text;
 +using System.Text.Json;
 +using System.Threading;
 +using Microsoft.Win32.SafeHandles;
++using SteamKit2;
 +
 +namespace DepotDownloader
 +{
@@ -169,6 +171,8 @@ diff -ruN a/dd/DepotDownloader/Channel.cs b/dd/DepotDownloader/Channel.cs
 +        const int PR_SET_DUMPABLE = 4;
 +        const int ENOSPC = 28;
 +        const long GOT_MS = 250;
++
++        public static bool OneLogon;
 +
 +        static FileStream stream;
 +        static readonly Lock gate = new();
@@ -239,6 +243,22 @@ diff -ruN a/dd/DepotDownloader/Channel.cs b/dd/DepotDownloader/Channel.cs
 +            }
 +        }
 +
++        public static string Transient(EResult result)
++        {
++            if (result == EResult.RateLimitExceeded)
++            {
++                return "rate";
++            }
++
++            return result is EResult.Cancelled or EResult.NoConnection or EResult.Timeout or EResult.Busy or EResult.ServiceUnavailable or EResult.TryAnotherCM ? "network" : null;
++        }
++
++        public static bool ScanName(string name)
++        {
++            var path = name.Replace('\\', '/');
++            return path.Length > 0 && !path.Any(c => c < 0x20 || c == 0x7f) && path.Split('/').All(x => x != "" && x != "." && x != "..");
++        }
++
 +        public static void Note(string why)
 +        {
 +            Interlocked.CompareExchange(ref noted, why, null);
@@ -282,6 +302,46 @@ diff -ruN a/dd/DepotDownloader/Channel.cs b/dd/DepotDownloader/Channel.cs
 +        public static void Total(ulong total)
 +        {
 +            Line("total", total.ToString(CultureInfo.InvariantCulture));
++        }
++
++        public static void App(uint app, string type, string name)
++        {
++            Line("app", app.ToString(CultureInfo.InvariantCulture), type, name);
++        }
++
++        public static void Art(uint app, string path)
++        {
++            Line("art", app.ToString(CultureInfo.InvariantCulture), path);
++        }
++
++        public static void Owned(uint app)
++        {
++            Line("owned", app.ToString(CultureInfo.InvariantCulture));
++        }
++
++        public static void Lang(uint app, string languages)
++        {
++            Line("lang", app.ToString(CultureInfo.InvariantCulture), languages);
++        }
++
++        public static void Depot(uint app, uint depot, params string[] fields)
++        {
++            Line(["depot", app.ToString(CultureInfo.InvariantCulture), depot.ToString(CultureInfo.InvariantCulture), .. fields]);
++        }
++
++        public static void Scan(string kind, uint depot, ulong gid)
++        {
++            Line(kind, depot.ToString(CultureInfo.InvariantCulture), gid.ToString(CultureInfo.InvariantCulture));
++        }
++
++        public static void ScanFail(uint depot, ulong gid, string why)
++        {
++            Line("scanfail", depot.ToString(CultureInfo.InvariantCulture), gid.ToString(CultureInfo.InvariantCulture), why);
++        }
++
++        public static void ScanPath(ulong size, string name)
++        {
++            Line("path", size.ToString(CultureInfo.InvariantCulture), name);
 +        }
 +
 +        public static void DepotDone(ulong bytes)
@@ -410,7 +470,37 @@ diff -ruN a/dd/DepotDownloader/Channel.cs b/dd/DepotDownloader/Channel.cs
 diff -ruN a/dd/DepotDownloader/ContentDownloader.cs b/dd/DepotDownloader/ContentDownloader.cs
 --- a/dd/DepotDownloader/ContentDownloader.cs
 +++ b/dd/DepotDownloader/ContentDownloader.cs
-@@ -332,7 +332,7 @@
+@@ -5,9 +5,12 @@
+ using System.Buffers;
+ using System.Collections.Concurrent;
+ using System.Collections.Generic;
++using System.Globalization;
+ using System.IO;
+ using System.Linq;
+ using System.Net;
++using System.Text;
++using System.Text.RegularExpressions;
+ using System.Threading;
+ using System.Threading.Tasks;
+ using SteamKit2;
+@@ -32,6 +35,16 @@
+         private static CDNClientPool cdnPool;
+ 
+         private const string DEFAULT_DOWNLOAD_DIR = "depots";
++        private const int LIBRARY_BATCH = 100;
++        private const int LICENSE_WAIT_MS = 60000;
++        private const int SCAN_TRIES = 4;
++        private const int NAME_MAX = 256;
++        private const ELicenseFlags LICENSE_GONE = ELicenseFlags.Expired | ELicenseFlags.CancelledByUser | ELicenseFlags.CancelledByAdmin |
++            ELicenseFlags.CancelledByFriendlyFraudLock | ELicenseFlags.CancelledByPartner | ELicenseFlags.PendingRefund;
++        private static readonly Regex WORD = new(@"^[A-Za-z][A-Za-z0-9_-]*\z");
++        private static readonly Regex TOKEN = new(@"^[A-Za-z0-9_-]+\z");
++        private static readonly Regex LANG = new(@"^[a-z][a-z_-]*\z");
++        private static readonly Regex ART = new(@"^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*\z");
+         private const string CONFIG_DIR = ".DepotDownloader";
+         private static readonly string STAGING_DIR = Path.Combine(CONFIG_DIR, "staging");
+ 
+@@ -332,7 +345,7 @@
              if (steam3 == null)
                  return;
  
@@ -419,7 +509,19 @@ diff -ruN a/dd/DepotDownloader/ContentDownloader.cs b/dd/DepotDownloader/Content
          }
  
          public static async Task DownloadPubfileAsync(uint appId, ulong publishedFileId)
-@@ -435,7 +435,7 @@
+@@ -423,6 +436,11 @@
+ 
+             await steam3?.RequestAppInfo(appId);
+ 
++            if (Channel.Enabled && steam3.steamUser.SteamID.AccountType != EAccountType.AnonUser)
++            {
++                await WaitForLicenses();
++            }
++
+             if (!await AccountHasAccess(appId, appId))
+             {
+                 if (steam3.steamUser.SteamID.AccountType != EAccountType.AnonUser && await steam3.RequestFreeAppLicense(appId))
+@@ -435,7 +453,7 @@
                  else
                  {
                      var contentName = GetAppName(appId);
@@ -428,7 +530,7 @@ diff -ruN a/dd/DepotDownloader/ContentDownloader.cs b/dd/DepotDownloader/Content
                  }
              }
  
-@@ -527,7 +527,7 @@
+@@ -527,7 +545,7 @@
                  if (depotIdsFound.Count < depotIdsExpected.Count)
                  {
                      var remainingDepotIds = depotIdsExpected.Except(depotIdsFound);
@@ -437,19 +539,19 @@ diff -ruN a/dd/DepotDownloader/ContentDownloader.cs b/dd/DepotDownloader/Content
                  }
              }
  
-@@ -566,6 +566,11 @@
+@@ -566,6 +584,11 @@
              {
                  Console.WriteLine("Depot {0} is not available from this account.", depotId);
  
 +                if (Channel.Enabled)
 +                {
-+                    throw new ChannelException("owned depot", $"Depot {depotId} is not available from this account.");
++                    throw new ChannelException($"owned depot {depotId}", $"Depot {depotId} is not available from this account.");
 +                }
 +
                  return null;
              }
  
-@@ -575,6 +580,11 @@
+@@ -575,6 +598,11 @@
                  if (manifestId == INVALID_MANIFEST_ID && !string.Equals(branch, DEFAULT_BRANCH, StringComparison.OrdinalIgnoreCase))
                  {
                      Console.WriteLine("Warning: Depot {0} does not have branch named \"{1}\". Trying {2} branch.", depotId, branch, DEFAULT_BRANCH);
@@ -461,7 +563,7 @@ diff -ruN a/dd/DepotDownloader/ContentDownloader.cs b/dd/DepotDownloader/Content
                      branch = DEFAULT_BRANCH;
                      manifestId = await GetSteam3DepotManifest(depotId, appId, branch);
                  }
-@@ -582,6 +592,11 @@
+@@ -582,14 +610,24 @@
                  if (manifestId == INVALID_MANIFEST_ID)
                  {
                      Console.WriteLine("Depot {0} missing public subsection or manifest section.", depotId);
@@ -473,19 +575,21 @@ diff -ruN a/dd/DepotDownloader/ContentDownloader.cs b/dd/DepotDownloader/Content
                      return null;
                  }
              }
-@@ -590,6 +605,11 @@
+ 
+-            await steam3.RequestDepotKey(depotId, appId);
++            var keyResult = await steam3.RequestDepotKey(depotId, appId);
              if (!steam3.DepotKeys.TryGetValue(depotId, out var depotKey))
              {
                  Console.WriteLine("No valid depot key for {0}, unable to download.", depotId);
 +                if (Channel.Enabled)
 +                {
-+                    throw new ChannelException("owned depot", $"No valid depot key for {depotId}.");
++                    throw new ChannelException(Channel.Transient(keyResult) ?? $"owned depot {depotId}", $"No valid depot key for {depotId}.");
 +                }
 +
                  return null;
              }
  
-@@ -598,6 +618,11 @@
+@@ -598,6 +636,11 @@
              if (!CreateDirectories(depotId, uVersion, out var installDir))
              {
                  Console.WriteLine("Error: Unable to create install directories!");
@@ -497,7 +601,293 @@ diff -ruN a/dd/DepotDownloader/ContentDownloader.cs b/dd/DepotDownloader/Content
                  return null;
              }
  
-@@ -695,6 +720,19 @@
+@@ -616,6 +659,285 @@
+             return new DepotDownloadInfo(depotId, containingAppId, manifestId, branch, installDir, depotKey);
+         }
+ 
++        static async Task WaitForLicenses()
++        {
++            var until = Environment.TickCount64 + LICENSE_WAIT_MS;
++            while (steam3.Licenses == null)
++            {
++                if (steam3.IsAborted || Environment.TickCount64 > until)
++                {
++                    throw new ChannelException("network", "No license list from Steam.");
++                }
++
++                await Task.Delay(100);
++            }
++        }
++
++        public static async Task ListLibraryAsync()
++        {
++            await WaitForLicenses();
++
++            var packages = steam3.Licenses.Where(l => (l.LicenseFlags & LICENSE_GONE) == 0).Select(l => l.PackageID).Distinct().ToList();
++            foreach (var batch in packages.Chunk(LIBRARY_BATCH))
++            {
++                await steam3.RequestPackageInfo(batch);
++            }
++
++            var apps = new SortedSet<uint>();
++            foreach (var id in packages)
++            {
++                if (!steam3.PackageInfo.TryGetValue(id, out var package))
++                {
++                    throw new ChannelException("network", $"Package {id} was not answered.");
++                }
++
++                if (package == null)
++                {
++                    continue;
++                }
++
++                foreach (var child in package.KeyValues["appids"].Children)
++                {
++                    var app = child.AsUnsignedInteger();
++                    if (app != 0)
++                    {
++                        apps.Add(app);
++                    }
++                }
++            }
++
++            foreach (var batch in apps.Chunk(LIBRARY_BATCH))
++            {
++                await steam3.RequestAppInfos(batch);
++            }
++
++            foreach (var app in apps)
++            {
++                if (!steam3.AppInfo.TryGetValue(app, out var info))
++                {
++                    throw new ChannelException("network", $"App {app} was not answered.");
++                }
++
++                Channel.Owned(app);
++                if (info == null)
++                {
++                    continue;
++                }
++
++                var common = GetSteam3AppSection(app, EAppInfoSection.Common) ?? KeyValue.Invalid;
++                var type = common["type"].Value;
++                Channel.App(app, type != null && WORD.IsMatch(type) ? type : "unknown", LibraryName(common["name"].Value));
++
++                var capsule = common["library_assets_full"]["library_capsule"]["image"];
++                var art = capsule["english"].Value ?? capsule.Children.FirstOrDefault()?.Value;
++                if (art != null && art.Length <= NAME_MAX && ART.IsMatch(art) && !art.Split('/').Any(x => x == "." || x == ".."))
++                {
++                    Channel.Art(app, art);
++                }
++
++                var depots = GetSteam3AppSection(app, EAppInfoSection.Depots) ?? KeyValue.Invalid;
++                var langs = (depots["baselanguages"].Value ?? "").Split(',').Select(x => x.Trim().ToLowerInvariant()).Where(x => LANG.IsMatch(x));
++                Channel.Lang(app, LibraryList(langs));
++
++                foreach (var depotSection in depots.Children)
++                {
++                    if (depotSection.Children.Count == 0 || !uint.TryParse(depotSection.Name, NumberStyles.None, CultureInfo.InvariantCulture, out var depot))
++                    {
++                        continue;
++                    }
++
++                    var config = depotSection["config"];
++                    var oslist = (config["oslist"].Value ?? "").Split(',').Select(x => x.Trim()).Where(x => TOKEN.IsMatch(x));
++                    var arch = config["osarch"].Value ?? "";
++                    var lang = (config["language"].Value ?? "").ToLowerInvariant();
++                    if ((arch != "" && !TOKEN.IsMatch(arch)) || (lang != "" && !LANG.IsMatch(lang)))
++                    {
++                        continue;
++                    }
++
++                    var manifest = depotSection["manifests"][DEFAULT_BRANCH];
++                    var size = LibraryNumber(manifest["size"]);
++                    if (size == "-")
++                    {
++                        size = LibraryNumber(depotSection["maxsize"]);
++                    }
++
++                    Channel.Depot(app, depot, LibraryList(oslist), arch == "" ? "-" : arch, lang == "" ? "-" : lang,
++                        config["lowviolence"].AsBoolean() ? "1" : "0", LibraryNumber(depotSection["depotfromapp"]),
++                        LibraryNumber(depotSection["dlcappid"]), LibraryNumber(manifest["gid"]), size == "-" ? "0" : size);
++                }
++            }
++        }
++
++        static string LibraryName(string name)
++        {
++            var sb = new StringBuilder();
++            var bytes = 0;
++            foreach (var rune in (name ?? "").EnumerateRunes())
++            {
++                if (rune.Value < 0x20 || rune.Value == 0x7f)
++                {
++                    continue;
++                }
++
++                if (bytes + rune.Utf8SequenceLength > NAME_MAX)
++                {
++                    break;
++                }
++
++                bytes += rune.Utf8SequenceLength;
++                sb.Append(rune.ToString());
++            }
++
++            return sb.Length == 0 ? "-" : sb.ToString();
++        }
++
++        static string LibraryList(IEnumerable<string> items)
++        {
++            var list = string.Join(',', items.Distinct());
++            return list == "" ? "-" : list;
++        }
++
++        static string LibraryNumber(KeyValue kv)
++        {
++            return ulong.TryParse(kv.Value, NumberStyles.None, CultureInfo.InvariantCulture, out var n) ? n.ToString(CultureInfo.InvariantCulture) : "-";
++        }
++
++        public static async Task ScanAsync(string listFile)
++        {
++            var pairs = new List<(uint app, uint depot, ulong gid)>();
++            string[] lines;
++            try
++            {
++                lines = await File.ReadAllLinesAsync(listFile);
++            }
++            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
++            {
++                throw new ChannelException("other", "Unable to read the scan list.");
++            }
++
++            foreach (var line in lines)
++            {
++                var f = line.Split((char[])null, StringSplitOptions.RemoveEmptyEntries);
++                if (f.Length == 0)
++                {
++                    continue;
++                }
++
++                if (f.Length != 3 || !uint.TryParse(f[0], NumberStyles.None, CultureInfo.InvariantCulture, out var app) ||
++                    !uint.TryParse(f[1], NumberStyles.None, CultureInfo.InvariantCulture, out var depot) ||
++                    !ulong.TryParse(f[2], NumberStyles.None, CultureInfo.InvariantCulture, out var gid))
++                {
++                    throw new ChannelException("other", "Refused a scan list line.");
++                }
++
++                pairs.Add((app, depot, gid));
++            }
++
++            cdnPool = new CDNClientPool(steam3, INVALID_APP_ID);
++            try
++            {
++                await cdnPool.UpdateServerList();
++            }
++            catch (Exception ex) when (ex is not OperationCanceledException)
++            {
++                throw new ChannelException("network", "No content servers.");
++            }
++
++            foreach (var (app, depot, gid) in pairs)
++            {
++                var why = await ScanDepotAsync(app, depot, gid);
++                if (why != null)
++                {
++                    Channel.ScanFail(depot, gid, why);
++                }
++
++                if (why == "rate")
++                {
++                    break;
++                }
++            }
++        }
++
++        static async Task<string> ScanDepotAsync(uint appId, uint depotId, ulong gid)
++        {
++            var keyResult = await steam3.RequestDepotKey(depotId, appId);
++            if (keyResult == EResult.Cancelled)
++            {
++                throw new ChannelException("network", "The Steam session ended.");
++            }
++
++            if (!steam3.DepotKeys.TryGetValue(depotId, out var depotKey))
++            {
++                return Channel.Transient(keyResult) ?? "owned";
++            }
++
++            var code = await steam3.GetDepotManifestRequestCodeAsync(depotId, appId, gid, DEFAULT_BRANCH);
++            if (code == 0 && steam3.IsAborted)
++            {
++                throw new ChannelException("network", "The Steam session ended.");
++            }
++
++            if (code == 0)
++            {
++                return "network";
++            }
++
++            var refused = false;
++            for (var tries = 0; tries < SCAN_TRIES; tries++)
++            {
++                var connection = cdnPool.GetConnection();
++                DepotManifest manifest;
++                try
++                {
++                    string cdnToken = null;
++                    if (steam3.CDNAuthTokens.TryGetValue((depotId, connection.Host), out var auth) && auth.Task.IsCompletedSuccessfully)
++                    {
++                        cdnToken = auth.Task.Result.Token;
++                    }
++
++                    manifest = await cdnPool.CDNClient.DownloadManifestAsync(depotId, gid, code, connection, depotKey, cdnPool.ProxyServer, cdnToken).ConfigureAwait(false);
++                    cdnPool.ReturnConnection(connection);
++                }
++                catch (SteamKitWebRequestException e) when (e.StatusCode == HttpStatusCode.Forbidden && !steam3.CDNAuthTokens.ContainsKey((depotId, connection.Host)))
++                {
++                    await steam3.RequestCDNAuthToken(appId, depotId, connection);
++                    refused = !(steam3.CDNAuthTokens.TryGetValue((depotId, connection.Host), out var token) && token.Task.IsCompletedSuccessfully);
++                    continue;
++                }
++                catch (SteamKitWebRequestException e) when (e.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
++                {
++                    return refused ? "network" : "owned";
++                }
++                catch (SteamKitWebRequestException e) when (e.StatusCode == HttpStatusCode.TooManyRequests)
++                {
++                    return "rate";
++                }
++                catch (SteamKitWebRequestException e) when (e.StatusCode == HttpStatusCode.NotFound)
++                {
++                    return "network";
++                }
++                catch (Exception)
++                {
++                    cdnPool.ReturnBrokenConnection(connection);
++                    continue;
++                }
++
++                var files = (manifest.Files ?? []).Where(f => !f.Flags.HasFlag(EDepotFileFlag.Directory)).ToList();
++                if (!files.All(file => Channel.ScanName(file.FileName)))
++                {
++                    return "other";
++                }
++
++                Channel.Scan("scan", depotId, gid);
++                files.ForEach(file => Channel.ScanPath(file.TotalSize, file.FileName));
++                Channel.Scan("scanned", depotId, gid);
++                return null;
++            }
++
++            return "network";
++        }
++
+         private class ChunkMatch(DepotManifest.ChunkData oldChunk, DepotManifest.ChunkData newChunk)
+         {
+             public DepotManifest.ChunkData OldChunk { get; } = oldChunk;
+@@ -695,6 +1017,19 @@
                  }
              }
  
@@ -517,7 +907,7 @@ diff -ruN a/dd/DepotDownloader/ContentDownloader.cs b/dd/DepotDownloader/Content
              foreach (var depotFileData in depotsToDownload)
              {
                  await DownloadSteam3AsyncDepotFiles(cts, downloadCounter, depotFileData, allFileNamesAllDepots);
-@@ -784,6 +822,7 @@
+@@ -784,6 +1119,7 @@
                                  // If we could not get the manifest code, this is a fatal error
                                  if (manifestRequestCode == 0)
                                  {
@@ -525,7 +915,7 @@ diff -ruN a/dd/DepotDownloader/ContentDownloader.cs b/dd/DepotDownloader/Content
                                      cts.Cancel();
                                  }
                              }
-@@ -825,12 +864,14 @@
+@@ -825,12 +1161,14 @@
                              if (e.StatusCode == HttpStatusCode.Unauthorized || e.StatusCode == HttpStatusCode.Forbidden)
                              {
                                  Console.WriteLine("Encountered {2} for depot manifest {0} {1}. Aborting.", depot.DepotId, depot.ManifestId, (int)e.StatusCode);
@@ -540,7 +930,7 @@ diff -ruN a/dd/DepotDownloader/ContentDownloader.cs b/dd/DepotDownloader/Content
                                  break;
                              }
  
-@@ -862,6 +903,22 @@
+@@ -862,6 +1200,22 @@
  
              Console.WriteLine("Manifest {0} ({1})", depot.ManifestId, newManifest.CreationTime);
  
@@ -563,7 +953,7 @@ diff -ruN a/dd/DepotDownloader/ContentDownloader.cs b/dd/DepotDownloader/Content
              if (Config.DownloadManifestOnly)
              {
                  DumpManifestToTextFile(depot, newManifest);
-@@ -972,6 +1029,9 @@
+@@ -972,6 +1326,9 @@
              DepotConfigStore.Instance.InstalledManifestIDs[depot.DepotId] = depot.ManifestId;
              DepotConfigStore.Save();
  
@@ -573,7 +963,7 @@ diff -ruN a/dd/DepotDownloader/ContentDownloader.cs b/dd/DepotDownloader/Content
              Console.WriteLine("Depot {0} - Downloaded {1} bytes ({2} bytes uncompressed)", depot.DepotId, depotCounter.depotBytesCompressed, depotCounter.depotBytesUncompressed);
          }
  
-@@ -1018,7 +1078,7 @@
+@@ -1018,7 +1375,7 @@
                  }
                  catch (IOException ex)
                  {
@@ -582,7 +972,7 @@ diff -ruN a/dd/DepotDownloader/ContentDownloader.cs b/dd/DepotDownloader/Content
                  }
  
                  neededChunks = new List<DepotManifest.ChunkData>(file.Chunks);
-@@ -1065,6 +1125,7 @@
+@@ -1065,6 +1422,7 @@
                                  fsOld.Seek((long)match.OldChunk.Offset, SeekOrigin.Begin);
  
                                  var adler = Util.AdlerHash(fsOld, (int)match.OldChunk.UncompressedLength);
@@ -590,7 +980,7 @@ diff -ruN a/dd/DepotDownloader/ContentDownloader.cs b/dd/DepotDownloader/Content
                                  if (!adler.SequenceEqual(BitConverter.GetBytes(match.OldChunk.Checksum)))
                                  {
                                      neededChunks.Add(match.NewChunk);
-@@ -1089,7 +1150,7 @@
+@@ -1089,7 +1447,7 @@
                                  }
                                  catch (IOException ex)
                                  {
@@ -599,7 +989,7 @@ diff -ruN a/dd/DepotDownloader/ContentDownloader.cs b/dd/DepotDownloader/Content
                                  }
  
                                  foreach (var match in copyChunks)
-@@ -1121,7 +1182,7 @@
+@@ -1121,7 +1479,7 @@
                          }
                          catch (IOException ex)
                          {
@@ -608,7 +998,7 @@ diff -ruN a/dd/DepotDownloader/ContentDownloader.cs b/dd/DepotDownloader/Content
                          }
                      }
  
-@@ -1131,12 +1192,16 @@
+@@ -1131,12 +1489,16 @@
  
                  if (neededChunks.Count == 0)
                  {
@@ -625,7 +1015,7 @@ diff -ruN a/dd/DepotDownloader/ContentDownloader.cs b/dd/DepotDownloader/Content
                      lock (downloadCounter)
                      {
                          downloadCounter.completeDownloadSize -= file.TotalSize;
-@@ -1146,11 +1211,15 @@
+@@ -1146,11 +1508,15 @@
                  }
  
                  var sizeOnDisk = (file.TotalSize - (ulong)neededChunks.Select(x => (long)x.UncompressedLength).Sum());
@@ -641,7 +1031,7 @@ diff -ruN a/dd/DepotDownloader/ContentDownloader.cs b/dd/DepotDownloader/Content
                  lock (downloadCounter)
                  {
                      downloadCounter.completeDownloadSize -= sizeOnDisk;
-@@ -1269,6 +1338,8 @@
+@@ -1269,6 +1635,8 @@
                          cdnPool.ReturnBrokenConnection(connection);
                          Console.WriteLine("Encountered unexpected error downloading chunk {0}: {1}", chunkID, e.Message);
                      }
@@ -650,7 +1040,7 @@ diff -ruN a/dd/DepotDownloader/ContentDownloader.cs b/dd/DepotDownloader/Content
                  } while (written == 0);
  
                  if (written == 0)
-@@ -1327,6 +1398,8 @@
+@@ -1327,6 +1695,8 @@
                  Ansi.Progress(downloadCounter.totalBytesUncompressed, downloadCounter.completeDownloadSize);
              }
  
@@ -777,7 +1167,31 @@ diff -ruN a/dd/DepotDownloader/Program.cs b/dd/DepotDownloader/Program.cs
                      return 1;
                  }
              }
-@@ -314,12 +323,26 @@
+@@ -159,6 +168,23 @@
+ 
+             #endregion
+ 
++            var library = HasParameter(args, "-blockie-library");
++            var scan = HasParameter(args, "-blockie-scan");
++            var scanList = GetParameter<string>(args, "-blockie-scan");
++            if (library || scan)
++            {
++                if (library == scan || (scan && scanList == null))
++                {
++                    Console.WriteLine("Error: give -blockie-library or -blockie-scan <file>.");
++                    Channel.Fail("other");
++                    return 1;
++                }
++
++                PrintUnconsumedArgs(args);
++                Channel.OneLogon = true;
++                return await RunBlockie(username, password, library ? () => ContentDownloader.ListLibraryAsync() : () => ContentDownloader.ScanAsync(scanList));
++            }
++
+             var appId = GetParameter(args, "-app", ContentDownloader.INVALID_APP_ID);
+             if (appId == ContentDownloader.INVALID_APP_ID)
+             {
+@@ -314,12 +340,26 @@
                      try
                      {
                          await ContentDownloader.DownloadAppAsync(appId, depotManifestIds, branch, os, arch, language, lv, isUGC).ConfigureAwait(false);
@@ -804,7 +1218,7 @@ diff -ruN a/dd/DepotDownloader/Program.cs b/dd/DepotDownloader/Program.cs
                          return 1;
                      }
                      catch (Exception e)
-@@ -335,6 +358,7 @@
+@@ -335,6 +375,7 @@
                  else
                  {
                      Console.WriteLine("Error: InitializeSteam failed");
@@ -812,7 +1226,54 @@ diff -ruN a/dd/DepotDownloader/Program.cs b/dd/DepotDownloader/Program.cs
                      return 1;
                  }
  
-@@ -350,6 +374,12 @@
+@@ -344,12 +385,59 @@
+             return 0;
+         }
+ 
++        static async Task<int> RunBlockie(string username, string password, Func<Task> work)
++        {
++            if (!InitializeSteam(username, password))
++            {
++                Console.WriteLine("Error: InitializeSteam failed");
++                Channel.Fail(Channel.Noted ?? "network");
++                return 1;
++            }
++
++            try
++            {
++                await work().ConfigureAwait(false);
++                Channel.End();
++                return 0;
++            }
++            catch (ChannelException ex)
++            {
++                Console.WriteLine(ex.Message);
++                Channel.Fail(ex.Why);
++                return 1;
++            }
++            catch (Exception ex) when (
++                ex is ContentDownloaderException
++                || ex is OperationCanceledException)
++            {
++                Console.WriteLine(ex.Message);
++                Channel.Fail(Channel.Noted ?? (ex is OperationCanceledException ? "network" : "other"));
++                return 1;
++            }
++            catch (AsyncJobFailedException ex)
++            {
++                Console.WriteLine(ex.Message);
++                Channel.Fail(Channel.Noted ?? "network");
++                return 1;
++            }
++            finally
++            {
++                ContentDownloader.ShutdownSteam3();
++            }
++        }
++
+         static bool InitializeSteam(string username, string password)
+         {
+             if (!ContentDownloader.Config.UseQrCode)
              {
                  if (username != null && password == null && (!ContentDownloader.Config.RememberPassword || !AccountSettingsStore.Instance.LoginTokens.ContainsKey(username)))
                  {
@@ -828,7 +1289,84 @@ diff -ruN a/dd/DepotDownloader/Program.cs b/dd/DepotDownloader/Program.cs
 diff -ruN a/dd/DepotDownloader/Steam3Session.cs b/dd/DepotDownloader/Steam3Session.cs
 --- a/dd/DepotDownloader/Steam3Session.cs
 +++ b/dd/DepotDownloader/Steam3Session.cs
-@@ -444,7 +444,7 @@
+@@ -20,6 +20,8 @@
+     {
+         public bool IsLoggedOn { get; private set; }
+ 
++        public bool IsAborted => bAborted;
++
+         public ReadOnlyCollection<SteamApps.LicenseListCallback.License> Licenses
+         {
+             get;
+@@ -183,6 +185,37 @@
+             }
+         }
+ 
++        public async Task RequestAppInfos(IEnumerable<uint> appIds)
++        {
++            var apps = appIds.Where(id => !AppInfo.ContainsKey(id)).ToList();
++
++            if (apps.Count == 0 || bAborted)
++                return;
++
++            var appTokens = await steamApps.PICSGetAccessTokens(apps, []);
++
++            foreach (var token_dict in appTokens.AppTokens)
++            {
++                this.AppTokens[token_dict.Key] = token_dict.Value;
++            }
++
++            var requests = apps.Select(id => new SteamApps.PICSRequest(id, AppTokens.GetValueOrDefault(id))).ToList();
++            var appInfoMultiple = await steamApps.PICSGetProductInfo(requests, []);
++
++            foreach (var appInfo in appInfoMultiple.Results)
++            {
++                foreach (var app_value in appInfo.Apps)
++                {
++                    AppInfo[app_value.Value.ID] = app_value.Value;
++                }
++
++                foreach (var app in appInfo.UnknownApps)
++                {
++                    AppInfo[app] = null;
++                }
++            }
++        }
++
+         public async Task RequestPackageInfo(IEnumerable<uint> packageIds)
+         {
+             var packages = packageIds.ToList();
+@@ -237,10 +270,13 @@
+             }
+         }
+ 
+-        public async Task RequestDepotKey(uint depotId, uint appid = 0)
++        public async Task<EResult> RequestDepotKey(uint depotId, uint appid = 0)
+         {
+-            if (DepotKeys.ContainsKey(depotId) || bAborted)
+-                return;
++            if (DepotKeys.ContainsKey(depotId))
++                return EResult.OK;
++
++            if (bAborted)
++                return EResult.Cancelled;
+ 
+             var depotKey = await steamApps.GetDepotDecryptionKey(depotId, appid);
+ 
+@@ -248,10 +284,11 @@
+ 
+             if (depotKey.Result != EResult.OK)
+             {
+-                return;
++                return depotKey.Result;
+             }
+ 
+             DepotKeys[depotKey.DepotID] = depotKey.DepotKey;
++            return EResult.OK;
+         }
+ 
+ 
+@@ -444,7 +481,7 @@
                              _ = AccountSettingsStore.Instance.GuardData.TryGetValue(logonDetails.Username, out var guarddata);
                              authSession = await steamClient.Authentication.BeginAuthSessionViaCredentialsAsync(new AuthSessionDetails
                              {
@@ -837,7 +1375,7 @@ diff -ruN a/dd/DepotDownloader/Steam3Session.cs b/dd/DepotDownloader/Steam3Sessi
                                  Username = logonDetails.Username,
                                  Password = logonDetails.Password,
                                  IsPersistentSession = ContentDownloader.Config.RememberPassword,
-@@ -471,7 +471,7 @@
+@@ -471,7 +508,7 @@
                          {
                              var session = await steamClient.Authentication.BeginAuthSessionViaQRAsync(new AuthSessionDetails
                              {
@@ -846,7 +1384,7 @@ diff -ruN a/dd/DepotDownloader/Steam3Session.cs b/dd/DepotDownloader/Steam3Sessi
                                  IsPersistentSession = ContentDownloader.Config.RememberPassword,
                              });
  
-@@ -496,6 +496,7 @@
+@@ -496,6 +533,7 @@
                          catch (Exception ex)
                          {
                              Console.Error.WriteLine("Failed to authenticate with Steam: " + ex.Message);
@@ -854,7 +1392,7 @@ diff -ruN a/dd/DepotDownloader/Steam3Session.cs b/dd/DepotDownloader/Steam3Sessi
                              Abort(false);
                              return;
                          }
-@@ -526,8 +527,18 @@
+@@ -526,8 +564,18 @@
                              AccountSettingsStore.Instance.GuardData.Remove(result.AccountName);
                          }
  
@@ -874,7 +1412,7 @@ diff -ruN a/dd/DepotDownloader/Steam3Session.cs b/dd/DepotDownloader/Steam3Sessi
                      }
                      catch (TaskCanceledException)
                      {
-@@ -536,6 +547,7 @@
+@@ -536,6 +584,7 @@
                      catch (Exception ex)
                      {
                          Console.Error.WriteLine("Failed to authenticate with Steam: " + ex.Message);
@@ -882,7 +1420,16 @@ diff -ruN a/dd/DepotDownloader/Steam3Session.cs b/dd/DepotDownloader/Steam3Sessi
                          Abort(false);
                          return;
                      }
-@@ -564,6 +576,7 @@
+@@ -561,9 +610,16 @@
+                 // Any operations outstanding need to be aborted
+                 bAborted = true;
+             }
++            else if (Channel.OneLogon && IsLoggedOn)
++            {
++                Console.WriteLine("Lost connection to Steam");
++                Channel.Note("network");
++                Abort(false);
++            }
              else if (connectionBackoff >= 10)
              {
                  Console.WriteLine("Could not connect to Steam after 10 tries");
@@ -890,7 +1437,7 @@ diff -ruN a/dd/DepotDownloader/Steam3Session.cs b/dd/DepotDownloader/Steam3Sessi
                  Abort(false);
              }
              else if (!bAborted)
-@@ -603,6 +616,16 @@
+@@ -603,6 +659,16 @@
                  bExpectingDisconnectRemote = true;
                  Abort(false);
  
@@ -907,7 +1454,7 @@ diff -ruN a/dd/DepotDownloader/Steam3Session.cs b/dd/DepotDownloader/Steam3Sessi
                  if (!isAccessToken)
                  {
                      Console.WriteLine("This account is protected by Steam Guard.");
-@@ -653,6 +676,7 @@
+@@ -653,6 +719,7 @@
              if (loggedOn.Result == EResult.ServiceUnavailable)
              {
                  Console.WriteLine("Unable to login to Steam3: {0}", loggedOn.Result);
@@ -915,15 +1462,15 @@ diff -ruN a/dd/DepotDownloader/Steam3Session.cs b/dd/DepotDownloader/Steam3Sessi
                  Abort(false);
  
                  return;
-@@ -661,6 +685,7 @@
+@@ -661,6 +728,7 @@
              if (loggedOn.Result != EResult.OK)
              {
                  Console.WriteLine("Unable to login to Steam3: {0}", loggedOn.Result);
-+                Channel.Note(loggedOn.Result == EResult.RateLimitExceeded ? "network" : "other");
++                Channel.Note(Channel.Transient(loggedOn.Result) ?? "other");
                  Abort();
  
                  return;
-@@ -700,8 +725,24 @@
+@@ -700,8 +768,24 @@
              }
          }
  

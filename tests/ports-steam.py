@@ -347,20 +347,76 @@ def outcome_case(c, world, want, mark=None, **kw):
     return lines
 
 
-@case("child outcomes: owned (marked), owned depot (no mark), depot and branch as other, expired, network, space, other")
+@case("child outcomes: owned (marked), owned depot with or without its id (no mark, the helper's line three fields), a "
+      "five field or non digits owned depot line as other, depot and branch as other, expired, network, rate as "
+      "network, space, other")
 def _(c):
     outcome_case(c, {"pass": [{"fail": "owned"}]}, "owned", True)
     outcome_case(c, {"pass": [{"fail": "owned depot"}]}, "owned", False)
+    lines = outcome_case(c, {"pass": [{"fail": "owned depot 9000101"}]}, "owned", False)
+    c(len(last(lines).split("\t")) == 3, f"the helper's line {last(lines)!r}")
+    outcome_case(c, {"pass": [{"fail": "owned depot 9000101 9"}]}, "other", False)
+    outcome_case(c, {"pass": [{"fail": "owned depot x9000101"}]}, "other", False)
+    outcome_case(c, {"pass": [{"fail": "network depot 9000101"}]}, "other", False)
     outcome_case(c, {"pass": [{"fail": "depot"}]}, "other")
     c(any("map row does not match" in x for x in LOG), "depot not logged as a map row bug")
     outcome_case(c, {"pass": [{"fail": "branch"}]}, "other")
     outcome_case(c, {"pass": [{"approve": False}]}, "expired", signed=False)
     outcome_case(c, {"pass": [{"fail": "network"}]}, "network")
+    outcome_case(c, {"get": [{"fail": "rate"}]}, "network")
     outcome_case(c, {"get": [{"fail": "space"}]}, "space")
     outcome_case(c, {"pass": [{"fail": "other"}]}, "other")
     outcome_case(c, {"pass": [{"noend": True}]}, "other")
     outcome_case(c, {"get": [{"noend": True}]}, "other")
     outcome_case(c, {"get": [{"rc": 1}]}, "other")
+
+
+@case("a fail rate from DepotDownloader in a pass ends the run at once; the unit relays it as rate, the helper as "
+      "network")
+def _(c):
+    setup({"pass": [{"fail": "rate"}]}, signed=True)
+    r, w = os.pipe()
+    t0 = time.monotonic()
+    try:
+        run = m.steam_dd(m.Proto(w), "pass", "alpha.zip", "token")
+    finally:
+        os.close(w)
+        os.close(r)
+    c(run.fail == "rate" and run.rc == 1 and time.monotonic() - t0 < 10, f"{run.fail} {run.rc} {LOG[-3:]}")
+    c(m.outcome(run, "alpha.zip", "pass") == "network", "rate not mapped to network")
+
+
+@case("library scan through the unit: the 3 field path line is cached and kept to the unit, scan, scanned and "
+      "scanfail forwarded; a 2 field path line ends other with nothing cached")
+def _(c):
+    lib = ["app\t9000001\tgame\tInvented", "owned\t9000001", "lang\t9000001\t-",
+           "depot\t9000001\t9000011\t-\t-\t-\t0\t-\t-\t900001100\t1",
+           "depot\t9000001\t9000012\t-\t64\t-\t0\t-\t-\t900001200\t1"]
+    for paths, want in ((["a.bin", "b/c.bin"], "done\tscan"), (["path\t1"], "fail\tscan\tother")):
+        setup({"lines": lib, "scans": {"9000011": {"paths": paths}, "9000012": {"fail": "owned"}}}, signed=True)
+        m.unit_library_done(lib, int(time.time()))
+        got = []
+        real = os.read
+
+        def rec(fd, n):
+            data = real(fd, n)
+            with contextlib.suppress(OSError):
+                if os.readlink(f"/proc/self/fd/{fd}").endswith(".fifo"):
+                    got.append(data)
+            return data
+        os.read = rec
+        try:
+            rc, lines = call("steam-lib", "scan")
+        finally:
+            os.read = real
+        sent = {x.split("\t")[0] for x in b"".join(got).decode("utf-8", "replace").splitlines() if x}
+        c(last(lines) == want, f"{paths}: {lines[-2:]} {LOG[-3:]}")
+        if want == "done\tscan":
+            c(m.read_paths("9000011", "900001100") == [("a.bin", 1), ("b/c.bin", 1)], "not cached")
+            c(sent == {"scan", "scanned", "scanfail", "end", "rc"}, f"forwarded {sent}")
+            c({d: e["kind"] for (d, g), e in m.read_scanfail().items()} == {"9000012": "owned"}, "scanfail")
+        else:
+            c(m.read_paths("9000011", "900001100") is None and "path" not in sent, f"cached or forwarded {sent}")
 
 
 @case("a crash with no fail line: other, or space under the floor; .DepotDownloader dropped once, then the get runs")
