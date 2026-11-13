@@ -276,6 +276,8 @@ jobs:
           t=setd
           suite podman run --rm -v "$PWD/tests:/tests:ro" "$IMAGE:$TAG" \
             bash -c 'dnf -y -q install dbus-daemon > /dev/null && /tests/setd.sh'
+          t=volume-limit-wp
+          suite podman run --rm -v "$PWD/tests:/tests:ro" "$IMAGE:$TAG" /tests/volume-limit-wp.sh 2 3 4 5 6 7
 
       - name: Source RPMs
         env:

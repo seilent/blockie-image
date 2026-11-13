@@ -6,6 +6,117 @@ fail() { echo "audio: $*" >&2; exit 1; }
 tmp=$(mktemp -d)
 trap 'rm -rf "${tmp:?}"' EXIT
 
+limits() {
+  local vol=$1 rc got
+  export LIM=$tmp/lim
+  mkdir -p "$LIM/bin"
+  cat > "$LIM/bin/wpctl" << 'EOF'
+#!/bin/sh
+echo "wpctl $*" >> "$LIM/log"
+case "$1 $2" in
+"settings --save")
+    [ -n "${LIM_KEEP:-}" ] || echo "$4" > "$LIM/saved"
+    [ ! -f "$LIM/next" ] || mv "$LIM/next" "$LIM/map"
+    ;;
+"settings blockie.volume-limit")
+    v=$(cat "$LIM/saved" 2> /dev/null || echo 1.0)
+    echo "Value: $v (Saved: $v)"
+    ;;
+esac
+EOF
+  cat > "$LIM/bin/pw-metadata" << 'EOF'
+#!/bin/sh
+if [ $# -ge 5 ]; then
+    case $5 in
+    "" | *[!0-9]*) echo "pw-metadata $1 $2 $3 $4 BAD" >> "$LIM/log" ;;
+    *) echo "pw-metadata $1 $2 $3 $4 NONCE" >> "$LIM/log" ;;
+    esac
+    exit 0
+fi
+echo "pw-metadata $*" >> "$LIM/log"
+if [ "$4" = ready ]; then
+    [ -n "${LIM_UNREADY:-}" ] || echo "update: id:0 key:'ready' value:'1' type:'Spa:String'"
+    exit 0
+fi
+[ -z "${LIM_SLOW:-}" ] || /usr/bin/sleep 0.4
+[ ! -f "$LIM/later" ] || mv "$LIM/later" "$LIM/map"
+if [ -s "$LIM/seq" ]; then
+    printf 'version 1\nsound.max_volume %s\n' "$(head -n 1 "$LIM/seq")" > "$LIM/map"
+    sed -i 1d "$LIM/seq"
+fi
+v=${LIM_APPLIED:-$(cat "$LIM/saved" 2> /dev/null)}
+[ -z "$v" ] || echo "update: id:0 key:'applied' value:'$v' type:'Spa:String'"
+EOF
+  printf '#!/bin/sh\necho "sleep $*" >> "$LIM/log"\n' > "$LIM/bin/sleep"
+  chmod 755 "$LIM/bin/wpctl" "$LIM/bin/pw-metadata" "$LIM/bin/sleep"
+  lrun() {
+    rm -f "$LIM/log" "$LIM/saved"
+    rc=0
+    BLOCKIE_VOLUME_SETTINGS=$LIM/map PATH="$LIM/bin:$PATH" "$vol" "$@" > /dev/null 2> "$LIM/err" || rc=$?
+    got=$(cat "$LIM/log" 2> /dev/null || true)
+  }
+  lmap() { printf 'version 1\nbuttons.home.hold switcher\n%b' "${1:+sound.max_volume $1\n}" > "${2:-$LIM/map}"; }
+  rm -f "$LIM/map"
+  lrun limit
+  [[ $rc == 0 && -z $got ]] || fail "limit with no map gave rc $rc and ran '$got', want rc 0 and nothing"
+  lrun limit wait
+  [[ $rc == 0 && -z $got ]] || fail "limit wait with no map gave rc $rc and ran '$got', want rc 0 and nothing"
+  lmap
+  lrun limit
+  [[ $rc == 0 && $(grep -m 1 '^wpctl settings --save' <<< "$got") == "wpctl settings --save blockie.volume-limit 1.00" ]] ||
+    fail "limit with no key gave rc $rc and ran '$got', want a push of 1.00"
+  lmap 60
+  LIM_UNREADY=1 lrun limit
+  [[ $rc == 0 && $(grep -c '^pw-metadata -n blockie-volume-limit 0 ready$' <<< "$got") == 10 &&
+    $(grep -m 1 -n '^wpctl settings --save' <<< "$got" | cut -d: -f1) -gt 10 && $(grep -c '^sleep 1$' <<< "$got") -ge 10 ]] ||
+    fail "limit with the script not ready gave rc $rc and ran '$got', want 10 ready reads 1 s apart, then the push"
+  lrun limit
+  [[ $rc == 0 && $got == $'pw-metadata -n blockie-volume-limit 0 ready\nwpctl settings --save blockie.volume-limit 0.60\nwpctl settings blockie.volume-limit\npw-metadata -n blockie-volume-limit 0 push NONCE\npw-metadata -n blockie-volume-limit 0 applied' ]] ||
+    fail "limit at 60 gave rc $rc and ran '$got', want the ready read, one push of 0.60, one read back, a push nonce and one applied read"
+  LIM_KEEP=1 lrun limit
+  [[ $rc == 1 && $(grep -c '^wpctl settings --save blockie.volume-limit 0.60$' <<< "$got") == 10 &&
+    $(grep -c '^sleep 1$' <<< "$got") == 9 && $got != *applied* && $got != *NONCE* && $(< "$LIM/err") == *"did not take the limit 0.60"* ]] ||
+    fail "a read back that never matches gave rc $rc and ran '$got', want 10 pushes 1 s apart and rc 1"
+  lmap 30 "$LIM/next"
+  lrun limit
+  [[ $rc == 0 && $(grep '^wpctl settings --save' <<< "$got" | paste -sd ,) == "wpctl settings --save blockie.volume-limit 0.60,wpctl settings --save blockie.volume-limit 0.30" &&
+    $(tail -n 1 <<< "$got") == "pw-metadata -n blockie-volume-limit 0 applied" ]] ||
+    fail "a map changed after the push gave rc $rc and ran '$got', want 0.60 then 0.30 pushed and applied read"
+  lmap 60
+  lmap 30 "$LIM/later"
+  lrun limit
+  [[ $rc == 0 && $(grep '^wpctl settings --save' <<< "$got" | paste -sd ,) == "wpctl settings --save blockie.volume-limit 0.60,wpctl settings --save blockie.volume-limit 0.30" &&
+    $(< "$LIM/err") == *"reads 0.30 after the push of 0.60, once more"* ]] ||
+    fail "a map changed during the applied wait gave rc $rc and ran '$got', want 0.60 then 0.30 pushed"
+  lmap 60
+  printf '%s\n' 50 40 30 > "$LIM/seq"
+  lrun limit
+  [[ $rc == 1 && $(grep '^wpctl settings --save' <<< "$got" | sed 's/.* //' | paste -sd ,) == 0.60,0.50,0.40,0.30 &&
+    $(tail -n 1 <<< "$got") == "pw-metadata -n blockie-volume-limit 0 push NONCE" &&
+    $(< "$LIM/err") == *"moved to 0.30 during 3 pushes, pushed once more without the wait"* ]] ||
+    fail "a map that keeps moving gave rc $rc and ran '$got', want 3 pushes, one more of 0.30 without the wait and rc 1"
+  lmap 30
+  LIM_APPLIED=0.3 lrun limit wait
+  [[ $rc == 0 && $got == "pw-metadata -n blockie-volume-limit 0 applied" ]] ||
+    fail "limit wait on applied 0.3 at 30 gave rc $rc and ran '$got', want one applied read"
+  LIM_APPLIED=0.99 lrun limit wait
+  [[ $rc == 0 && $got != *wpctl* && $(grep -c '^sleep 0.1$' <<< "$got") == 20 &&
+    $(grep -c '^pw-metadata' <<< "$got") == 21 && $(< "$LIM/err") == *"not applied after 2 s"* ]] ||
+    fail "limit wait that never matches gave rc $rc and ran '$got', want 21 reads over 2 s, rc 0 and a journal line"
+  LIM_SLOW=1 LIM_APPLIED=0.99 lrun limit wait
+  n=$(grep -c '^pw-metadata' <<< "$got")
+  [[ $rc == 0 && $n -ge 2 && $n -lt 21 && $(< "$LIM/err") == *"not applied after 2 s"* ]] ||
+    fail "limit wait with slow reads gave rc $rc after $n reads, want the 3 s deadline before 21 reads"
+  lrun limit later
+  [[ $rc == 2 && -z $got ]] || fail "limit later gave rc $rc and ran '$got', want rc 2 and nothing"
+}
+
+if [[ ${1:-} == limit ]]; then
+  limits "${BLOCKIE_VOLUME_BIN:-/usr/libexec/blockie/blockie-volume}"
+  echo "audio: limit ok"
+  exit 0
+fi
+
 ucm=/usr/share/alsa/ucm2
 card=$ucm/MediaTek/mt6768-mt6358/PocketBlock.conf
 hifi=$ucm/MediaTek/mt6768-mt6358/PocketBlock-HiFi.conf
@@ -296,5 +407,6 @@ done
 rc=0
 got=$(WPCTL_OUT="Volume: 0.40" WPCTL_RC=3 PATH="$tmp/bin:$PATH" "$vol" get) || rc=$?
 [[ $rc == 3 && -z $got ]] || fail "get with wpctl rc 3 gave rc $rc and '$got', want rc 3 and no output"
+limits "$vol"
 
 echo "audio: ok, $clients audio client units, PipeWire $(rpm -q --qf '%{VERSION}' pipewire), WirePlumber $(rpm -q --qf '%{VERSION}' wireplumber)"

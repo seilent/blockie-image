@@ -1,0 +1,82 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: seilent <github@seilent.net>
+Date: Sat, 14 Nov 2026 00:00:00 +0900
+Subject: [PATCH] Cap the audio, mixer and mixer stream volumes at 0 dB
+
+---
+ audio/audio_driver.c | 6 +++---
+ command.c            | 4 ++--
+ menu/menu_setting.c  | 4 ++--
+ 3 files changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/audio/audio_driver.c b/audio/audio_driver.c
+index a4a28cf..2c86a86 100644
+--- a/audio/audio_driver.c
++++ b/audio/audio_driver.c
+@@ -1568,7 +1568,7 @@ void audio_driver_mixer_set_stream_volume(unsigned i, float vol)
+       audio_driver_st.mixer_streams[i].voice;
+ 
+    if (voice)
+-      audio_mixer_voice_set_volume(voice, DB_TO_GAIN(vol));
++      audio_mixer_voice_set_volume(voice, DB_TO_GAIN(MIN(vol, 0.0f)));
+ }
+ 
+ void audio_driver_mixer_stop_stream(unsigned i)
+@@ -1796,11 +1796,11 @@ void audio_set_float(enum audio_action action, float val)
+    switch (action)
+    {
+       case AUDIO_ACTION_VOLUME_GAIN:
+-         audio_driver_st.volume_gain        = DB_TO_GAIN(val);
++         audio_driver_st.volume_gain        = DB_TO_GAIN(MIN(val, 0.0f));
+          break;
+       case AUDIO_ACTION_MIXER_VOLUME_GAIN:
+ #ifdef HAVE_AUDIOMIXER
+-         audio_driver_st.mixer_volume_gain  = DB_TO_GAIN(val);
++         audio_driver_st.mixer_volume_gain  = DB_TO_GAIN(MIN(val, 0.0f));
+ #endif
+          break;
+       case AUDIO_ACTION_RATE_CONTROL_DELTA:
+diff --git a/command.c b/command.c
+index 791d510..fafbca5 100644
+--- a/command.c
++++ b/command.c
+@@ -1163,7 +1163,7 @@ void command_event_set_volume(
+    char msg[128];
+    float new_volume = settings->floats.audio_volume + gain;
+    new_volume       = MAX(new_volume, -80.0f);
+-   new_volume       = MIN(new_volume, 12.0f);
++   new_volume       = MIN(new_volume, 0.0f);
+    configuration_set_float(settings, settings->floats.audio_volume, new_volume);
+    _len             = strlcpy(msg, msg_hash_to_str(MSG_AUDIO_VOLUME),
+          sizeof(msg));
+@@ -1201,7 +1201,7 @@ void command_event_set_mixer_volume(
+    char msg[128];
+    float new_volume = settings->floats.audio_mixer_volume + gain;
+    new_volume       = MAX(new_volume, -80.0f);
+-   new_volume       = MIN(new_volume, 12.0f);
++   new_volume       = MIN(new_volume, 0.0f);
+    configuration_set_float(settings, settings->floats.audio_mixer_volume, new_volume);
+    _len             = strlcpy(msg, msg_hash_to_str(MSG_AUDIO_VOLUME),
+          sizeof(msg));
+diff --git a/menu/menu_setting.c b/menu/menu_setting.c
+index 24fe6af..a1afa1a 100644
+--- a/menu/menu_setting.c
++++ b/menu/menu_setting.c
+@@ -14551,7 +14551,7 @@ static bool setting_append_list(
+                general_write_handler,
+                general_read_handler);
+          (*list)[list_info->index - 1].action_ok = &setting_action_ok_uint;
+-         menu_settings_list_current_add_range(list, list_info, -80, 12, 1.0, true, true);
++         menu_settings_list_current_add_range(list, list_info, -80, 0, 1.0, true, true);
+ 
+ #ifdef HAVE_AUDIOMIXER
+          CONFIG_FLOAT(
+@@ -14567,7 +14567,7 @@ static bool setting_append_list(
+                general_write_handler,
+                general_read_handler);
+          (*list)[list_info->index - 1].action_ok = &setting_action_ok_uint;
+-         menu_settings_list_current_add_range(list, list_info, -80, 12, 1.0, true, true);
++         menu_settings_list_current_add_range(list, list_info, -80, 0, 1.0, true, true);
+          SETTINGS_DATA_LIST_CURRENT_ADD_FLAGS(list, list_info, SD_FLAG_LAKKA_ADVANCED);
+ #endif
+ 

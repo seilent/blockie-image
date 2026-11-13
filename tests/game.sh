@@ -797,6 +797,8 @@ cmp -s <(printf '%s\n' 'nes /usr/share/libretro/shaders/blockie/crt-gdv-mini.gls
   'gba /usr/share/libretro/shaders/blockie/lcd3x.glslp' 'ps1 /usr/share/libretro/shaders/blockie/lcd3x.glslp') \
   "$t/shader-defaults" || { ok=1; echo "  shipped shader-defaults"; }
 ! grep -q 'audio_volume' "$share/blockie.cfg" || ok=1
+! grep -Eq '^(audio_dsp_plugin|audio_filter_dir)' "$share/blockie.cfg" || { ok=1; echo "  blockie.cfg sets a DSP plugin or its directory"; }
+[[ -z $(find /usr/lib64/retroarch/filters/audio -type f 2> /dev/null) ]] || { ok=1; echo "  a file under /usr/lib64/retroarch/filters/audio"; }
 ! grep -q '^core_options_path' "$share/blockie.cfg" || { ok=1; echo "  blockie.cfg sets core_options_path"; }
 for l in 'menu_show_online_updater = "false"' 'menu_show_core_updater = "false"' 'core_updater_buildbot_cores_url = ""' \
   'core_updater_buildbot_assets_url = ""' 'netplay_public_announce = "false"' 'network_cmd_enable = "false"'; do
@@ -804,7 +806,7 @@ for l in 'menu_show_online_updater = "false"' 'menu_show_core_updater = "false"'
 done
 ! grep -Eq '^input_(enable_hotkey|menu_toggle|exit_emulator)_btn' "$share/blockie.cfg" || { ok=1; echo "  a pad hotkey in blockie.cfg"; }
 ! grep -q 'input_menu_toggle_btn' "$pad" || { ok=1; echo "  a pad menu toggle in the autoconfig"; }
-res $ok "base config: dirs, sram autosave every 60 s, cores, pipewire, midi, info cache, gamemode, no save on exit, menu ok on south, positional face buttons with physical labels, shader defaults, volume, stdin commands, no pad hotkeys"
+res $ok "base config: dirs, sram autosave every 60 s, cores, pipewire, midi, info cache, gamemode, no save on exit, menu ok on south, positional face buttons with physical labels, shader defaults, volume, no DSP filter, stdin commands, no pad hotkeys"
 
 if [[ $fails == 0 ]]; then
   echo "game: all ok"

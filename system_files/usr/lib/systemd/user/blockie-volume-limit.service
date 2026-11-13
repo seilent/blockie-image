@@ -1,0 +1,11 @@
+[Unit]
+Description=Push the volume limit to WirePlumber
+After=wireplumber.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/blockie/blockie-volume limit
+
+[Install]
+WantedBy=wireplumber.service

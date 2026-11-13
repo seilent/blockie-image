@@ -283,5 +283,44 @@ cmp -s <(printf '[Login]\nHandlePowerKey=ignore\nHandlePowerKeyLongPress=ignore\
 ! grep -q '^\[Install\]' /usr/lib/systemd/system/geoclue.service || fail "geoclue.service can be enabled"
 [[ -z $(find /etc/systemd /usr/lib/systemd -path '*.wants/*' \( -name 'geoclue*' -o -name 'xdg-*portal*' \)) ]] || fail "a geoclue or portal unit is enabled"
 
+vt=$(mktemp -d)
+wp=/usr/share/wireplumber
+for l in 'name = blockie/volume-limit.lua, type = script/lua' 'provides = custom.blockie-volume-limit' \
+  'requires = [ support.settings, api.mixer ]' 'after = [ support.standard-event-source ]' 'before = [ monitor.alsa ]' \
+  'type = virtual, provides = custom.blockie-audio' \
+  'wants = [ custom.blockie-volume-limit ]' 'custom.blockie-audio = required'; do
+  grep -qxF "    $l" "$wp/wireplumber.conf.d/60-blockie-volume-limit.conf" ||
+    grep -qxF "  $l" "$wp/wireplumber.conf.d/60-blockie-volume-limit.conf" || fail "60-blockie-volume-limit.conf lacks $l"
+done
+spa-json-dump "$wp/wireplumber.conf.d/60-blockie-volume-limit.conf" > "$vt/vl.json" || fail "60-blockie-volume-limit.conf does not parse"
+jq -e '.["wireplumber.settings.schema"]["blockie.volume-limit"] | .type == "float" and .default == 1.0 and .min == 0.05
+  and .max == 1.0' "$vt/vl.json" > /dev/null || fail "the blockie.volume-limit schema entry: $(cat "$vt/vl.json")"
+[[ -s $wp/scripts/blockie/volume-limit.lua ]] || fail "volume-limit.lua missing"
+pf=/usr/share/pipewire/pipewire.conf.d/60-blockie-volume-limit.conf
+spa-json-dump "$pf" > "$vt/pf.json" || fail "$pf does not parse"
+jq -e '.["context.modules"] | length == 1 and (.[0] | .name == "libpipewire-module-filter-chain" and (has("flags") | not)
+  and (.args | (has("audio.rate") | not) and .["audio.channels"] == 2 and .["audio.position"] == ["FL", "FR"]
+  and .["filter.graph"] == {"nodes": [{"type": "builtin", "name": "gain", "label": "linear",
+    "control": {"Mult": 0.0, "Add": 0.0}}], "inputs": ["gain:In"], "outputs": ["gain:Out"]}
+  and .["capture.props"] == {"node.name": "blockie.volume-limit", "media.class": "Audio/Sink", "filter.smart": true,
+    "filter.smart.name": "blockie-volume-limit",
+    "filter.smart.target": {"api.alsa.card.name": "mt6768-mt6358", "media.class": "Audio/Sink"},
+    "state.restore-props": "false"}
+  and .["playback.props"] == {"node.name": "blockie.volume-limit.output", "node.passive": true,
+    "node.dont-fallback": true, "node.linger": true, "state.restore-props": "false", "state.restore-target": "false"}))' \
+  "$vt/pf.json" > /dev/null || fail "60-blockie-volume-limit.conf is not the planned silent filter: $(cat "$vt/pf.json")"
+u=/usr/lib/systemd/user
+for l in Type=oneshot "ExecStart=/usr/libexec/blockie/blockie-volume limit" After=wireplumber.service StartLimitIntervalSec=0 WantedBy=wireplumber.service; do
+  grep -qxF "$l" "$u/blockie-volume-limit.service" || fail "blockie-volume-limit.service lacks $l"
+done
+! grep -Eq '^(RemainAfterExit|PartOf)=' "$u/blockie-volume-limit.service" || fail "blockie-volume-limit.service has RemainAfterExit or PartOf"
+for l in PathChanged=/run/blockie-set/settings Unit=blockie-volume-limit.service WantedBy=default.target; do
+  grep -qxF "$l" "$u/blockie-volume-limit.path" || fail "blockie-volume-limit.path lacks $l"
+done
+[[ $(readlink -f /etc/systemd/user/wireplumber.service.wants/blockie-volume-limit.service) == "$u/blockie-volume-limit.service" &&
+  $(readlink -f /etc/systemd/user/default.target.wants/blockie-volume-limit.path) == "$u/blockie-volume-limit.path" ]] ||
+  fail "the preset does not enable blockie-volume-limit.service and .path"
+rm -rf "${vt:?}"
+
 echo "image: dnf5 $(rpm -q dnf5)"
 echo "image: ok $kver"

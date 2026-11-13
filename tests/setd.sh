@@ -350,9 +350,16 @@ s = m.Store(keys, rules)
 s.publish()
 check(read("buttons") == default_map and oct(os.stat(os.path.join(run, "buttons")).st_mode & 0o777) == "0o644",
       f"the buttons map holds the defaults in 13 lines, 0644: {read('buttons')}")
-check(read("settings") == ["version 1"] + [f"{k} {defaults[k]}" for k in sorted(buttons)] + ["power.clocks trip72-big1443"]
+check(read("settings") == ["version 1"] + [f"{k} {defaults[k]}" for k in sorted(buttons)]
+      + ["power.clocks trip72-big1443", "sound.max_volume 100"]
       and oct(os.stat(os.path.join(run, "settings")).st_mode & 0o777) == "0o644",
       f"the settings map holds every map key in sorted order with its effective value: {read('settings')}")
+mv = keys["sound.max_volume"]
+check(mv["type"] == "u" and mv["default"] == 100 and mv["enum"] == list(range(100, 0, -5)) and mv["map"] is True
+      and mv["group"] == "sound" and mv["label"] == "Max volume",
+      "sound.max_volume loads as u, 100 to 5 step 5, default 100, group sound, mapped")
+check(refused(lambda: s.set("sound.max_volume", 7), "Invalid") and s.get("sound.max_volume") == 100 and stored() is None,
+      "sound.max_volume refuses 7 and keeps 100")
 check(refused(lambda: s.set("buttons.home.tap", "back"), "Invalid") and stored() is None, "an unknown word is Invalid")
 saves = []
 save = s.save

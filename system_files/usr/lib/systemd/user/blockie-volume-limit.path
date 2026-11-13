@@ -1,0 +1,9 @@
+[Unit]
+Description=Push the volume limit when the settings map changes
+
+[Path]
+PathChanged=/run/blockie-set/settings
+Unit=blockie-volume-limit.service
+
+[Install]
+WantedBy=default.target

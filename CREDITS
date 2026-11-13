@@ -19,7 +19,8 @@ packages/waydroid: Fedora's waydroid 1.6.3-1.fc44 source RPM (https://github.com
 rebuilt without mount-secontext.patch and the D-Bus activation file, with namespaces-includes.patch,
 no-debugfs-bind.patch, net-filter-ipforward.patch, lxc-debug-log.patch, container-session.patch and dbus-policy.patch.
 packages/retroarch: Fedora's retroarch 1.22.0-20.fc44 source RPM (https://github.com/libretro/RetroArch,
-GPL-3.0-or-later), rebuilt for GLES with gles-context.patch, upstream RetroArch commit db91cdbf (#18436).
+GPL-3.0-or-later), rebuilt for GLES with gles-context.patch, upstream RetroArch commit db91cdbf (#18436), and
+with volume-cap.patch, which stops its volume, mixer volume and mixer stream volumes at 0 dB.
 packages/libretro-snes9x: Snes9x (https://github.com/libretro/snes9x, fae2fea, the Snes9x licence: non commercial
 use, with LGPL-2.1-or-later and MIT components; the texts under /usr/share/licenses/libretro-snes9x/), built unchanged
 as the libretro core.
