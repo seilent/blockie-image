@@ -2,6 +2,7 @@
 import contextlib
 import fcntl
 import gzip
+import hashlib
 import importlib.machinery
 import importlib.util
 import io
@@ -25,7 +26,8 @@ DATA = f"{T}/data"
 PORTS = f"{DATA}/roms/ports"
 DL = f"{DATA}/steam-dl"
 LIB = f"{DL}/lib"
-GS = f"{DATA}/steam-games/.blockie"
+GAMES = f"{DATA}/steam-games"
+GS = f"{GAMES}/.blockie"
 USR = f"{T}/usr"
 RUN = f"{T}/run"
 SRUN = f"{T}/srun"
@@ -37,7 +39,7 @@ FIX = os.environ["FIXTURES"]
 ME = pwd.getpwuid(os.getuid()).pw_name
 NOW = 1800000000
 os.makedirs(BINS, exist_ok=True)
-for n in ("fake-dd", "fake-systemctl"):
+for n in ("fake-dd", "fake-systemctl", "fake-inhibit", "fake-setpriv"):
     shutil.copyfile(f"{FIX}/{n}", f"{BINS}/{n}")
     os.chmod(f"{BINS}/{n}", 0o755)
 with open(f"{BINS}/nmcli", "w") as f:
@@ -72,6 +74,8 @@ os.environ.update({
     "BLOCKIE_PORTS_STEAM_LISTS": f"{USR}/steam-files", "BLOCKIE_PORTS_DD": f"{BINS}/fake-dd",
     "BLOCKIE_PORTS_STEAM_RUN": SRUN, "BLOCKIE_PORTS_STEAM_USER": ME, "BLOCKIE_PORTS_USER": ME,
     "BLOCKIE_PORTS_CURL": f"{BINS}/curl", "FAKE_T": T, "FAKE_DD": DDJSON, "FAKE_DD_LOG": DDLOG,
+    "BLOCKIE_PORTS_FLOOR": "0", "BLOCKIE_PORTS_INHIBIT": f"{BINS}/fake-inhibit",
+    "BLOCKIE_PORTS_SETPRIV": f"{BINS}/fake-setpriv",
     "BLOCKIE_DD_CONFIG": f"{SDIR}/account.config",
 })
 loader = importlib.machinery.SourceFileLoader("ports", BIN)
@@ -825,8 +829,8 @@ def e2e(world=None, signed=True):
     for p in (SRUN, f"{T}/units"):
         if os.path.lexists(p):
             shutil.rmtree(p)
-    for p in (DDLOG, f"{T}/dd-library.count", f"{T}/dd-scan.count", f"{T}/curl.log", f"{T}/unit.log",
-              f"{T}/systemctl.log"):
+    for p in (DDLOG, f"{T}/dd-library.count", f"{T}/dd-scan.count", f"{T}/dd-pass.count", f"{T}/dd-get.count",
+              f"{T}/curl.log", f"{T}/unit.log", f"{T}/systemctl.log", f"{T}/inhibit.log"):
         if os.path.lexists(p):
             os.unlink(p)
     for d in (f"{SRUN}/req", SDIR, f"{DATA}/cache/ports-tmp", f"{T}/units"):
@@ -1319,6 +1323,400 @@ def _(c):
     for bad in (["art", "9000001", "../x.jpg"], ["art", "9000001", "/x.jpg"], ["art", "9000001", "a/./x.jpg"],
                 ["art", "9000001", "x.jpg", "y"], ["art", "x", "x.jpg"], ["art", "9000001", "a b.jpg"]):
         c(not m.lib_line(bad), f"{bad} accepted")
+
+
+GET = {"Game.exe": "invented exe", "package.json": "{}", "index.html": "<html></html>", "js/rmmz_core.js": "core",
+       "js/main.js": "main", "img/titles1/a.png": "png", "lang/en.json": "en", "lang/en2.json": "en two",
+       "dlc/a.png": "dlc a", "dlc/b.png": "dlc b"}
+GET_DEPOTS = ("9002011", "9002012", "9002013", "9002014", "9002015", "9002016")
+ENGLISH = ["9002011", "9002012", "9002014", "9002015"]
+
+
+def sha1(text):
+    return hashlib.sha1(text.encode()).hexdigest()
+
+
+def get_lib(extra=(), g11=None):
+    return (app("9000201", "Invented Get", langs="english,japanese")
+            + [dep("9000201", "9002011", oslist="windows", g=g11), dep("9000201", "9002012", oslist="windows",
+                                                                      lang="english"),
+               dep("9000201", "9002013", oslist="windows", lang="japanese"), dep("9000201", "9002014", dlc="9002019"),
+               dep("9000201", "9002015", dlc="9002018"), "owned\t9002019", "owned\t9002018"] + list(extra))
+
+
+def get_ready(files=None, world=None):
+    setup()
+    lines = get_lib()
+    w = {"lines": lines, "files": {p: {"data": v} for p, v in (files or GET).items()},
+         "public": {d: [gid(d)] for d in GET_DEPOTS}}
+    w.update(world or {})
+    e2e(w)
+    write(f"{DL}/signed", "signed 1\n")
+    m.unit_library_done(lines, NOW)
+    scan("9002011", list(MZ))
+    for d in GET_DEPOTS[1:]:
+        scan(d, [f"x{d}.dat"])
+    write(f"{USR}/runners.d/test.conf", "CLASSES=rmmz:windows\n")
+    call("steam-lib", "index")
+
+
+def dargs(r):
+    a = r["args"]
+    i = a.index("-depot") + 1
+    out = []
+    while i < len(a) and not a[i].startswith("-"):
+        out.append(a[i])
+        i += 1
+    return out
+
+
+def state():
+    rows = [x.split("\t") for x in games() if x.startswith("app\t9000201\t")]
+    return rows[0][7] if rows else None
+
+
+def digest(choice):
+    return hashlib.sha256(f"9000201\twindows\t-\t{choice}\tsteam-games/9000201".encode()).hexdigest()
+
+
+@case("steam-lib get: the app row from library.tsv, depots neutral, language, DLC in that order, no -qr; the files "
+      "under steam-games/<app>; .got with the digest, each depot's gid, the class, root and size and SHA1 per path; "
+      "pass and get login rows; the list reads got; a missing or bad app id")
+def _(c):
+    get_ready()
+    c(games()[2:] == ["app\t9000201\tInvented Get\trmmz\tenglish\tenglish,japanese\t400\tget\t-"], f"{games()}")
+    rc, out = call("steam-lib", "get", "9000201")
+    c(rc == 0 and out[-1] == "done\t9000201", f"{rc} {out[-3:]} {LOG[-4:]}")
+    runs = dd_runs()
+    c([r["op"] for r in runs] == ["pass", "get"], f"{[r['op'] for r in runs]}")
+    c(runs[0]["args"][:4] == ["-app", "9000201", "-os", "windows"] and dargs(runs[0]) == ENGLISH and
+      "-qr" not in runs[0]["args"] and "-manifest" not in runs[0]["args"], f"{runs[0]['args']}")
+    for p, v in GET.items():
+        f = f"{GAMES}/9000201/{p}"
+        c(os.path.isfile(f) and rd(f) == v and stat.S_IMODE(os.stat(f).st_mode) == 0o644, f"{p} not placed")
+    got = json.loads(rd(f"{GS}/9000201.got"))
+    c(got["digest"] == digest("english") and got["class"] == "rmmz" and got["os"] == "windows" and got["root"] == "",
+      f"{got['digest']} {got['class']} {got['os']} {got['root']!r}")
+    c(sorted(map(tuple, got["depots"])) == sorted((d, gid(d)) for d in ENGLISH), f"{got['depots']}")
+    c(got["files"]["9000201/js/main.js"] == [4, sha1("main")] and len(got["files"]) == len(GET) and
+      sorted(got["placed"]) == sorted(f"9000201/{p}" for p in GET), f"{got['files']}")
+    c([(r["op"], r["result"]) for r in m.read_logins()][-2:] == [("pass", "ok"), ("get", "ok")], f"{m.read_logins()}")
+    c(state() == "got", f"{games()}")
+    c(not os.listdir(f"{GS}/txn") and not [n for n in os.listdir(DL) if n.startswith("app-9000201.")],
+      f"{os.listdir(DL)}")
+    rc, out = call("steam-lib", "get", "x9000201")
+    c(out == ["fail\tx9000201\tother"], f"{out}")
+    rc, out = call("steam-lib", "get", "9000299")
+    c(out == ["fail\t9000299\tother"], f"{out}")
+    with contextlib.redirect_stdout(io.StringIO()):
+        c(m.run(["blockie-ports", "steam-lib", "get"], m.Proto(os.open(os.devnull, os.O_WRONLY))) == 64, "no app")
+
+
+@case("DLC: a DLC depot's fail owned depot reruns the pass once without it, recorded in dlcdrop.tsv and left out of "
+      "the next get until the licence set changes")
+def _(c):
+    get_ready(world={"pass": [{"fail": "owned depot 9002014"}, {}]})
+    rc, out = call("steam-lib", "get", "9000201")
+    passes = dd_runs("pass")
+    c(out[-1] == "done\t9000201" and len(passes) == 2, f"{out[-2:]} {len(passes)} {LOG[-4:]}")
+    c(dargs(passes[0]) == ENGLISH and dargs(passes[1]) == ["9002011", "9002012", "9002015"],
+      f"{[dargs(r) for r in passes]}")
+    lic = m.licence_hash(m.read_library())
+    c(m.read_dlcdrop() == [("9000201", "9002014", lic)], f"{m.read_dlcdrop()}")
+    got = json.loads(rd(f"{GS}/9000201.got"))
+    c(sorted(x[0] for x in got["depots"]) == ["9002011", "9002012", "9002015"], f"{got['depots']}")
+    c([(r["op"], r["result"]) for r in m.read_logins()][-3:] == [("pass", "owned"), ("pass", "ok"), ("get", "ok")],
+      f"{m.read_logins()}")
+    c(games()[2].split("\t")[6] == "300" and state() == "got", f"{games()}")
+    rc, out = call("steam-lib", "get", "9000201")
+    c(out[-1] == "done\t9000201" and dargs(dd_runs("pass")[-1]) == ["9002011", "9002012", "9002015"],
+      f"{out[-1:]} {dargs(dd_runs('pass')[-1])}")
+    m.unit_library_done(get_lib(["owned\t9002017"]), NOW)
+    rc, out = call("steam-lib", "get", "9000201")
+    c(out[-1] == "done\t9000201" and dargs(dd_runs("pass")[-1]) == ENGLISH, f"{dargs(dd_runs('pass')[-1])}")
+
+
+@case("DLC: a base depot's owned depot, a second owned depot in the rerun and app level owned end owned with no mark; "
+      "the rerun inside a rate backoff ends bound with no second DepotDownloader run")
+def _(c):
+    get_ready(world={"pass": [{"fail": "owned depot 9002011"}]})
+    rc, out = call("steam-lib", "get", "9000201")
+    c(out[-1] == "fail\t9000201\towned" and len(dd_runs("pass")) == 1 and m.read_dlcdrop() == [],
+      f"{out[-1:]} {len(dd_runs('pass'))} {m.read_dlcdrop()}")
+    get_ready(world={"pass": [{"fail": "owned depot 9002014"}, {"fail": "owned depot 9002015"}]})
+    rc, out = call("steam-lib", "get", "9000201")
+    c(out[-1] == "fail\t9000201\towned" and len(dd_runs("pass")) == 2 and
+      [r[1] for r in m.read_dlcdrop()] == ["9002014"], f"{out[-1:]} {len(dd_runs('pass'))} {m.read_dlcdrop()}")
+    get_ready(world={"pass": [{"fail": "owned"}]})
+    rc, out = call("steam-lib", "get", "9000201")
+    c(out[-1] == "fail\t9000201\towned" and not os.path.exists(f"{GS}/9000201.owned") and
+      not os.path.exists(f"{PORTS}/.blockie/steam/app-9000201.owned"), f"{out[-1:]}")
+    get_ready(world={"pass": [{"fail": "owned depot 9002014"}, {}]})
+    real = m.steam_dd
+    planted = []
+
+    def dd(proto, op, *a, **kw):
+        run = real(proto, op, *a, **kw)
+        if op == "pass" and not planted:
+            now = int(time.time())
+            m.unit_login_end("get", m.unit_login("get", now), "rate", now)
+            planted.append(now)
+        return run
+    m.steam_dd = dd
+    try:
+        rc, out = call("steam-lib", "get", "9000201")
+    finally:
+        m.steam_dd = real
+    c(out[-1] == "fail\t9000201\tbound" and len(dd_runs("pass")) == 1, f"{out[-1:]} {len(dd_runs('pass'))}")
+
+
+@case("the pass reclass: a pass whose files class an unoffered class ends fail class with no download; an app not "
+      "offered from the scan cache ends fail class with no unit started")
+def _(c):
+    get_ready(files={"Game.exe": "x", "data/a.dat": "y"})
+    rc, out = call("steam-lib", "get", "9000201")
+    c(out[-1] == "fail\t9000201\tclass" and len(dd_runs("pass")) == 1 and not dd_runs("get") and
+      not os.path.exists(f"{GAMES}/9000201/Game.exe"), f"{out[-2:]} {LOG[-3:]}")
+    get_ready()
+    os.unlink(f"{USR}/runners.d/test.conf")
+    rc, out = call("steam-lib", "get", "9000201")
+    c(out == ["fail\t9000201\tclass"] and not dd_runs() and not os.path.exists(f"{T}/systemctl.log"), f"{out}")
+
+
+@case("steam-lib lang: a pick among the choices is kept and the list reads it with get; the next get fetches the "
+      "japanese build, deletes the english files it placed that are unchanged and keeps one the game changed; no "
+      "unchanged orphan is left")
+def _(c):
+    get_ready()
+    call("steam-lib", "get", "9000201")
+    rc, out = call("steam-lib", "lang", "9000201", "klingon")
+    c(out == ["fail\t9000201\tother"] and not os.path.exists(f"{GS}/9000201.lang"), f"{out}")
+    rc, out = call("steam-lib", "lang", "9000201", "japanese")
+    c(rc == 0 and out == ["done\t9000201"] and rd(f"{GS}/9000201.lang") == "japanese\n", f"{out}")
+    line = games()[2].split("\t")
+    c(line[4] == "japanese" and line[7] == "get", f"{line}")
+    write(f"{GAMES}/9000201/lang/en2.json", "changed by the game")
+    files = {k: v for k, v in GET.items() if not k.startswith("lang/")}
+    files["lang/ja.json"] = "ja"
+    w = json.loads(rd(DDJSON))
+    w["files"] = {p: {"data": v} for p, v in files.items()}
+    write(DDJSON, json.dumps(w))
+    old = json.loads(rd(f"{GS}/9000201.got"))
+    rc, out = call("steam-lib", "get", "9000201")
+    c(out[-1] == "done\t9000201" and dargs(dd_runs("pass")[-1]) == ["9002011", "9002013", "9002014", "9002015"],
+      f"{out[-1:]} {dargs(dd_runs('pass')[-1])} {LOG[-3:]}")
+    c(not os.path.exists(f"{GAMES}/9000201/lang/en.json") and rd(f"{GAMES}/9000201/lang/ja.json") == "ja" and
+      rd(f"{GAMES}/9000201/lang/en2.json") == "changed by the game", f"{os.listdir(f'{GAMES}/9000201/lang')}")
+    for dst, (size, h) in old["files"].items():
+        f = f"{GAMES}/{dst}"
+        c(dst.split("/", 1)[1] in files or not os.path.exists(f) or sha1(rd(f)) != h, f"an unchanged orphan {dst}")
+    got = json.loads(rd(f"{GS}/9000201.got"))
+    c(got["digest"] == digest("japanese") and "9000201/lang/en2.json" in got["placed"] and
+      "9000201/lang/en.json" not in got["placed"] and "9000201/lang/en.json" not in got["files"], f"{got['placed']}")
+    c(state() == "got", f"{games()}")
+
+
+@case("steam-lib remove: unchanged placed files and their empty dirs go; a planted save, a changed file and the runner "
+      "profile dir stay; the list offers get again; a re-get places the files and keeps the save; busy with a scope")
+def _(c):
+    get_ready()
+    call("steam-lib", "get", "9000201")
+    base = f"{GAMES}/9000201"
+    write(f"{base}/save/file1.rmmzsave", "invented save")
+    write(f"{base}/js/main.js", "changed by the game")
+    write(f"{base}/.blockie/nw/Local Storage/x", "invented profile")
+    rc, out = call("steam-lib", "remove", "9000201")
+    c(rc == 0 and out == ["done\t9000201"], f"{out} {LOG[-3:]}")
+    c(rd(f"{base}/save/file1.rmmzsave") == "invented save" and rd(f"{base}/js/main.js") == "changed by the game" and
+      os.path.isfile(f"{base}/.blockie/nw/Local Storage/x"), "a save, a changed file or the profile went")
+    c(not any(os.path.exists(f"{base}/{p}") for p in ("Game.exe", "js/rmmz_core.js", "img", "lang", "dlc")),
+      f"{sorted(os.listdir(base))}")
+    got = json.loads(rd(f"{GS}/9000201.got"))
+    c(got == {"digest": "-", "placed": ["9000201/js/main.js"], "files": {"9000201/js/main.js": [4, sha1("main")]}},
+      f"{got}")
+    c(state() == "get", f"{games()}")
+    rc, out = call("steam-lib", "get", "9000201")
+    c(out[-1] == "done\t9000201" and rd(f"{base}/Game.exe") == GET["Game.exe"] and
+      rd(f"{base}/js/main.js") == GET["js/main.js"] and rd(f"{base}/save/file1.rmmzsave") == "invented save",
+      f"{out[-1:]} {LOG[-3:]}")
+    c(state() == "got", f"{games()}")
+    write(f"{T}/scope-rc", "0\n")
+    rc, out = call("steam-lib", "remove", "9000201")
+    c(out == ["fail\t9000201\tbusy"] and os.path.exists(f"{base}/Game.exe"), f"{out}")
+
+
+@case("update: a new public gid or a new depot keeps the digest; the list reads got until the new build is scanned and "
+      "offered, then update, never get; with no runner conf it stays got; the update get leaves got")
+def _(c):
+    get_ready()
+    call("steam-lib", "get", "9000201")
+    m.unit_library_done(get_lib(g11="900201199"), NOW)
+    call("steam-lib", "index")
+    c(state() == "got", f"an unscanned new gid {games()}")
+    scan("9002011", list(MZ), g="900201199")
+    call("steam-lib", "index")
+    c(state() == "update", f"a scanned new gid {games()}")
+    os.unlink(f"{USR}/runners.d/test.conf")
+    call("steam-lib", "index")
+    c(state() == "got", f"no runner conf {games()}")
+    write(f"{USR}/runners.d/test.conf", "CLASSES=rmmz:windows\n")
+    m.unit_library_done(get_lib([dep("9000201", "9002016", oslist="windows")]), NOW)
+    scan("9002011", list(MZ))
+    scan("9002016", ["x9002016.dat"])
+    call("steam-lib", "index")
+    c(state() == "update", f"a new depot {games()}")
+    c(json.loads(rd(f"{GS}/9000201.got"))["digest"] == digest("english"), "digest")
+    rc, out = call("steam-lib", "get", "9000201")
+    got = json.loads(rd(f"{GS}/9000201.got"))
+    c(out[-1] == "done\t9000201" and "9002016" in dargs(dd_runs("pass")[-1]) and
+      ["9002016", gid("9002016")] in got["depots"] and state() == "got", f"{out[-1:]} {got['depots']} {games()}")
+
+
+@case("replay of an app journal left mid copy in steam-games/.blockie/txn: the copy done, the unchanged orphan gone, "
+      "the changed one kept and listed, the .got keys from the journal, the journal gone; a journal in the wrong root, "
+      "an app journal of another op or with an extra install key is dropped untouched")
+def _(c):
+    setup()
+    e2e()
+    base = f"{GAMES}/9000201"
+    write(f"{base}/lang/en.json", "en")
+    write(f"{base}/lang/en2.json", "changed by the game")
+    write(f"{DL}/app-9000201.part/lang/ja.json", "ja")
+    write(f"{DL}/app-9000201.list",
+          f"manifest\t9002013\t{gid('9002013')}\nfile\t{sha1('ja')}\t2\tlang/ja.json\ntotal\t2\n", 0o640)
+    keys = {"depots": [["9002013", gid("9002013")]], "class": "rmmz", "os": "windows", "root": ""}
+    entry = ["lang/ja.json", "9000201/lang/ja.json", 2, sha1("ja")]
+    data = {"op": "steam", "name": "app-9000201", "digest": digest("japanese"), "placed": [entry[1:]],
+            "replaced": [], "copies": [entry], "got": keys,
+            "orphans": [["9000201/lang/en.json", 2, sha1("en")], ["9000201/lang/en2.json", 6, sha1("en two")]]}
+    m.journal("steam-app-9000201", data, m.GAMES_TXN)
+    with m.game_lock():
+        m.replay()
+    c(rd(f"{base}/lang/ja.json") == "ja" and not os.path.exists(f"{base}/lang/en.json") and
+      rd(f"{base}/lang/en2.json") == "changed by the game", f"{sorted(os.listdir(f'{base}/lang'))} {LOG[-3:]}")
+    got = json.loads(rd(f"{GS}/9000201.got"))
+    want = dict(keys, digest=digest("japanese"), placed=["9000201/lang/ja.json", "9000201/lang/en2.json"],
+                files={"9000201/lang/ja.json": [2, sha1("ja")], "9000201/lang/en2.json": [6, sha1("en two")]})
+    c(got == want, f"{got}")
+    c(not os.listdir(m.GAMES_TXN) and not os.path.exists(f"{DL}/app-9000201.part"), f"{os.listdir(m.GAMES_TXN)}")
+    before = rd(f"{GS}/9000201.got")
+    port = {"op": "steam", "name": "alpha.zip", "digest": "x", "placed": [], "replaced": [], "copies": []}
+    for txn, n, d in ((m.GAMES_TXN, "steam-alpha.zip", port),
+                      (m.GAMES_TXN, "steam-app-9000202", {"op": "install", "name": "app-9000202",
+                                                          "new": [f"{base}/lang/ja.json"]}),
+                      (m.GAMES_TXN, "steam-app-9000201", dict(data, got=dict(keys, digest="x"))),
+                      (m.TXN, "steam-app-9000201", data)):
+        m.journal(n, d, txn)
+    LOG.clear()
+    with m.game_lock():
+        m.replay()
+    c(sum("dropped the unreadable journal" in x for x in LOG) == 4 and rd(f"{GS}/9000201.got") == before and
+      rd(f"{base}/lang/ja.json") == "ja" and not os.listdir(m.GAMES_TXN) and not os.listdir(m.TXN), f"{LOG}")
+
+
+@case("the pass note: a pass whose build classes unoffered stops the list offering get after that one pass and the "
+      "next get ends class with no unit; a scan of the same gids written after the note replaces it")
+def _(c):
+    get_ready(files={"Game.exe": "x", "data/a.dat": "y"})
+    rc, out = call("steam-lib", "get", "9000201")
+    c(out[-1] == "fail\t9000201\tclass" and state() is None, f"{out[-1:]} {games()}")
+    note = json.loads(rd(f"{GS}/9000201.pass"))
+    pairs = sorted([d, gid(d)] for d in ENGLISH)
+    c(note["class"] == "win32" and note["os"] == "windows" and note["pairs"] == pairs and note["lib"] == pairs,
+      f"{note}")
+    rc, out = call("steam-lib", "get", "9000201")
+    c(out == ["fail\t9000201\tclass"] and len(dd_runs("pass")) == 1, f"{out} {len(dd_runs('pass'))}")
+    time.sleep(0.05)
+    scan("9002011", list(MZ))
+    for d in ENGLISH[1:]:
+        scan(d, [f"x{d}.dat"])
+    call("steam-lib", "index")
+    c(state() == "get" and not os.path.exists(f"{GS}/9000201.pass"), f"{games()}")
+
+
+@case("logins: a network result doubles only from a row of its own class, so an app get's network leaves the next "
+      "library network at 600 s and the reverse; a rate result still doubles across classes")
+def _(c):
+    t = NOW
+    for first, then, kind, want in (("get", "library", "network", 600), ("library", "get", "network", 600),
+                                    ("get", "library", "rate", 1200), ("scan", "library", "network", 1200)):
+        setup()
+        m.unit_login_end(first, m.unit_login(first, t), kind, t)
+        m.unit_login_end(then, m.unit_login(then, t + 1000), kind, t + 1000)
+        r = m.read_logins()[-1]
+        c((r["op"], r["result"], r["backoff"]) == (then, kind, want), f"{first} then {then} {kind}: {r}")
+
+
+@case("the unit floor on an app get: a got line under the floor ends fail space with no game file placed and a space "
+      "login row")
+def _(c):
+    get_ready()
+    os.environ["BLOCKIE_PORTS_FLOOR"] = str(1 << 62)
+    try:
+        rc, out = call("steam-lib", "get", "9000201")
+    finally:
+        os.environ["BLOCKIE_PORTS_FLOOR"] = "0"
+    r = m.read_logins()[-1]
+    c(out[-1] == "fail\t9000201\tspace" and not os.path.exists(f"{GAMES}/9000201/Game.exe") and
+      (r["op"], r["result"]) == ("get", "space"), f"{out[-1:]} {r}")
+
+
+@case("steam-lib remove: a unit clean that fails after the files went still runs the index, so the list reads get")
+def _(c):
+    get_ready()
+    call("steam-lib", "get", "9000201")
+    write(f"{T}/start-fails", "")
+    try:
+        rc, out = call("steam-lib", "remove", "9000201")
+    finally:
+        os.unlink(f"{T}/start-fails")
+    c(out == ["fail\t9000201\tother"] and not os.path.exists(f"{GAMES}/9000201/Game.exe") and state() == "get",
+      f"{out} {games()}")
+
+
+@case("the pass note gives way to a correction row and to an engines.tsv change, so the app is offered again; a note "
+      "with a class or status out of form, or for an app no longer in the library, is dropped at index")
+def _(c):
+    for how in ("correction", "engines"):
+        get_ready(files={"Game.exe": "x", "data/a.dat": "y"})
+        call("steam-lib", "get", "9000201")
+        c(state() is None and os.path.exists(f"{GS}/9000201.pass"), f"{how}: before {games()}")
+        if how == "correction":
+            write(f"{USR}/corrections.tsv", "app\tgid\tclass\n9000201\t-\trmmz:windows\n")
+        else:
+            write(f"{USR}/engines.tsv", "".join(x + "\n" for x in rd(f"{SHIP}/engines.tsv").splitlines()
+                                                if not x.startswith("win32\t")))
+        call("steam-lib", "index")
+        c(state() == "get" and not os.path.exists(f"{GS}/9000201.pass"), f"{how}: {games()}")
+    get_ready()
+    note = {"os": "windows", "pairs": sorted([d, gid(d)] for d in ENGLISH), "lib": sorted([d, gid(d)] for d in ENGLISH),
+            "class": "win32", "root": "", "status": "-", "table": m.table_hash()}
+    for bad in ({"class": "win32\tx"}, {"status": "invented"}, {"root": "../x"}):
+        write(f"{GS}/9000201.pass", json.dumps(dict(note, **bad)))
+        call("steam-lib", "index")
+        c(state() == "get" and not os.path.exists(f"{GS}/9000201.pass"), f"{bad}: {games()}")
+    write(f"{GS}/9000999.pass", json.dumps(dict(note)))
+    call("steam-lib", "index")
+    c(not os.path.exists(f"{GS}/9000999.pass"), "a note for an app outside the library kept")
+
+
+@case("an app journal whose install keys are out of form is dropped before any copy or source drop")
+def _(c):
+    setup()
+    e2e()
+    write(f"{DL}/app-9000201.part/lang/ja.json", "ja")
+    write(f"{DL}/app-9000201.list", f"file\t{sha1('ja')}\t2\tlang/ja.json\ntotal\t2\n", 0o640)
+    entry = ["lang/ja.json", "9000201/lang/ja.json", 2, sha1("ja")]
+    for keys in ({"depots": [], "class": "rmmz", "os": "windows"}, {"depots": [], "class": "rmmz", "os": "windows",
+                                                                   "root": "", "digest": "x"}, None):
+        m.journal("steam-app-9000201", {"op": "steam", "name": "app-9000201", "digest": "x", "placed": [entry[1:]],
+                                        "replaced": [], "copies": [entry], "got": keys, "orphans": []}, m.GAMES_TXN)
+        LOG.clear()
+        with m.game_lock():
+            m.replay()
+        c(not os.path.exists(f"{GAMES}/9000201/lang/ja.json") and rd(f"{DL}/app-9000201.part/lang/ja.json") == "ja" and
+          not os.path.exists(f"{GS}/9000201.got") and not os.listdir(m.GAMES_TXN) and
+          any("dropped the unreadable journal" in x for x in LOG), f"{keys}: {LOG}")
 
 
 print(f"steam-lib: {fails} failed" if fails else "steam-lib: python cases ok", flush=True)

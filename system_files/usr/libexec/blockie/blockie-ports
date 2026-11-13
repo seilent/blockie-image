@@ -155,6 +155,10 @@ ART_PATH = re.compile(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*")
 ART_MAX = 50
 ART_BYTES = 4 << 20
 CURL = os.environ.get("BLOCKIE_PORTS_CURL", "curl")
+APP_INST = re.compile(r"app-([0-9]+)")
+GAMES_TXN = os.path.join(GAMES_STATE, "txn")
+APP_REQ = ("op", "port", "login", "paths", "os", "choice", "drop")
+LIB_ARGS = {"get": 1, "remove": 1, "lang": 2}
 
 
 class Fail(Exception):
@@ -471,13 +475,13 @@ def unpack_tree(path, md5, proto):
     record(path, md5)
 
 
-def journal(name, data):
-    os.makedirs(TXN, 0o755, exist_ok=True)
-    write_atomic(os.path.join(TXN, name), json.dumps(data).encode())
+def journal(name, data, txn=TXN):
+    os.makedirs(txn, 0o755, exist_ok=True)
+    write_atomic(os.path.join(txn, name), json.dumps(data).encode())
 
 
-def drop_journal(name):
-    remove(os.path.join(TXN, name))
+def drop_journal(name, txn=TXN):
+    remove(os.path.join(txn, name))
 
 
 def mark_update(name):
@@ -496,29 +500,39 @@ def rollback(data):
 
 
 def replay():
-    try:
-        names = sorted(os.listdir(TXN))
-    except FileNotFoundError:
-        return
-    for n in names:
-        p = os.path.join(TXN, n)
-        if ".tmp-" not in n:
-            try:
-                with open(p) as f:
-                    data = json.load(f)
-                if data.get("op") == "steam":
-                    steam_replay(data)
-                else:
-                    update = data.get("op") == "update"
-                    if not (update and data.get("extracted")):
-                        rollback(data)
-                    if update and PORT.fullmatch(str(data.get("name"))):
-                        mark_update(data["name"])
-                log(f"replayed the journal of {n}")
-            except (OSError, ValueError, AttributeError, TypeError, KeyError, Fail) as err:
-                log(f"dropped the unreadable journal {n}: {type(err).__name__ if QUIET[0] else err}")
-        remove(p)
-    fsync_dir(TXN)
+    for txn in (TXN, GAMES_TXN):
+        try:
+            names = sorted(os.listdir(txn))
+        except FileNotFoundError:
+            continue
+        except OSError as err:
+            log(f"replay: {txn} not read, {type(err).__name__}")
+            continue
+        for n in names:
+            p = os.path.join(txn, n)
+            if ".tmp-" not in n:
+                try:
+                    with open(p) as f:
+                        data = json.load(f)
+                    app = APP_INST.fullmatch(str(data.get("name"))) is not None
+                    if app != (txn == GAMES_TXN) or (app and data.get("op") != "steam"):
+                        raise ValueError("a journal in the other dir")
+                    if data.get("op") == "steam":
+                        steam_replay(data)
+                    else:
+                        update = data.get("op") == "update"
+                        if not (update and data.get("extracted")):
+                            rollback(data)
+                        if update and PORT.fullmatch(str(data.get("name"))):
+                            mark_update(data["name"])
+                    log(f"replayed the journal of {n}")
+                except (OSError, ValueError, AttributeError, TypeError, KeyError, Fail) as err:
+                    log(f"dropped the unreadable journal {n}: {type(err).__name__ if QUIET[0] else err}")
+            remove(p)
+        try:
+            fsync_dir(txn)
+        except OSError as err:
+            log(f"replay: {txn} not synced, {type(err).__name__}")
 
 
 def whole(v):
@@ -759,8 +773,9 @@ def make_feed(hmod, proto):
 
 
 class Ctx:
-    def __init__(self, proto):
+    def __init__(self, proto, args=()):
         self.proto = proto
+        self.args = list(args)
         self.hmod = None
         self.feed = None
 
@@ -1361,8 +1376,14 @@ def read_signed():
         return False
 
 
+def where(name):
+    app = APP_INST.fullmatch(name)
+    return (GAMES, GAMES_STATE, app.group(1)) if app else (PORTS, STEAM_STATE, name)
+
+
 def mark(name, kind):
-    return os.path.join(STEAM_STATE, f"{name}.{kind}")
+    _, state, key = where(name)
+    return os.path.join(state, f"{key}.{kind}")
 
 
 def read_json(path):
@@ -1664,21 +1685,22 @@ def steam_dd(proto, op, name, login, paths=None, total=None, extra=None, on_line
     return run
 
 
-def outcome(run, name, op):
+def outcome(run, name, op, dlc=None):
     if run.stopped:
         return run.stopped
     if run.fail:
         if run.fail == "owned":
-            write_atomic(mark(name, "owned"), b"", 0o600)
+            if dlc is None:
+                write_atomic(mark(name, "owned"), b"", 0o600)
             return "owned"
         if run.fail == "owned depot" or owned_depot(["fail", *run.fail.split(" ")]):
-            return "owned"
+            return "dlc" if dlc and run.fail.split(" ")[-1] in dlc else "owned"
         if run.fail == "rate":
             return "network"
         if run.fail in ("depot", "branch"):
             log(f"{name}: fail {run.fail}, the map row does not match Steam")
             return "other"
-        return run.fail if run.fail in ("login", "expired", "network", "space") else "other"
+        return run.fail if run.fail in ("login", "expired", "network", "space", "bound") else "other"
     if run.rc == 0 and run.end and (op != "pass" or run.total is not None):
         return None
     if run.rc == 0 or not run.seen:
@@ -1717,25 +1739,29 @@ def sha1_file(path):
     return h.hexdigest()
 
 
-def inside_port(row, dst):
-    base = os.path.realpath(os.path.join(PORTS, row["into"].split("/", 1)[0]))
-    parent = os.path.realpath(os.path.dirname(os.path.join(PORTS, dst)))
+def inside_port(name, row, dst):
+    if APP_INST.fullmatch(name):
+        return inside_port_dst(name, dst)
+    top = where(name)[0]
+    base = os.path.realpath(os.path.join(top, row["into"].split("/", 1)[0]))
+    parent = os.path.realpath(os.path.dirname(os.path.join(top, dst)))
     return parent == base or parent.startswith(base + "/")
 
 
 def merge(name, row, lst):
+    top = where(name)[0]
     got = read_json(mark(name, "got")) or {}
     ours = {p for p in got.get("placed", []) if isinstance(p, str)}
     plan = {"fetch": [], "replace": [], "placed": [], "skip": 0}
     for path, size, sha1 in lst["files"]:
         dst = f"{row['into']}/{path}"
-        full = os.path.join(PORTS, dst)
-        if not inside_port(row, dst):
+        full = os.path.join(top, dst)
+        if not inside_port(name, row, dst):
             raise Fail("other")
         parent = os.path.dirname(full)
-        while parent != PORTS and not os.path.lexists(parent):
+        while parent != top and not os.path.lexists(parent):
             parent = os.path.dirname(parent)
-        if parent != PORTS and not stat.S_ISDIR(os.lstat(parent).st_mode):
+        if parent != top and not stat.S_ISDIR(os.lstat(parent).st_mode):
             raise Fail("exists")
         try:
             st = os.lstat(full)
@@ -1776,11 +1802,11 @@ def floor_check(name, plan):
 
 
 def aside(name, dst):
-    return os.path.join(STEAM_STATE, f"{name}.replaced", dst)
+    return os.path.join(mark(name, "replaced"), dst)
 
 
 def place(name, path, dst, n):
-    full = os.path.join(PORTS, dst)
+    full = os.path.join(where(name)[0], dst)
     src = os.open(os.path.join(STEAM_DL, f"{name}.part", path), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
     try:
         st = os.fstat(src)
@@ -1816,9 +1842,9 @@ def copy_all(proto, name, entries, replaced):
     for n, (path, dst, sz, sha1) in enumerate(entries):
         if CANCEL[0]:
             raise Fail("cancel")
-        if not inside_port_dst(dst):
+        if not inside_port_dst(name, dst):
             raise Fail("other")
-        full = os.path.join(PORTS, dst)
+        full = os.path.join(where(name)[0], dst)
         if dst in replaced and os.path.lexists(full) and not os.path.lexists(aside(name, dst)):
             os.makedirs(os.path.dirname(aside(name, dst)), 0o755, exist_ok=True)
             os.rename(full, aside(name, dst))
@@ -1835,33 +1861,93 @@ def copy_all(proto, name, entries, replaced):
                 proto.progress("copy", done, len(entries))
 
 
-def inside_port_dst(dst):
+def inside_port_dst(name, dst):
     if not rel_ok(dst):
         return False
-    base = os.path.realpath(os.path.join(PORTS, dst.split("/", 1)[0]))
-    parent = os.path.realpath(os.path.dirname(os.path.join(PORTS, dst)))
-    return dst.split("/", 1)[0] not in KEEP and (parent == base or parent.startswith(base + "/"))
+    top, _, key = where(name)
+    parts = dst.split("/")
+    base = os.path.realpath(os.path.join(top, parts[0]))
+    parent = os.path.realpath(os.path.dirname(os.path.join(top, dst)))
+    own = top == PORTS or (parts[0] == key and parts[1:2] != [".blockie"]
+                           and os.path.dirname(base) == os.path.realpath(top))
+    return parts[0] not in KEEP and own and (parent == base or parent.startswith(base + "/"))
+
+
+def drop_unchanged(name, files, rmroot):
+    games, _, key = where(name)
+    root = os.path.join(games, key)
+    dirs, kept = set(), []
+    for f in files:
+        if not (isinstance(f, list) and len(f) == 3 and isinstance(f[0], str) and inside_port_dst(name, f[0])):
+            continue
+        full = os.path.join(games, f[0])
+        try:
+            st = os.lstat(full)
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISREG(st.st_mode):
+            continue
+        try:
+            same = st.st_size == f[1] and sha1_file(full) == f[2]
+        except OSError:
+            same = False
+        if not same:
+            kept.append(f)
+            continue
+        os.unlink(full)
+        dirs.add(os.path.dirname(full))
+    for d in sorted(dirs, key=lambda p: -p.count("/")):
+        while d.startswith(root + "/") or (rmroot and d == root):
+            try:
+                os.rmdir(d)
+            except OSError:
+                break
+            d = os.path.dirname(d)
+    return kept
+
+
+def got_files(name):
+    files = (read_json(mark(name, "got")) or {}).get("files")
+    if not isinstance(files, dict):
+        return []
+    return [[d, v[0], v[1]] for d, v in files.items()
+            if isinstance(v, list) and len(v) == 2 and isinstance(v[0], int) and isinstance(v[1], str)]
+
+
+def app_keys(data):
+    if not (isinstance(data.get("got"), dict) and set(data["got"]) == {"depots", "class", "os", "root"}):
+        raise ValueError("an app journal without its install keys")
 
 
 def finish(name, data):
-    write_atomic(mark(name, "got"), json.dumps({"digest": data["digest"],
-                                                "placed": [x[0] for x in data["placed"]]}).encode(), 0o600)
-    remove(os.path.join(STEAM_STATE, f"{name}.replaced"))
+    got = {"digest": data["digest"], "placed": [x[0] for x in data["placed"]]}
+    if APP_INST.fullmatch(name):
+        app_keys(data)
+        kept = drop_unchanged(name, data.get("orphans", []), False)
+        got.update(data["got"], placed=got["placed"] + [x[0] for x in kept],
+                   files={x[0]: [x[1], x[2]] for x in [*data["placed"], *kept]})
+    write_atomic(mark(name, "got"), json.dumps(got).encode(), 0o600)
+    remove(mark(name, "replaced"))
     remove(mark(name, "dropped"))
     steam_op(name, "clean")
 
 
 def steam_replay(data):
     name = data.get("name")
-    if not isinstance(name, str) or not PORT.fullmatch(name) or not isinstance(data.get("digest"), str):
+    if not isinstance(name, str) or not (PORT.fullmatch(name) or APP_INST.fullmatch(name)) or not isinstance(
+            data.get("digest"), str):
         raise ValueError("a steam journal without a port or digest")
+    if APP_INST.fullmatch(name):
+        app_keys(data)
+    base = where(name)[0]
     copies = [tuple(c) for c in data["copies"]]
     replaced = set(data["replaced"])
-    if not all(len(c) == 4 and rel_ok(c[0]) and inside_port_dst(c[1]) for c in copies):
+    if not all(len(c) == 4 and rel_ok(c[0]) and inside_port_dst(name, c[1]) for c in copies):
         raise ValueError("a steam journal entry outside the port")
-    if not all(os.path.isdir(os.path.join(PORTS, c[1].split("/", 1)[0])) for c in copies):
+    if not APP_INST.fullmatch(name) and not all(os.path.isdir(os.path.join(base, c[1].split("/", 1)[0]))
+                                                for c in copies):
         raise ValueError("a steam journal for a port dir that is gone")
-    for d in sorted({os.path.dirname(os.path.join(PORTS, c[1])) for c in copies}):
+    for d in sorted({os.path.dirname(os.path.join(base, c[1])) for c in copies}):
         os.makedirs(d, 0o755, exist_ok=True)
         for e in os.listdir(d):
             m = re.fullmatch(r"\.blockie-tmp-([0-9]+)-[0-9]+", e)
@@ -1870,7 +1956,7 @@ def steam_replay(data):
     todo = []
     drops = []
     for path, dst, size, sha1 in copies:
-        full = os.path.join(PORTS, dst)
+        full = os.path.join(base, dst)
         if not os.path.lexists(os.path.join(STEAM_DL, f"{name}.part", path)):
             continue
         try:
@@ -1895,15 +1981,43 @@ def steam_replay(data):
     finish(name, data)
 
 
-def steam_get(proto, name):
-    row = load_map().get(name)
-    if not row_offered(name, row, read_apps(), installed_dirs(), updates_offered()):
-        raise Fail("other")
+def app_reclass(row, lst):
+    view = lib_view([p for p, _, _ in lst["files"]])
+    table = load_engines()
+    builds = {row["os"]: [(d, g, 0) for d, g in lst["manifests"]]}
+    cls, root, status = app_classes(row["app"], {row["os"]: view}, builds, table, load_corrections())[row["os"]]
+    pairs = sorted(list(x) for x in lst["manifests"])
+    write_atomic(os.path.join(GAMES_STATE, f"{row['app']}.pass"), json.dumps(
+        {"os": row["os"], "pairs": pairs, "lib": row["pairs"], "class": cls, "root": root, "status": status,
+         "table": table_hash()}).encode())
+    if f"{cls}:{row['os']}" not in load_offered():
+        log(f"{row['port']}: the pass classes it {cls}:{row['os']}, not offered")
+        return False
+    row["got"] = {"depots": pairs, "class": cls, "os": row["os"], "root": root}
+    return True
+
+
+def steam_get(proto, name, row=None):
+    if row is None:
+        row = load_map().get(name)
+        if not row_offered(name, row, read_apps(), installed_dirs(), updates_offered()):
+            raise Fail("other")
+    app = APP_INST.fullmatch(name) is not None
     login = "token" if read_signed() else "qr"
     qr_used = login == "qr"
+    drops, reran = set(row.get("drops", ())), False
     while True:
-        run = steam_dd(proto, "pass", name, login)
-        why = outcome(run, name, "pass")
+        extra = {"os": row["os"], "choice": row["choice"], "drop": sorted(drops)} if app else None
+        run = steam_dd(proto, "pass", name, login, extra=extra)
+        why = outcome(run, name, "pass", (set() if reran else row["dlc"] - drops) if app else None)
+        if why == "dlc":
+            depot = run.fail.split(" ")[-1]
+            log(f"{name}: a DLC depot is not the account's, the pass runs once without it")
+            drops.add(depot)
+            row["pairs"] = [x for x in row["pairs"] if x[0] != depot]
+            dlcdrop_add(row["app"], depot, row["lic"])
+            login, reran = "token", True
+            continue
         if why == "login" and not qr_used:
             login, qr_used = "qr", True
             continue
@@ -1914,13 +2028,15 @@ def steam_get(proto, name):
         lst = read_list(name)
         if lst is None:
             return "other"
+        if app and not app_reclass(row, lst):
+            return "class"
         plan = merge(name, row, lst)
         if not plan["fetch"]:
             break
         floor_check(name, plan)
         paths = None if len(plan["fetch"]) == len(lst["files"]) else [x[0] for x in plan["fetch"]]
-        run = steam_dd(proto, "get", name, "token", paths, sum(x[2] for x in plan["fetch"]))
-        why = outcome(run, name, "get")
+        run = steam_dd(proto, "get", name, "token", paths, sum(x[2] for x in plan["fetch"]), extra=extra)
+        why = outcome(run, name, "get", set() if app else None)
         if why == "login" and not qr_used:
             login, qr_used = "qr", True
             continue
@@ -1932,30 +2048,30 @@ def steam_get(proto, name):
     os.sync()
     data = {"op": "steam", "name": name, "digest": row["digest"], "placed": plan["placed"],
             "replaced": plan["replace"], "copies": entries}
+    txn = TXN
+    if app:
+        txn = GAMES_TXN
+        new = {x[0] for x in plan["placed"]}
+        data.update(got=row["got"], orphans=[x for x in got_files(name) if x[0] not in new])
     with game_lock():
-        journal(f"steam-{name}", data)
+        journal(f"steam-{name}", data, txn)
         if entries:
             copy_all(proto, name, entries, set(plan["replace"]))
         finish(name, data)
-        drop_journal(f"steam-{name}")
+        drop_journal(f"steam-{name}", txn)
     return None
 
 
-def cmd_steam_get(name, ctx):
-    if not PORT.fullmatch(name):
-        raise Fail("other")
-    if scope_active():
-        raise Fail("busy")
-    if offline():
-        raise Fail("network")
-    os.makedirs(STEAM_STATE, 0o755, exist_ok=True)
+def steam_fetch(proto, name, row=None):
+    for d in (STEAM_STATE, where(name)[1]):
+        os.makedirs(d, 0o755, exist_ok=True)
     stop_units()
     steam_op(ACCOUNT, "clean")
     with game_lock():
         replay()
     hold = idle_hold()
     try:
-        why = steam_get(ctx.proto, name)
+        why = steam_get(proto, name, row)
     finally:
         idle_release(hold)
     if why == "cancel":
@@ -1965,6 +2081,16 @@ def cmd_steam_get(name, ctx):
             log(f"{name}: clean after the stop failed, the next get resumes in the part dir")
     if why:
         raise Fail(why)
+
+
+def cmd_steam_get(name, ctx):
+    if not PORT.fullmatch(name):
+        raise Fail("other")
+    if scope_active():
+        raise Fail("busy")
+    if offline():
+        raise Fail("network")
+    steam_fetch(ctx.proto, name)
 
 
 def cmd_steam_logout(name, ctx):
@@ -2395,6 +2521,66 @@ def dlcdrop_add(app, depot, lic):
     write_atomic(DLCDROP, "".join("\t".join(r) + "\n" for r in rows).encode())
 
 
+def lib_pass(app, builds, th):
+    path = os.path.join(GAMES_STATE, f"{app}.pass")
+    note = read_json(path)
+    if note is None or note.get("table") != th or not isinstance(note.get("os"), str) or not (
+            CLASS.fullmatch(str(note.get("class"))) and note.get("status") in ("-", "firm", "provisional")
+            and isinstance(note.get("root"), str) and (note["root"] == "" or rel_ok(note["root"]))):
+        return None, path
+    cur = sorted([d, g] for d, g, _ in builds.get(note["os"], []))
+    try:
+        at = os.stat(path).st_mtime_ns
+        scanned = bool(cur) and all(os.stat(paths_file(d, g)).st_mtime_ns >= at for d, g in cur)
+    except OSError:
+        scanned = False
+    if not cur or cur not in (note.get("lib"), note.get("pairs")) or scanned:
+        return None, path
+    return note, path
+
+
+def lib_entry(app, info, lib, lic, failed, table, fixes, th):
+    choice, choices, builds = lib_builds(app, info, lib, dlcdrop_active(app, lic))
+    views, pending = {}, False
+    for os_name, build in builds.items():
+        lists = [read_paths(d, g) for d, g, _ in build]
+        if all(x is not None for x in lists):
+            views[os_name] = lib_view(lib_merged(lists))
+        elif any(x is None and not scanfail_skip(failed, d, g) for x, (d, g, _) in zip(lists, build)):
+            pending = True
+    classes = app_classes(app, views, builds, table, fixes)
+    note, _ = lib_pass(app, builds, th)
+    if note is not None:
+        classes[note["os"]] = [note["class"], note["root"], note["status"]]
+    return choice, choices, builds, classes, pending
+
+
+def lib_arch(info, build):
+    ids = {d for d, _, _ in build}
+    return next((d["arch"] for d in info["depots"] if d["depot"] in ids and d["arch"]), "-")
+
+
+def app_digest(app, os_name, arch, choice):
+    return hashlib.sha256("\t".join((app, os_name, arch, choice, f"steam-games/{app}")).encode()).hexdigest()
+
+
+def lib_state(app, info, choice, builds, pick, on, th):
+    got = read_json(mark(f"app-{app}", "got")) or {}
+    placed = got.get("placed")
+    if not isinstance(placed, list) or not any(
+            isinstance(p, str) and rel_ok(p) and os.path.lexists(os.path.join(GAMES, p)) for p in placed):
+        return None, got
+    os_name = got.get("os")
+    build = builds.get(os_name, []) if isinstance(os_name, str) else []
+    if not build or got.get("digest") != app_digest(app, os_name, lib_arch(info, build), choice):
+        return "get", got
+    have = sorted(list(x) for x in got.get("depots", []) if isinstance(x, list))
+    want = sorted([d, g] for d, g, _ in build)
+    note, _ = lib_pass(app, builds, th)
+    behind = note is not None and want == note.get("lib") and have == note.get("pairs")
+    return ("update" if on and pick == os_name and have != want and not behind else "got"), got
+
+
 def lib_index():
     try:
         lib = read_library()
@@ -2410,36 +2596,39 @@ def lib_index():
     ports = {}
     for name, row in sorted(load_map().items()):
         ports.setdefault(row["app"], name)
-    classes_out, games = [f"hash\t{table_hash()}\n"], []
+    th = table_hash()
+    classes_out, games, checked = [f"hash\t{th}\n"], [], set()
     done = total = 0
     for app in sorted(lib["apps"], key=int):
         info = lib["apps"][app]
         kept = lib_kept(info)
         if not kept and app not in ports:
             continue
-        choice, choices, builds = lib_builds(app, info, lib, dlcdrop_active(app, lic))
-        views, pending = {}, False
-        for os_name, build in builds.items():
-            lists = [read_paths(d, g) for d, g, _ in build]
-            if all(x is not None for x in lists):
-                views[os_name] = lib_view(lib_merged(lists))
-            elif any(x is None and not scanfail_skip(failed, d, g) for x, (d, g, _) in zip(lists, build)):
-                pending = True
+        choice, choices, builds, classes, pending = lib_entry(app, info, lib, lic, failed, table, fixes, th)
         if kept:
             total += 1
             done += not pending
-        classes = app_classes(app, views, builds, table, fixes)
         for os_name in sorted(classes):
             cls, root, status = classes[os_name]
             pairs = ",".join(f"{d}:{g}" for d, g, _ in builds[os_name])
             classes_out.append(f"{app}\t{os_name}\t{cls}\t{root or '.'}\t{status}\t{pairs}\n")
+        note, note_path = lib_pass(app, builds, th)
+        checked.add(app)
+        if note is None:
+            remove(note_path)
         pick = lib_pick(classes, table, offered)
-        if not ((pick is not None and f"{classes[pick][0]}:{pick}" in offered) or app in ports):
+        on = pick is not None and f"{classes[pick][0]}:{pick}" in offered
+        state, got = lib_state(app, info, choice, builds, pick, on, th) if kept else (None, {})
+        if not (on or app in ports or state):
             continue
         size_os = pick or next(iter(builds), None)
         size = sum(s for _, _, s in builds.get(size_os, []))
-        games.append("\t".join(("app", app, info["name"] or "-", classes[pick][0] if pick else "unknown", choice,
-                                ",".join(sorted(choices)), str(size), "get", ports.get(app, "-"))) + "\n")
+        cls = classes[pick][0] if pick else got.get("class") if CLASS.fullmatch(str(got.get("class"))) else "unknown"
+        games.append("\t".join(("app", app, info["name"] or "-", cls, choice, ",".join(sorted(choices)), str(size),
+                                state or "get", ports.get(app, "-"))) + "\n")
+    for n in os.listdir(GAMES_STATE):
+        if n.endswith(".pass") and DIGITS.fullmatch(n[:-5]) and n[:-5] not in checked:
+            remove(os.path.join(GAMES_STATE, n))
     write_atomic(CLASSES_TSV, "".join(classes_out).encode())
     write_atomic(GAMES_TSV, f"signed\t{int(read_signed())}\nscan\t{done}\t{total}\n{''.join(games)}".encode())
 
@@ -2582,9 +2771,84 @@ def lib_art():
         log(f"steam-lib art: {got} of {tries} fetched")
 
 
+def app_row(app, lib):
+    info = lib["apps"].get(app)
+    if info is None or not lib_kept(info):
+        raise Fail("other")
+    lic = licence_hash(lib)
+    table, fixes, offered = load_engines(), load_corrections(), load_offered()
+    choice, _, builds, classes, _ = lib_entry(app, info, lib, lic, {}, table, fixes, table_hash())
+    pick = lib_pick(classes, table, offered)
+    if pick is None or f"{classes[pick][0]}:{pick}" not in offered:
+        raise Fail("class")
+    ids = [d for d, _, _ in builds[pick]]
+    dlc = {d["depot"] for d in info["depots"] if d["dlc"] is not None and d["depot"] in ids}
+    return {"port": f"app-{app}", "md5": None, "app": app, "os": pick, "depots": ids, "manifests": [],
+            "pairs": sorted([d, g] for d, g, _ in builds[pick]),
+            "branch": None, "into": app, "files": None, "keep": set(), "check": None,
+            "digest": app_digest(app, pick, lib_arch(info, builds[pick]), choice), "choice": choice, "dlc": dlc,
+            "drops": dlcdrop_active(app, lic), "lic": lic}
+
+
+def lib_get(proto, app):
+    lib = lib_read()
+    if lib is None:
+        raise Fail("other")
+    steam_fetch(proto, f"app-{app}", app_row(app, lib))
+
+
+def lib_remove(app):
+    name = f"app-{app}"
+    os.makedirs(GAMES_STATE, 0o755, exist_ok=True)
+    stop_units()
+    with game_lock():
+        replay()
+        kept = drop_unchanged(name, got_files(name), True)
+        if kept:
+            write_atomic(mark(name, "got"), json.dumps({"digest": "-", "placed": [x[0] for x in kept],
+                                                        "files": {x[0]: [x[1], x[2]] for x in kept}}).encode(), 0o600)
+        else:
+            remove(mark(name, "got"))
+        remove(mark(name, "replaced"))
+        remove(mark(name, "dropped"))
+    steam_op(name, "clean")
+
+
+def lib_lang(app, choice):
+    lib = lib_read()
+    info = lib["apps"].get(app) if lib else None
+    if info is None or choice not in lib_choices(info):
+        raise Fail("other")
+    os.makedirs(GAMES_STATE, 0o755, exist_ok=True)
+    write_atomic(os.path.join(GAMES_STATE, f"{app}.lang"), f"{choice}\n".encode())
+
+
 def cmd_steam_lib(name, ctx):
     if name == "index":
         lib_index()
+        return
+    if name in LIB_ARGS:
+        app = ctx.args[0]
+        if not DIGITS.fullmatch(app):
+            raise Fail("other")
+        if name == "lang":
+            lib_lang(app, ctx.args[1])
+            lib_index()
+            return
+        if scope_active():
+            raise Fail("busy")
+        if name == "get" and offline():
+            raise Fail("network")
+        try:
+            if name == "remove":
+                lib_remove(app)
+            else:
+                lib_get(ctx.proto, app)
+        finally:
+            try:
+                lib_index()
+            except (Fail, OSError) as err:
+                log(f"steam-lib {name}: the index after it failed, {type(err).__name__}")
         return
     if name not in ("refresh", "scan", "art"):
         raise Fail("other")
@@ -2825,11 +3089,28 @@ def unit_send(fd, line):
         view = view[os.write(fd, view):]
 
 
+def unit_dd_end(port, op, start, result):
+    if start is None:
+        return
+    try:
+        unit_login_end(op, start, result, int(time.time()))
+    except OSError as err:
+        log(f"{port} {op}: the login row was not closed, {type(err).__name__}")
+
+
 def unit_dd(req, row, port):
     op = req["op"]
     fifo = unit_fifo(port)
     rc = 1
+    start, result = None, "other"
     try:
+        if APP_INST.fullmatch(port):
+            try:
+                start = unit_login(op, int(time.time()))
+            except Fail as err:
+                unit_send(fifo, f"fail\t{err.why}")
+                unit_send(fifo, "rc\t1")
+                return 1
         work = os.path.join(STEAM_DL, f"{port}.{'check' if op == 'pass' else 'part'}")
         try:
             if not unit_own(work):
@@ -2852,7 +3133,7 @@ def unit_dd(req, row, port):
                                  env=dict(os.environ, BLOCKIE_DD_FD=str(w)))
         finally:
             os.close(w)
-        manifests, files, total, end, bad = [], [], None, False, False
+        manifests, files, total, end, bad, space, word = [], [], None, False, False, False, None
         with os.fdopen(r, "rb") as f:
             while True:
                 raw = f.readline(LINE_MAX)
@@ -2874,12 +3155,18 @@ def unit_dd(req, row, port):
                     total = int(fields[1])
                 elif kind == "end" and len(fields) == 1:
                     end = True
-                elif not (kind == "qr" or (kind in ("got", "exp") and len(fields) == 2) or
-                          (kind == "fail" and (len(fields) in (2, 3) or owned_depot(fields)))):
+                elif kind == "got" and len(fields) == 2 and op == "get":
+                    try:
+                        space = free_bytes() <= FLOOR
+                    except OSError:
+                        bad = True
+                elif kind == "fail" and (len(fields) in (2, 3) or owned_depot(fields)):
+                    word = word or fields[1]
+                elif not (kind == "qr" or (kind in ("got", "exp") and len(fields) == 2)):
                     bad = True
-                if bad:
+                if bad or space:
                     p.kill()
-                    unit_send(fifo, "fail\tother")
+                    unit_send(fifo, "fail\tspace" if space else "fail\tother")
                     break
                 try:
                     unit_send(fifo, line)
@@ -2901,10 +3188,42 @@ def unit_dd(req, row, port):
                 os.chmod(tmp, 0o640)
                 os.replace(tmp, lst)
                 unit_rmtree(work)
+        if rc == 0 and end and not bad and (op != "pass" or total is not None):
+            result = "ok"
+        elif space or bad:
+            result = "space" if space else "other"
+        elif word and re.fullmatch(r"[a-z]+", word):
+            result = word
+        unit_dd_end(port, op, start, result)
+        start = None
         unit_send(fifo, f"rc\t{rc}")
         return 0 if rc == 0 and not bad else 1
     finally:
+        unit_dd_end(port, op, start, result)
         os.close(fifo)
+
+
+def unit_app_row(inst, req):
+    if set(req) - set(APP_REQ):
+        raise ValueError("the request names what the unit derives")
+    app = APP_INST.fullmatch(inst).group(1)
+    lib = read_library()
+    info = lib["apps"].get(app) if lib else None
+    if info is None or not lib_kept(info):
+        raise ValueError("the app is not in the library")
+    choices = lib_choices(info)
+    choice, os_name, drop = req.get("choice"), req.get("os"), req.get("drop") or []
+    if not isinstance(choice, str) or choice not in choices or os_name not in lib_oses(info):
+        raise ValueError("the choice or the OS is not the app's")
+    dlc = {d["depot"] for d in info["depots"] if d["dlc"] is not None}
+    if not (isinstance(drop, list) and all(isinstance(x, str) and x in dlc for x in drop)):
+        raise ValueError("a depot to leave out is not a DLC depot of the app")
+    build = lib_build(info, os_name, choices[choice], set() if choice == "-" else set(choice.split("+")),
+                      lib["owned"], set(drop))
+    if not build:
+        raise ValueError("the app has no build")
+    return {"app": app, "os": os_name, "depots": [d for d, _, _ in build], "manifests": [], "branch": None,
+            "files": None}
 
 
 @contextlib.contextmanager
@@ -3033,7 +3352,8 @@ def unit_login_end(op, start, result, now):
                   if rows[i]["op"] == op and rows[i]["start"] == start and rows[i]["result"] == "-"), None)
         if i is None:
             return
-        prev = next((r for r in reversed(rows[:i]) if r["result"] != "-"), None)
+        prev = next((r for r in reversed(rows[:i]) if r["result"] != "-" and
+                     (result != "network" or (r["op"] in LIB_OPS) == (op in LIB_OPS))), None)
         if prev is not None and now - prev["at"] - prev["backoff"] > BACKOFF_MAX_S:
             prev = None
         rows[i] = dict(rows[i], result=result, at=now,
@@ -3222,8 +3542,8 @@ def unit_lib(req):
 
 
 def unit_main(argv):
-    if len(argv) != 1 or not (argv[0] in (ACCOUNT, LIB_INST) or PORT.fullmatch(argv[0])):
-        log("usage: blockie-ports steam-unit <port>|account|lib")
+    if len(argv) != 1 or not (argv[0] in (ACCOUNT, LIB_INST) or PORT.fullmatch(argv[0]) or APP_INST.fullmatch(argv[0])):
+        log("usage: blockie-ports steam-unit <port>|app-<id>|account|lib")
         return 64
     inst = argv[0]
     os.umask(0o027)
@@ -3264,6 +3584,8 @@ def unit_main(argv):
                 raise ValueError(f"{inst}.{req['dir']} is not the unit's")
             unit_rmtree(os.path.join(work, ".DepotDownloader"))
             return 0
+        if op in ("pass", "get") and APP_INST.fullmatch(inst):
+            return unit_dd(req, unit_app_row(inst, req), inst)
         if op in ("pass", "get"):
             row = load_map().get(inst)
             app = read_apps().get(inst, (None, None))[0]
@@ -3289,14 +3611,17 @@ WAITING = ("runtime", "unpack")
 
 
 def run(argv, proto):
-    if len(argv) < 2 or argv[1] not in COMMANDS or len(argv) != 2 + COMMANDS[argv[1]][0] or any(
-            CTRL.search(a) for a in argv[2:]):
+    n = COMMANDS[argv[1]][0] if len(argv) > 1 and argv[1] in COMMANDS else None
+    if n is not None and argv[1] == "steam-lib" and len(argv) > 2:
+        n += LIB_ARGS.get(argv[2], 0)
+    if n is None or len(argv) != 2 + n or any(CTRL.search(a) for a in argv[2:]):
         log(f"usage: {ME} sync|refresh|index|install <name>|update <name>|uninstall <name>|runtime <name>|"
-            f"unpack <file>|steam-get <name>|steam-logout|steam-lib index|refresh|scan|art")
+            f"unpack <file>|steam-get <name>|steam-logout|steam-lib index|refresh|scan|art|get <app>|remove <app>|"
+            f"lang <app> <choice>")
         return 64
     cmd = argv[1]
     arg = argv[2] if len(argv) > 2 else cmd
-    name = os.path.basename(arg) if cmd == "unpack" else arg
+    name = os.path.basename(arg) if cmd == "unpack" else argv[3] if len(argv) > 3 else arg
     CANCEL[0] = False
     QUIET[0] = cmd in STEAM_CMDS or cmd == "steam-lib"
     signal.signal(signal.SIGTERM, on_term)
@@ -3312,7 +3637,7 @@ def run(argv, proto):
         lock = helper_lock(proto, cmd in WAITING)
         empty_tmp()
         try:
-            COMMANDS[cmd][1](arg, Ctx(proto))
+            COMMANDS[cmd][1](arg, Ctx(proto, argv[3:]))
         finally:
             if cmd in STEAM_TSV_CMDS:
                 try:

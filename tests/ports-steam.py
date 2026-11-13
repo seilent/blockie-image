@@ -224,7 +224,8 @@ def everything():
 
 
 LINE = re.compile(r"progress\t(?:login|check|download|copy)\t[0-9]+\t(?:[0-9]+|-)|qr\thttps://[\x21-\x7e]+|"
-                  r"done\t[^\t]+|fail\t[^\t]+\t(?:login|owned|expired|exists|network|space|busy|nodata|cancel|other)")
+                  r"done\t[^\t]+|"
+                  r"fail\t[^\t]+\t(?:login|owned|expired|exists|network|space|busy|nodata|cancel|bound|other)")
 
 
 @case("map loader: a good row is kept, rows with .., an absolute path, bad digits, an unknown os or depots - are dropped")
@@ -369,6 +370,127 @@ def _(c):
     outcome_case(c, {"pass": [{"noend": True}]}, "other")
     outcome_case(c, {"get": [{"noend": True}]}, "other")
     outcome_case(c, {"get": [{"rc": 1}]}, "other")
+
+
+@case("child outcomes for an app row: fail owned depot 9000101 is the DLC rerun only for an eligible DLC id; a base "
+      "id, an empty set or no id is owned; app level owned writes no mark; bound passes through")
+def _(c):
+    setup(signed=True)
+    run = m.Run()
+    run.fail = "owned depot 9000101"
+    c(m.outcome(run, "app-9000001", "pass", {"9000101"}) == "dlc", "an eligible DLC id")
+    c(m.outcome(run, "app-9000001", "pass", {"9000102"}) == "owned" and
+      m.outcome(run, "app-9000001", "pass", set()) == "owned", "a base id or the rerun")
+    c(m.outcome(run, "alpha.zip", "pass") == "owned" and not os.path.exists(f"{SSTATE}/alpha.zip.owned"), "port row")
+    run.fail = "owned depot"
+    c(m.outcome(run, "app-9000001", "pass", {"9000101"}) == "owned", "no id")
+    run.fail = "owned"
+    c(m.outcome(run, "app-9000001", "pass", set()) == "owned" and
+      not os.path.exists(f"{DATA}/steam-games/.blockie/9000001.owned") and
+      not os.path.exists(f"{SSTATE}/app-9000001.owned"), "an owned mark for an app row")
+    run.fail = "bound"
+    c(m.outcome(run, "alpha.zip", "pass") == "bound" and m.outcome(run, "app-9000001", "pass", set()) == "bound",
+      "bound")
+
+
+APP_LIB = ["app\t9000301\tgame\tInvented", "owned\t9000301", "lang\t9000301\t-",
+           "depot\t9000301\t9003011\twindows\t-\t-\t0\t-\t-\t900301100\t1",
+           "depot\t9000301\t9003012\t-\t-\t-\t0\t-\t9003019\t900301200\t1", "owned\t9003019",
+           "app\t9000302\ttool\tInvented Tool", "owned\t9000302", "lang\t9000302\t-",
+           "depot\t9000302\t9003021\t-\t-\t-\t0\t-\t-\t900302100\t1"]
+APP_GOOD = {"login": "token", "os": "windows", "choice": "-", "drop": []}
+
+
+def app_unit(op, env=None):
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(f"{SRUN}/app-9000301.fifo")
+    write(f"{SRUN}/req/app-9000301", json.dumps(dict(APP_GOOD, op=op, port="app-9000301")), 0o640)
+    p = subprocess.Popen([BIN, "steam-unit", "app-9000301"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         env=dict(os.environ, **(env or {})))
+    end = time.monotonic() + 10
+    while not os.path.exists(f"{SRUN}/app-9000301.fifo") and time.monotonic() < end:
+        time.sleep(0.02)
+    fd = os.open(f"{SRUN}/app-9000301.fifo", os.O_RDONLY | os.O_NONBLOCK)
+    p.wait(timeout=20)
+    time.sleep(0.1)
+    got = os.read(fd, 4096)
+    os.close(fd)
+    return p.returncode, got
+
+
+@case("app instances: the unit takes app-<digits> only for a kept app of library.tsv and refuses, before any FIFO or "
+      "DepotDownloader, a request naming a depot or another key it derives, a leave out depot that is a base depot or "
+      "not in library.tsv, a choice or OS not the app's; app-x is a usage error")
+def _(c):
+    setup(signed=True)
+    m.unit_library_done(APP_LIB, int(time.time()))
+    good = APP_GOOD
+    for inst, kw, why in (("app-9000399", good, "not in the library"), ("app-9000302", good, "not in the library"),
+                          ("app-9000301", dict(good, depots=["9003011"]), "derives"),
+                          ("app-9000301", dict(good, manifests=["1"]), "derives"),
+                          ("app-9000301", dict(good, drop=["9003011"]), "not a DLC depot"),
+                          ("app-9000301", dict(good, drop=["9003099"]), "not a DLC depot"),
+                          ("app-9000301", dict(good, choice="english"), "not the app's"),
+                          ("app-9000301", dict(good, os="linux"), "not the app's")):
+        r = unit("pass", inst, **kw)
+        c(r.returncode == 1 and why in r.stderr and not dd_runs() and not os.path.exists(f"{SRUN}/{inst}.fifo"),
+          f"{inst} {kw}: rc {r.returncode} {r.stderr[-200:]!r}")
+    for inst in ("app-x", "app-", "App-9000301"):
+        write(f"{SRUN}/req/{inst}", json.dumps({"op": "pass", "port": inst}), 0o640)
+        r = subprocess.run([BIN, "steam-unit", inst], capture_output=True, text=True, timeout=20)
+        c(r.returncode == 64 and "usage:" in r.stderr, f"{inst}: rc {r.returncode}")
+    m.unit_login_end("get", m.unit_login("get", int(time.time())), "rate", int(time.time()))
+    rc, got = app_unit("pass")
+    c(rc == 1 and got == b"fail\tbound\nrc\t1\n" and not dd_runs(), f"inside a rate backoff {got!r}")
+
+
+@case("the login row of an app run closes as other when DepotDownloader cannot start and when the get is refused for "
+      "want of a list, with no rc line on either")
+def _(c):
+    setup(signed=True)
+    m.unit_library_done(APP_LIB, int(time.time()))
+    for op, env, sent in (("pass", {"BLOCKIE_PORTS_DD": f"{T}/no-such-dd"}, b""), ("get", {}, b"fail\tother\n")):
+        rc, got = app_unit(op, env)
+        r = m.read_logins()[-1]
+        c(rc == 1 and got == sent and (r["op"], r["result"]) == (op, "other") and not dd_runs(),
+          f"{op}: rc {rc} {got!r} {r}")
+
+
+@case("the app row's destination bound: only <app>/... under steam-games, never .blockie, another app, .. or a "
+      "symlinked dir out of the app dir; its marks live in steam-games/.blockie")
+def _(c):
+    setup()
+    games = f"{DATA}/steam-games"
+    os.makedirs(f"{games}/9000001/sub")
+    os.makedirs(f"{T}/elsewhere-app", exist_ok=True)
+    os.symlink(f"{T}/elsewhere-app", f"{games}/9000001/link")
+    for dst, want in (("9000001/a", True), ("9000001/sub/a", True), ("9000002/a", False), (".blockie/a", False),
+                      ("9000001/../9000002/a", False), ("9000001/link/a", False), ("/9000001/a", False),
+                      ("9000001/.blockie/nw/a", False)):
+        c(m.inside_port_dst("app-9000001", dst) == want, f"{dst}: want {want}")
+    os.symlink(f"{T}/elsewhere-app", f"{games}/9000003")
+    c(not m.inside_port_dst("app-9000003", "9000003/a"), "a symlinked app dir passed")
+    c(m.where("app-9000001") == (games, f"{games}/.blockie", "9000001") and
+      m.mark("app-9000001", "got") == f"{games}/.blockie/9000001.got" and
+      m.mark("alpha.zip", "got") == f"{SSTATE}/alpha.zip.got", f"{m.where('app-9000001')}")
+    shutil.rmtree(f"{T}/elsewhere-app")
+
+
+@case("the unit floor: a got line under the free space floor stops DepotDownloader as fail space, whoever asked")
+def _(c):
+    setup(signed=True)
+    os.environ["BLOCKIE_PORTS_FLOOR"] = str(1 << 62)
+    t0 = time.monotonic()
+    try:
+        rc, lines = call("steam-get", "alpha.zip")
+    finally:
+        os.environ["BLOCKIE_PORTS_FLOOR"] = "0"
+    gets = dd_runs("get")
+    c(last(lines) == "fail\talpha.zip\tspace" and time.monotonic() - t0 < 10 and gets and not alive(gets[-1]["pid"]),
+      f"{lines[-2:]} {LOG[-3:]}")
+    left = [os.path.relpath(os.path.join(r, f), f"{PORTS}/alpha") for r, d, fs in os.walk(f"{PORTS}/alpha") for f in fs]
+    c(left == ["port.json"] and os.path.isdir(f"{DL}/alpha.zip.part"),
+      f"files in the port dir after a floor stop {left}, or the part dir went")
 
 
 @case("a fail rate from DepotDownloader in a pass ends the run at once; the unit relays it as rate, the helper as "
@@ -741,6 +863,19 @@ def _(c):
     with m.game_lock():
         m.replay()
     c(not os.listdir(f"{STATE}/txn") and not os.path.exists(f"{PORTS}/gone"), "a journal for a port dir that is gone made it")
+
+
+@case("an op runtime journal in the ports txn dir still replays under the dir check: its new paths rolled back, the "
+      "journal gone")
+def _(c):
+    setup()
+    write(f"{PORTS}/frt_3.5.2.part", "invented part")
+    m.journal("frt_3.5.2", {"op": "runtime", "name": "frt_3.5.2", "new": [f"{PORTS}/frt_3.5.2.part"]})
+    LOG.clear()
+    with m.game_lock():
+        m.replay()
+    c(not os.path.exists(f"{PORTS}/frt_3.5.2.part") and not os.listdir(f"{STATE}/txn") and
+      "replayed the journal of frt_3.5.2" in LOG, f"{LOG}")
 
 
 @case("a validation longer than the stall bound with got rising is not stalled; a silent token run is")
