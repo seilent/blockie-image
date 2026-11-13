@@ -1,7 +1,8 @@
 %global debug_package %{nil}
 %global _build_id_links none
-%global commit bf4aa06d83c568a3a0a45d283375860bb11bfe0c
-%global shortcommit bf4aa06
+%global commit 209492893749c9a6b6dbfded4ba4f7fbcaacc4cc
+%global shortcommit 2094928
+%global steam_files 1
 %global qrdir qrcodegen-720f62bd
 
 Name:           blockie-frontend
@@ -58,7 +59,8 @@ cp %{SOURCE10} "$cache/Selawik_Release.zip"
 
 %build
 BLOCKIE_FE_CACHE=$PWD/.fe-cache BLOCKIE_FE_OUT=$PWD/.fe-out BLOCKIE_FE_JOBS=%{_smp_build_ncpus} CC=gcc CXX=g++ \
-  BLOCKIE_FE_CFLAGS="%{build_cflags}" BLOCKIE_FE_LDFLAGS="%{build_ldflags}" BLOCKIE_FE_COMMIT=%{shortcommit} ./build.sh app
+  BLOCKIE_FE_CFLAGS="%{build_cflags}" BLOCKIE_FE_LDFLAGS="%{build_ldflags}" BLOCKIE_FE_COMMIT=%{shortcommit} \
+  BLOCKIE_FE_STEAM_FILES=%{steam_files} ./build.sh app
 mkdir -p third-party
 cp .fe-cache/src/libspng-0.7.4/LICENSE third-party/libspng-LICENSE
 cp .fe-cache/src/zlib-1.3.1/LICENSE third-party/zlib-LICENSE
