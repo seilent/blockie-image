@@ -99,6 +99,12 @@ show() {
     "$sdl_controllerconfig" "$SDL_VIDEODRIVER" "$SDL_VIDEO_WAYLAND_WMCLASS" "$SDL_APP_ID" "$CUR_TTY" "$GODOT_OPTS" \
     "$GODOT2_OPTS"
 }
+finish() {
+  pm_gptokeyb_finish() { echo gptokeyb; }
+  pm_message_end() { echo message_end; }
+  systemctl() { echo "systemctl $*"; }
+  pm_finish
+}
 dialog() {
   PortMasterDialogInit
   PortMasterDialog progress "Preparing game data" 5 100
@@ -172,6 +178,9 @@ check $'args [--text] [Unable to download] [--timeout] [10] [--wait]' PortMaster
 check $'args [--progress]\nargs [--progress-set] [5] [100]\nargs [--progress-set] [50] [100]' dialog
 [[ $(grep -c '^stdin ' "$t/run/portmsg.log") == 1 ]] || { ok=1; echo "  the progress text was sent more than once"; }
 res $ok "pm_message --timeout, pm_show_error and the message box wait with a timeout, close, and dialog progress"
+
+[[ $(modrun finish) == $'gptokeyb\nmessage_end' ]]
+res $? "pm_finish stops gptokeyb and ends the messages with no systemctl restart of oga_events (no polkit ask)"
 
 printf '#!/bin/sh\necho "$@" >> %s/cf.args\nexit "$(cat %s/cf.rc)"\n' "$t" "$t" > "$t/cf/harbourmaster"
 chmod 755 "$t/cf/harbourmaster"

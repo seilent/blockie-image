@@ -46,8 +46,13 @@ wlegl=$(cd "$w" && pwd -P)/lib_aarch64/extra_wayland/libwayland-egl.so.1
 res $? "with no port prefix the mod puts the runtime's libwayland-egl.so.1 in weston_preload (westonwrap.sh:525)"
 xskat="env LD_PRELOAD=$w/lib_aarch64/libwayland-client.so.0:$w/lib_aarch64/libwayland-server.so.0:$w/lib_aarch64/graphics/crusty_gbm/libcrusty.so"
 mapfile -t pre < <(env -i PATH=/usr/bin BLOCKIE_GPULIB="$gpu" strace="$xskat" bash "$w/westonwrap-blockie.sh" cleanup 2> /dev/null)
-[[ ${pre[2]:-} == "env LD_PRELOAD=$wlegl:${xskat#env LD_PRELOAD=}" && -z ${pre[3]:-} ]]
-res $? "with XSkat's env LD_PRELOAD prefix in strace the mod puts libwayland-egl.so.1 first in it"
+[[ ${pre[2]:-} == "env LD_PRELOAD=$wlegl:$w/lib_aarch64/libwayland-client.so.0:$w/lib_aarch64/libwayland-server.so.0" &&
+  -z ${pre[3]:-} ]]
+res $? "with XSkat's env LD_PRELOAD prefix in strace the mod puts libwayland-egl.so.1 first and drops crusty_gbm's libcrusty.so"
+mapfile -t tsc < <(env -i PATH=/usr/bin BLOCKIE_GPULIB="$gpu" BLOCKIE_XDIR="$t/empty" BLOCKIE_XWATCH_POLLS=1 strace="$xskat" \
+  bash "$w/westonwrap-blockie.sh" headless noop kiosk crusty_glx_gl4es game 2> /dev/null)
+[[ ${tsc[2]:-} == "env LD_PRELOAD=$wlegl:$w/lib_aarch64/libwayland-client.so.0:$w/lib_aarch64/libwayland-server.so.0" ]]
+res $? "with the same prefix and a crusty GL mode (The Secret Chronicles) the mod drops crusty_gbm's libcrusty.so too"
 
 lib=$w/lib_aarch64
 if [[ -e /usr/lib64/libGL.so.1 ]]; then

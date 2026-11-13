@@ -69,7 +69,15 @@ if [[ "${0##*/}" == westonwrap*.sh ]]; then
   export LD_LIBRARY_PATH="$(_blockie_join "${LD_LIBRARY_PATH-}" "${BLOCKIE_GPULIB-}" "$BLOCKIE_PORTS_COMPAT")"
   BLOCKIE_WLEGL="$(cd -- "$(dirname -- "$0")" > /dev/null 2>&1 && pwd -P)/lib_aarch64/extra_wayland/libwayland-egl.so.1"
   if [[ ${strace-} == *LD_PRELOAD=* ]]; then
-    strace="${strace/LD_PRELOAD=/"LD_PRELOAD=$BLOCKIE_WLEGL:"}"
+    _blockie_pre=${strace#*LD_PRELOAD=}
+    _blockie_pre=${_blockie_pre%% *}
+    _blockie_keep=$BLOCKIE_WLEGL
+    IFS=: read -ra _blockie_libs <<< "$_blockie_pre"
+    for _blockie_l in "${_blockie_libs[@]}"; do
+      [[ -z $_blockie_l || $_blockie_l == */graphics/crusty_gbm/libcrusty.so ]] || _blockie_keep+=":$_blockie_l"
+    done
+    strace="${strace/"LD_PRELOAD=$_blockie_pre"/"LD_PRELOAD=$_blockie_keep"}"
+    unset _blockie_pre _blockie_keep _blockie_libs _blockie_l
   else
     export weston_preload="$(_blockie_join "$BLOCKIE_WLEGL" "${weston_preload-}")"
   fi
@@ -172,6 +180,11 @@ pm_show_error() {
 
 pm_message_close() {
   _blockie_portmsg --close || :
+}
+
+pm_finish() {
+  pm_gptokeyb_finish
+  pm_message_end
 }
 
 PortMasterDialogInit() {
