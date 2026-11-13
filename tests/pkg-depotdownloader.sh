@@ -88,4 +88,12 @@ BLOCKIE_DD_FD=3 BLOCKIE_DD_CONFIG=$t/account.config DOTNET_CLI_HOME=$t HOME=$t \
 ! grep -q '^qr' "$t/channel" || fail "a run with no network wrote a qr line"
 bad=$(grep -vE '^fail	(network|login|other)$' "$t/channel" || true)
 [[ -z $bad ]] || fail "lines other than one fail line on the channel: $bad"
+blockie_mode() {
+  local rc=0
+  BLOCKIE_DD_FD=3 BLOCKIE_DD_CONFIG=$t/account.config DOTNET_CLI_HOME=$t HOME=$t \
+    timeout -k 2 10 dotnet "$dd" "$@" 3> "$t/channel" < /dev/null > /dev/null 2>&1 || rc=$?
+  [[ $rc == 1 && $(< "$t/channel") == $'fail\tother' ]] || fail "$* with no network: rc $rc, $(< "$t/channel")"
+}
+blockie_mode -blockie-scan
+blockie_mode -blockie-library -blockie-scan "$t/list"
 echo "pkg-$name: ok"
