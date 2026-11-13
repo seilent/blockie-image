@@ -3,6 +3,8 @@ import errno
 import glob
 import os
 import re
+import stat
+import subprocess
 import sys
 import time
 
@@ -47,6 +49,10 @@ POLL_MS = int(os.environ.get("BLOCKIE_HOTKEYD_POLL_MS", "1000"))
 SHOWN_MS = int(os.environ.get("BLOCKIE_HOTKEYD_SHOWN_MS", "5000"))
 BACKLIGHT = os.environ.get("BLOCKIE_HOTKEYD_BACKLIGHT", "/usr/libexec/blockie/blockie-backlight")
 BOOT_STATE = os.environ.get("BLOCKIE_BOOT_STATE", "/run/blockie/boot/state")
+RUN = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+PORT = os.path.join(RUN, "blockie-game.port")
+PAUSED = os.path.join(RUN, "blockie-game.paused")
+SCOPE = "blockie-game.scope"
 BLINK_MS = 300
 RESLEEP_MAX_MS = 30000
 STORM_MS = 600000
@@ -74,24 +80,25 @@ KEYS = {
 }
 VIRTUAL = {("AYANEO Controller", "0019", "4001", "0428", "ayaneo-gamepad/input0")}
 ARGS = {"switcher": (0, 0), "next": (0, 0), "back": (0, 0), "switch": (1, 1), "hook": (1, 1), "unit": (1, 1),
-        "call": (4, 4), "blank": (0, 1), "menu": (0, 0), "none": (0, 0)}
+        "call": (4, 4), "blank": (0, 1), "menu": (0, 0), "game-menu": (0, 0), "none": (0, 0)}
 GESTURES = ("tap", "hold", "press")
-DISPLAY = {"awake": "blank-off", "blanked": "blank-on", "lit-frozen": "screen-on", "menu": "menu-on"}
+DISPLAY = {"awake": "blank-off", "blanked": "blank-on", "lit-frozen": "screen-on", "menu": "menu-on",
+           "paused": "menu-on"}
 DEFAULTS = {("volup", "press"): ("hook", "volume-up"),
             ("voldown", "press"): ("hook", "volume-down"), ("power", "tap"): ("blank",),
             ("power", "hold"): ((1000, "hold=1000", ("menu",)),
                                 (3000, "hold=3000", ("unit", "blockie-poweroff.service")))}
 SETTINGS = "@settings"
 BUTTONS = ("home", "extra1", "extra2", "extra3")
-ACTIONS = {"none": None, "switcher": ("switcher",), "game-menu": ("hook", "game-menu"),
-           "game-quit": ("hook", "game-quit")}
+ACTIONS = {"none": None, "switcher": ("switcher",), "game-menu": ("game-menu",), "game-quit": ("hook", "game-quit")}
 ONLY = {"game-menu": "emulation", "game-quit": "emulation"}
+PAUSE_ROWS = (("game-menu",), ("hook", "game-quit"), ("hook", "volume-up"), ("hook", "volume-down"))
 LAYOUT_DEFAULTS = {("home", "tap"): "none", ("home", "hold"): "switcher", ("extra1", "tap"): "none",
                    ("extra1", "hold"): "none", ("extra2", "tap"): "none", ("extra2", "hold"): "none",
                    ("extra3", "tap"): "game-menu", ("extra3", "hold"): "game-quit"}
 NOTED = {}
 TARGETS = ("reboot", "android", "recovery")
-EXITS = ("cancel", "screen-off", "poweroff", "failed")
+EXITS = ("cancel", "screen-off", "poweroff", "failed", "resume", "quit")
 RUNNING = ("activating", "active", "deactivating", "reloading")
 NAME = re.compile(r"[a-z0-9][a-z0-9-]*")
 UNIT = re.compile(r"[a-z0-9][a-z0-9@._-]*\.service")
@@ -269,6 +276,27 @@ def identity(name, real):
     return tuple(out)
 
 
+def scope_active():
+    try:
+        r = subprocess.run(["systemctl", "--user", "show", "-P", "ActiveState", SCOPE], stdin=subprocess.DEVNULL,
+                           capture_output=True, text=True, timeout=2)
+    except (OSError, subprocess.SubprocessError) as err:
+        log(f"systemctl show {SCOPE}: {err}")
+        return None
+    out = r.stdout.strip()
+    if r.returncode != 0 or not out:
+        log(f"systemctl show {SCOPE}: exit {r.returncode}, {out or 'no state'}")
+        return None
+    return out == "active"
+
+
+def port_running():
+    try:
+        return stat.S_ISREG(os.lstat(PORT).st_mode)
+    except OSError:
+        return False
+
+
 def current():
     try:
         with open(CURRENT) as f:
@@ -300,6 +328,9 @@ class Menu:
         self.toast = 0
         self.late = 0
         self.ending = False
+        self.pause = False
+        self.power_shown = False
+        self.stdin = None
 
 
 class Hotkeyd:
@@ -351,6 +382,11 @@ class Hotkeyd:
         self.resumed = None
         self.seen = set()
         self.draining = False
+        self.paused = False
+        self.pause_due = False
+        self.pause_timer = 0
+        self.scope = None
+        self.scope_probe = None
 
     def session_bus(self):
         if self.bus is None:
@@ -395,7 +431,15 @@ class Hotkeyd:
             GLib.timeout_add(ms, lambda: p.force_exit() or False)
 
     def want(self, state):
-        if state == "menu" and self.opening is not None:
+        if state == "awake" and self.paused:
+            if self.scope is False or not port_running():
+                log(f"{SCOPE} is not active or {PORT} is gone: the pause ends")
+                self.unpause()
+            elif current() == "emulation":
+                state = "paused"
+        if state == "paused":
+            self.pause_due = not self.pause_child()
+        if state in ("menu", "paused") and self.opening is not None:
             log("switcher-open killed for the power menu")
             self.opening.force_exit()
         self.wanted = state
@@ -410,9 +454,9 @@ class Hotkeyd:
             self.helper.send_signal(15)
         if state != "menu":
             self.menu_due = False
-        if state in ("awake", "blanked") and self.menu is not None:
+        if self.menu is not None and (state in ("awake", "blanked") or (state == "paused" and self.pause_due)):
             self.end_menu(self.menu)
-        self.set_grab("all" if state in ("blanked", "lit-frozen") else "keys" if state == "menu" else "")
+        self.set_grab("all" if state in ("blanked", "lit-frozen") else "keys" if state in ("menu", "paused") else "")
         self.apply()
         self.consider()
 
@@ -421,7 +465,9 @@ class Hotkeyd:
             return
         if self.applied != self.wanted:
             state = self.wanted
-            if DRY:
+            if {state, self.applied} <= {"menu", "paused"}:
+                self.applied = state
+            elif DRY:
                 self.applied = state
             else:
                 p, found, ms = self.spawn(DISPLAY[state], HOOK_MS)
@@ -434,6 +480,8 @@ class Hotkeyd:
         self.start_pending()
         if self.menu_due and self.wanted == self.applied == "menu":
             self.start_menu()
+        elif self.pause_due and self.wanted == self.applied == "paused" and self.menu is None:
+            self.start_menu(True)
 
     def start_pending(self):
         if self.pending and self.wanted == "lit-frozen":
@@ -540,9 +588,13 @@ class Hotkeyd:
             log(f"{unit} is {why}: back to awake")
             self.want("awake")
         elif not m.failed:
-            log(f"{unit} is {why}: back to awake once blockie-powermenu showed it")
             m.failed = True
-            m.toast = GLib.timeout_add(TOAST_MS, self.toast_over, m)
+            if m.pause:
+                log(f"{unit} is {why}: waiting for the pause child's failed boot")
+                m.toast = GLib.timeout_add(2 * TOAST_MS, self.toast_over, m)
+            else:
+                log(f"{unit} is {why}: back to awake once blockie-powermenu showed it")
+                m.toast = GLib.timeout_add(TOAST_MS, self.toast_over, m)
 
     def toast_over(self, m):
         m.toast = 0
@@ -585,6 +637,11 @@ class Hotkeyd:
                     log("menu-on failed twice: back to awake")
                     self.want("awake")
                     return
+                if state == "paused" and self.wanted == "paused":
+                    log("menu-on failed twice: the pause ends")
+                    self.unpause()
+                    self.want("awake")
+                    return
                 self.start_pending()
                 return
             self.retry -= 1
@@ -602,7 +659,7 @@ class Hotkeyd:
                 self.want("blanked")
         elif self.wanted == "blanked":
             self.want("blanked" if args else "awake")
-        elif self.wanted == "menu":
+        elif self.wanted in ("menu", "paused"):
             self.want("blanked")
         elif not args and self.started:
             self.check_started()
@@ -615,7 +672,162 @@ class Hotkeyd:
             self.started = None
             self.want("lit-frozen")
 
+    def pause_child(self):
+        m = self.menu
+        return m is not None and m.pause and not m.ending and not m.result
+
+    def tell(self, word):
+        m = self.menu
+        if not self.pause_child() or m.stdin is None:
+            log(f"{word}: no pause child to tell")
+            return
+        try:
+            m.stdin.write_all(f"{word}\n".encode(), None)
+            m.stdin.flush(None)
+        except GLib.Error as err:
+            log(f"blockie-powermenu: {word}: {err.message}")
+
+    def pause(self, scope):
+        if self.menu is not None:
+            log("game-menu: ignored, blockie-powermenu still runs")
+            return
+        log("game-menu: the port pauses")
+        try:
+            os.close(os.open(PAUSED, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                             0o600))
+        except OSError as err:
+            log(f"cannot write {PAUSED}: {err.strerror}: no pause")
+            return
+        self.paused = True
+        self.scope = scope
+        self.last = None
+        if not self.pause_timer:
+            self.pause_timer = GLib.timeout_add(POLL_MS, self.pause_poll)
+        self.want("paused")
+
+    def unpause(self):
+        self.paused = False
+        self.pause_due = False
+        self.scope = None
+        try:
+            os.unlink(PAUSED)
+        except FileNotFoundError:
+            pass
+        except OSError as err:
+            log(f"cannot remove {PAUSED}: {err.strerror}: SIGCONT to {SCOPE}")
+            self.run(["systemctl", "--user", "kill", "--signal=SIGCONT", SCOPE])
+        if self.pause_timer:
+            GLib.source_remove(self.pause_timer)
+            self.pause_timer = 0
+
+    def restore(self):
+        if not os.path.lexists(PAUSED):
+            return
+        log(f"{PAUSED} found at start: reading {SCOPE}")
+        self.paused = True
+        self.pause_timer = GLib.timeout_add(POLL_MS, self.pause_poll)
+        self.query_scope()
+
+    def terminated(self):
+        if self.paused:
+            log("SIGTERM while paused: the pause ends")
+            self.unpause()
+        self.loop.quit()
+        return False
+
+    def mine(self):
+        return self.wanted == "paused" or (self.wanted == "menu" and self.pause_child())
+
+    def end_pause(self, why, polling=False):
+        log(f"{why}: the pause ends")
+        mine = self.mine()
+        if polling:
+            self.pause_timer = 0
+        self.unpause()
+        if mine:
+            self.want("awake")
+
+    def pause_poll(self):
+        if not self.paused:
+            self.pause_timer = 0
+            return False
+        if not os.path.lexists(PAUSED):
+            self.end_pause(f"{PAUSED} is gone", True)
+            return False
+        if self.wanted == "blanked":
+            return True
+        cur = current()
+        if cur != "emulation":
+            if self.mine():
+                log(f"session {cur or 'unknown'}: the pause child ends, the game stays stopped")
+                self.want("awake")
+            return True
+        self.query_scope()
+        return True
+
+    def query_scope(self):
+        if self.scope_probe is not None:
+            return
+        try:
+            p = Gio.Subprocess.new(["systemctl", "--user", "show", "-P", "ActiveState", SCOPE],
+                                   Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE)
+        except GLib.Error as err:
+            log(f"cannot run systemctl: {err.message}")
+            return
+        self.scope_probe = p
+        timer = [0]
+        timer[0] = GLib.timeout_add(2000, self.kill_probe, p, timer)
+        p.communicate_utf8_async(None, None, self.scope_shown, timer)
+
+    def kill_probe(self, p, timer):
+        timer[0] = 0
+        p.force_exit()
+        return False
+
+    def scope_shown(self, p, res, timer):
+        if timer[0]:
+            GLib.source_remove(timer[0])
+        self.scope_probe = None
+        try:
+            out = (p.communicate_utf8_finish(res)[1] or "").strip()
+        except GLib.Error as err:
+            log(f"systemctl show {SCOPE}: {err.message}")
+            out = ""
+        if not (out and p.get_if_exited() and p.get_exit_status() == 0):
+            log(f"systemctl show {SCOPE} gave no state: the pause stays")
+            return
+        self.scope = out == "active"
+        if not self.paused:
+            return
+        if not self.scope:
+            self.end_pause(f"{SCOPE} is {out}")
+        elif self.wanted == "awake" and current() == "emulation":
+            self.want("awake")
+
+    def quit_port(self):
+        log("quit from the pause")
+        if self.menu is not None:
+            self.end_menu(self.menu)
+        if not DRY:
+            self.hook("game-quit")
+        self.unpause()
+        self.want("awake")
+
+    def game_menu(self):
+        if self.wanted == "paused":
+            self.tell("back")
+            return
+        scope = scope_active() if self.wanted == "awake" and port_running() else False
+        if scope is not False:
+            self.pause(scope)
+        elif not DRY:
+            self.hook("game-menu")
+
     def open_menu(self):
+        if self.wanted == "paused" and self.pause_child():
+            self.tell("power")
+            self.want("menu")
+            return
         if self.menu is not None or self.wanted in ("menu", "lit-frozen"):
             log(f"menu: ignored, {'blockie-powermenu still runs' if self.menu is not None else self.wanted}")
             return
@@ -624,24 +836,34 @@ class Hotkeyd:
         self.last = None
         self.want("menu")
 
-    def start_menu(self):
+    def start_menu(self, pause=False):
         self.menu_due = False
+        self.pause_due = False
         if DRY and "BLOCKIE_HOTKEYD_MENU" not in os.environ:
             log("dry run: no blockie-powermenu started")
             return
         try:
-            launcher = Gio.SubprocessLauncher.new(Gio.SubprocessFlags.STDOUT_PIPE)
-            launcher.setenv("BLOCKIE_POWERMENU_FROM", self.menu_from, True)
+            flags = Gio.SubprocessFlags.STDOUT_PIPE
+            if pause:
+                flags |= Gio.SubprocessFlags.STDIN_PIPE
+            launcher = Gio.SubprocessLauncher.new(flags)
+            launcher.setenv("BLOCKIE_POWERMENU_FROM", "awake" if pause else self.menu_from, True)
             launcher.setenv("BLOCKIE_BOOT_STATE", BOOT_STATE, True)
+            if pause:
+                launcher.setenv("BLOCKIE_POWERMENU_MODE", "pause", True)
             p = launcher.spawnv([MENU])
         except GLib.Error as err:
             log(f"cannot run {MENU}: {err.message}: back to awake")
+            if pause:
+                self.unpause()
             self.want("awake")
             return
         m = Menu(p)
+        m.pause = pause
+        m.stdin = p.get_stdin_pipe() if pause else None
         m.late = GLib.timeout_add(SHOWN_MS, self.not_shown, m)
         self.menu = self.last = m
-        log(f"blockie-powermenu started from {self.menu_from}")
+        log("blockie-powermenu started in pause mode" if pause else f"blockie-powermenu started from {self.menu_from}")
         Gio.DataInputStream.new(p.get_stdout_pipe()).read_line_async(GLib.PRIORITY_DEFAULT, None, self.menu_line, m)
         p.wait_async(None, self.menu_exited, m)
 
@@ -654,14 +876,27 @@ class Hotkeyd:
         if line is not None:
             stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self.menu_line, m)
             self.menu_said(m, line.split())
-        elif m is self.last and not m.result and self.wanted == "menu":
+        elif m is self.last and not m.result and self.wanted in (("menu", "paused") if m.pause else ("menu",)):
             log("blockie-powermenu ended with no result: back to awake")
             m.result = "eof"
+            if m.pause:
+                self.unpause()
             self.want("awake")
 
     def menu_said(self, m, words):
         line = " ".join(words)
-        if m is not self.last or m.result or self.wanted != "menu":
+        if (m.pause and m is self.last and m.result == "boot" and words == ["failed", "boot"]
+                and self.wanted == "lit-frozen"):
+            log(f"blockie-powermenu: {line}: back to awake, the redirect decides")
+            m.result = ""
+            m.failed = False
+            m.power_shown = False
+            if m.toast:
+                GLib.source_remove(m.toast)
+                m.toast = 0
+            self.want("awake")
+            return
+        if m is not self.last or m.result or self.wanted not in (("menu", "paused") if m.pause else ("menu",)):
             log(f"blockie-powermenu: dropped: {line}")
             return
         log(f"blockie-powermenu: {line}")
@@ -671,8 +906,28 @@ class Hotkeyd:
                 GLib.source_remove(m.late)
                 m.late = 0
             return
+        if m.pause and words == ["shown", "power"]:
+            m.power_shown = True
+            return
+        if m.pause and len(words) == 3 and words[:2] == ["key", "extra1"] and words[2] in ("0", "1"):
+            if self.wanted == "paused":
+                self.handle("extra1", int(words[2]))
+            return
+        if m.pause and words in (["cancel"], ["failed", "gate"]):
+            m.power_shown = False
+            if self.wanted == "menu":
+                self.want("paused")
+            return
         m.result = words[0] if words else "?"
-        if words == ["cancel"] or words[:1] == ["failed"]:
+        if m.pause and words == ["resume"]:
+            self.unpause()
+            self.want("awake")
+        elif m.pause and words == ["quit"]:
+            self.quit_port()
+        elif m.pause and self.wanted == "paused" and words[:1] == ["failed"]:
+            self.unpause()
+            self.want("awake")
+        elif words == ["cancel"] or words[:1] == ["failed"]:
             self.want("awake")
         elif words == ["screen-off"]:
             self.want("blanked")
@@ -688,6 +943,8 @@ class Hotkeyd:
         else:
             log(f"blockie-powermenu: not a result: {line}: back to awake")
             m.result = "?"
+            if m.pause:
+                self.unpause()
             self.want("awake")
 
     def not_shown(self, m):
@@ -695,7 +952,9 @@ class Hotkeyd:
         if m is self.last and not m.shown and not m.result:
             log(f"blockie-powermenu printed no shown in {SHOWN_MS} ms: back to awake")
             m.result = "late"
-            if self.wanted == "menu":
+            if m.pause:
+                self.unpause()
+            if self.wanted in ("menu", "paused"):
                 self.want("awake")
             else:
                 self.end_menu(m)
@@ -728,11 +987,15 @@ class Hotkeyd:
         log("blockie-powermenu " + (f"exit {p.get_exit_status()}" if p.get_if_exited() else "killed"))
         if self.menu is m:
             self.menu = None
+        if m.pause:
+            self.resync()
         timer = self.regrab_timer
         if self.regrab and timer and not self.regrab_tick():
             GLib.source_remove(timer)
         if m.failed and m is self.last and self.wanted == "lit-frozen":
             self.want("awake")
+        if self.pause_due:
+            self.apply()
         self.consider()
 
     def blink(self, unit):
@@ -1149,8 +1412,10 @@ class Hotkeyd:
     def fire(self, key, gesture, row, fallback=False):
         if self.wanted in ("blanked", "menu", "lit-frozen") and key != "power":
             return
+        if self.wanted == "paused" and key != "power" and row not in PAUSE_ROWS:
+            return
         m = self.last
-        if (fallback and m is not None and m.shown
+        if (fallback and m is not None and (m.power_shown if m.pause else m.shown)
                 and ((m is self.menu and not m.ending) or m.at >= self.keys[key].down_at)):
             log(f"{key} {gesture}: blockie-powermenu showed: {' '.join(row)} skipped")
             return
@@ -1165,6 +1430,10 @@ class Hotkeyd:
             self.run(["blockie-session", action])
         elif action == "switch":
             self.run(["blockie-session", "switch", args[0]])
+        elif action == "game-menu":
+            self.game_menu()
+        elif action == "hook" and self.wanted == "paused" and row == ACTIONS["game-quit"]:
+            self.quit_port()
         elif action == "hook":
             if not DRY:
                 self.hook(args[0])
@@ -1330,8 +1599,9 @@ def main():
     else:
         d.rescan()
         GLib.timeout_add_seconds(RESCAN_S, d.rescan)
+    d.restore()
     d.apply()
-    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, 15, loop.quit)
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, 15, d.terminated)
     loop.run()
     return 0
 

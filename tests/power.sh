@@ -524,6 +524,50 @@ run "$off" --reboot reboot
 read -r -t 1 line <&4
 [[ $rc == 0 ]] && grep -qx 'systemctl start blockie-boot@reboot.service' "$t/log" || { ok=1; echo "  reboot without gates: rc $rc"; }
 res $ok "blockie-poweroff --reboot reads the gate file first: a closed target exits 1 with the reason, game stopped and Android untouched; reboot has no gate"
+
+paused=$t/run/blockie-game.paused
+conts() { grep -cx SIGCONT "$s/calls" 2> /dev/null; }
+ok=0
+state 1 stopped
+: > "$paused"
+run "$hooks/blank-off"
+[[ $rc == 0 && $(conts) == 0 ]] && stopped || { ok=1; echo "  with the file: rc $rc $(paste -sd '|' "$t/log")"; }
+rm -f "$paused"
+run "$hooks/blank-off"
+[[ $rc == 0 && $(conts) == 1 ]] && ! stopped || { ok=1; echo "  without the file: rc $rc $(paste -sd '|' "$t/log")"; }
+res $ok "T1: blank-off with blockie-game.paused sends no SIGCONT and the scope stays stopped; without it SIGCONT goes out"
+
+state 1 stopped
+mkdir "$paused"
+run "$hooks/blank-off"
+[[ $rc == 0 && $(conts) == 1 ]] && ! stopped
+res $? "T7: a directory at blockie-game.paused (a removal that failed) does not keep the scope stopped: blank-off sends SIGCONT"
+rmdir "$paused"
+
+shipped=0
+for p in /etc/blockie/hooks.d/blank-off.d/* /usr/lib/blockie/hooks.d/blank-off.d/*; do
+  [[ ! -e $p ]] || shipped=$((shipped + 1))
+done
+state 1 stopped
+: > "$paused"
+run /usr/libexec/blockie/blockie-hook blank-off
+[[ $(conts) == 0 ]] && stopped
+res $? "T2: blank-off through blockie-hook with every blank-off.d part that ships ($shipped) and blockie-game.paused sends no SIGCONT"
+
+state 1 stopped
+: > "$paused"
+run "$hooks/screen-on"
+[[ $(conts) == 0 ]] && stopped
+res $? "T3: screen-on with blockie-game.paused sends no SIGCONT"
+
+state 2 stopped
+: > "$paused"
+run "$off"
+line=
+read -r -t 1 line <&4
+[[ $rc == 0 && $line == QUIT && $(conts) == 1 ]] && ! stopped && grep -qx "$po: blockie-game.scope inactive" "$t/err"
+res $? "T5: blockie-poweroff with blockie-game.paused sends SIGCONT, then QUIT, and the stopped game scope ends"
+rm -f "$paused"
 exec 4>&-
 
 P=$t/sys/power

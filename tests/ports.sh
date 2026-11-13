@@ -67,6 +67,7 @@ while (( $# )) && [[ $1 != -- ]]; do
 done
 shift
 [[ -z ${FAKE_DELAY:-} ]] || sleep "$FAKE_DELAY"
+ls -A "${XDG_RUNTIME_DIR:-/nonexistent}" > "$FAKE/rundir" 2> /dev/null
 echo "$$" > "$FAKE/scope"
 exec setsid "$@"
 EOF
@@ -82,6 +83,7 @@ case "$*" in
     [[ -n $g ]] || exit 5
     rm -f "$FAKE/scope"
     kill -TERM -- "-$g" 2> /dev/null
+    kill -CONT -- "-$g" 2> /dev/null
     [[ $3 != --no-block ]] || exit 0
     for _ in $(seq 40); do
       kill -0 -- "-$g" 2> /dev/null || exit 0
@@ -302,6 +304,49 @@ quit
 finish
 [[ $r1 == 0 && $rc == 0 && $a == invented.late ]]
 res $? "app ids: no poll while the scope is stopped, the id lands after SIGCONT"
+
+: > "$t/run/blockie-game.paused"
+rm -f "$FAKE/rundir"
+FAKE_PORT=loop launch
+until_file "$FAKE/port.pid"
+[[ -f $t/run/blockie-game.port && ! -L $t/run/blockie-game.port ]]
+r1=$?
+quit
+finish
+[[ $r1 == 0 && $rc == 0 && ! -e $t/run/blockie-game.port && ! -e $t/run/blockie-game.port.tmp ]] &&
+  [[ ! -e $t/run/blockie-game.paused ]] && grep -qx blockie-game.port "$FAKE/rundir" && ! grep -qx blockie-game.paused "$FAKE/rundir"
+res $? "pause: blockie-game.port is written before the scope starts and stays while it runs, a stale blockie-game.paused is gone before the scope starts, and the port file is gone after it ends"
+
+gone_ms() {
+  local t0=$1 i
+  for ((i = 0; i < 100; i++)); do
+    kill -0 "$2" 2> /dev/null || { echo $(((${EPOCHREALTIME//[!0-9]/} - t0) / 1000)); return; }
+    sleep 0.02
+  done
+  echo -1
+}
+ok=0
+FAKE_PORT=loop launch
+until_file "$FAKE/port.pid"
+p=$(< "$FAKE/port.pid")
+kill -STOP -- "-$(< "$FAKE/scope")"
+t0=${EPOCHREALTIME//[!0-9]/}
+quit
+ms=$(gone_ms "$t0" "$p")
+finish
+[[ $rc == 0 ]] && ((ms >= 0 && ms < 1000)) || { ok=1; echo "  QUIT: rc $rc, port gone after $ms ms"; }
+FAKE_PORT=loop launch
+until_file "$FAKE/port.pid"
+p=$(< "$FAKE/port.pid")
+kill -STOP -- "-$(< "$FAKE/scope")"
+read -r up _ < /proc/uptime
+echo "${up%.*}" > "$t/run/blockie-game.quit"
+t0=${EPOCHREALTIME//[!0-9]/}
+PATH=$FAKE/bin:$PATH XDG_RUNTIME_DIR=$t/run timeout 5 /usr/lib/blockie/hooks.d/game-quit > /dev/null 2>&1
+ms=$(gone_ms "$t0" "$p")
+finish
+[[ $rc == 0 && ! -e $t/run/blockie-game.quit ]] && ((ms >= 0 && ms < 1000)) || { ok=1; echo "  second hold: rc $rc, port gone after $ms ms"; }
+res $ok "T6: a stopped port ends in under 1 s by the wrapper's QUIT and by game-quit's second hold (the stop's TERM comes with CONT)"
 
 ok=0
 sudo=$(PATH=$shims:$PATH sudo echo invented 2>&1)

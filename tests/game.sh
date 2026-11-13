@@ -64,6 +64,7 @@ while (( $# )) && [[ $1 != -- ]]; do
   shift
 done
 shift
+ls -A "${XDG_RUNTIME_DIR:-/nonexistent}" > "$FAKE/rundir" 2> /dev/null
 exec "$@"
 EOF
 cat > "$FAKE/bin/systemctl" << 'EOF'
@@ -184,6 +185,14 @@ exec 4>&-
 [[ $rc == 0 && $(head -n 1 "$FAKE/stdin") == "fifo 600" && $(cat "$FAKE/ino") != "$planted" && -z $line ]] &&
   [[ $(cat "$FAKE/line" 2> /dev/null) == MENU_TOGGLE && ! -e $fifo ]]
 res $? "commands: a stale 644 FIFO at the path is replaced by a new 600 one"
+
+: > "$t/run/blockie-game.port"
+: > "$t/run/blockie-game.paused"
+rm -f "$FAKE/rundir"
+play gba "$rom"
+[[ $rc == 0 && -f $FAKE/rundir && ! -e $t/run/blockie-game.port && ! -e $t/run/blockie-game.paused ]] &&
+  ! grep -qxE 'blockie-game\.(port|paused)' "$FAKE/rundir"
+res $? "pause: a RetroArch launch removes a stale blockie-game.port and blockie-game.paused before its scope starts"
 
 declare -A want=([gb]=gambatte [gbc]=gambatte [nes]=nestopia [snes]=snes9x [genesis]=genesis_plus_gx [gba]=mgba
   [ps1]=pcsx_rearmed [n64]=mupen64plus_next [psp]=ppsspp [dc]=flycast)

@@ -244,7 +244,7 @@ ended() {
   [[ -z $poll ]] || kill "$poll" 2> /dev/null
   poll=
   systemctl --user stop blockie-game.scope 2> /dev/null {lk}>&- 3<&-
-  rm -f -- "$run/blockie-game.appids" "$run/blockie-game.appids.tmp"
+  rm -f -- "$run/blockie-game.appids" "$run/blockie-game.appids.tmp" "$run/blockie-game.port"
   "$dl1" set > /dev/null {lk}>&- 3<&-
 }
 
@@ -268,13 +268,16 @@ port() {
   mkdir -p -- "${log%/*}" || die "cannot make ${log%/*}"
   snap=$(toplevels {lk}>&-)
   cmd=$run/blockie-game.cmd
-  trap '[[ -z $poll ]] || kill "$poll" 2> /dev/null; rm -f -- "$cmd" "$run/blockie-game.appids" "$run/blockie-game.appids.tmp"' EXIT
+  trap '[[ -z $poll ]] || kill "$poll" 2> /dev/null
+    rm -f -- "$cmd" "$run/blockie-game.appids" "$run/blockie-game.appids.tmp" "$run/blockie-game.port"' EXIT
   trap 'pstop 143' TERM
   trap 'pstop 130' INT
   trap 'pstop 129' HUP
-  rm -f -- "$cmd" "$run/blockie-game.quit" "$run/blockie-game.appids" "$run/blockie-game.appids.tmp"
+  rm -f -- "$cmd" "$run/blockie-game.quit" "$run/blockie-game.appids" "$run/blockie-game.appids.tmp" \
+    "$run/blockie-game.paused" "$run/blockie-game.port" "$run/blockie-game.port.tmp"
   mkfifo -m 600 -- "$cmd" || die "cannot make $cmd"
   exec 3<> "$cmd" || die "cannot open $cmd"
+  : > "$run/blockie-game.port" || die "cannot write $run/blockie-game.port"
   (
     cd -- "$pdir" || exit
     umask 022
@@ -438,7 +441,7 @@ if (( ${#lines[@]} )); then
   append+=("$tmp")
 fi
 cmd=$run/blockie-game.cmd
-rm -f -- "$cmd" "$run/blockie-game.quit"
+rm -f -- "$cmd" "$run/blockie-game.quit" "$run/blockie-game.port" "$run/blockie-game.paused"
 mkfifo -m 600 -- "$cmd" || die "cannot make $cmd"
 exec 3<> "$cmd" || die "cannot open $cmd"
 

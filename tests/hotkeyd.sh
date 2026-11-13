@@ -25,7 +25,7 @@ res() {
   fi
 }
 
-mkdir -p "$t/usr" "$t/etc" "$t/usr/test-a.conf.d"
+mkdir -p "$t/usr" "$t/etc" "$t/usr/test-a.conf.d" "$t/run"
 printf 'test-a 1 1\n' > "$t/current"
 cat > "$t/usr/test-a.conf" << 'EOF'
 home hold next
@@ -49,6 +49,11 @@ cat > "$t/fbin/fake-menu" << EOF
 #!/bin/sh
 echo "menu start from=\$BLOCKIE_POWERMENU_FROM state=\$BLOCKIE_BOOT_STATE" >> "$t/hooks.log"
 echo \$\$ > "$t/menu.pid"
+if [ -n "\${BLOCKIE_POWERMENU_MODE:-}" ]; then
+  echo "menu mode=\$BLOCKIE_POWERMENU_MODE" >> "$t/hooks.log"
+  exec 4<&0
+  while read -r w <&4; do echo "menu stdin \$w" >> "$t/hooks.log"; done &
+fi
 trap 'echo "menu term" >> "$t/hooks.log"; echo "term \$(date +%s%3N)" >> "$t/times"; [ -f "$t/menu.ignore" ] || { rm -f "$t/menu.pid"; exit 0; }' TERM
 while read -r d line; do
   sleep "\$d" > /dev/null &
@@ -82,7 +87,7 @@ run() {
   local script=$1
   rm -f "$t/fifo" "$t/hooks.log"
   mkfifo "$t/fifo"
-  BLOCKIE_HOTKEYD_INPUT=$t/fifo BLOCKIE_HOTKEYD_DRY=1 BLOCKIE_HOTKEYD_LONG_MS=300 \
+  XDG_RUNTIME_DIR=$t/run BLOCKIE_HOTKEYD_INPUT=$t/fifo BLOCKIE_HOTKEYD_DRY=1 BLOCKIE_HOTKEYD_LONG_MS=300 \
     BLOCKIE_HOTKEYD_TABLES="${TABLES:-$t/usr:$t/etc}" BLOCKIE_HOTKEYD_CURRENT=$t/current \
     BLOCKIE_HOTKEYD_BUTTONS="${MAP:-$t/nomap}" \
     BLOCKIE_HOTKEYD_SLEEP=$t/fbin/fake-sleep BLOCKIE_HOTKEYD_SYSFS=$t/psys BLOCKIE_HOTKEYD_MENU=$t/fbin/fake-menu \
@@ -160,7 +165,7 @@ layout() {
 printf 'emulation 1 1\n' > "$t/current"
 both='echo home down; sleep 0.5; echo home up; echo extra3 down; sleep 0.1; echo extra3 up; echo extra3 down; sleep 0.5; echo extra3 up'
 TABLES=$tables run "$both; echo extra1 down; sleep 0.5; echo extra1 up; $both"
-[[ ! -e $tables ]] && ! grep -q ignored "$t/err" && [[ $(cat "$t/out") == $'action home hold switcher\naction extra3 tap hook game-menu\naction extra3 hold hook game-quit\naction home hold switcher\naction extra3 tap hook game-menu\naction extra3 hold hook game-quit' &&
+[[ ! -e $tables ]] && ! grep -q ignored "$t/err" && [[ $(cat "$t/out") == $'action home hold switcher\naction extra3 tap game-menu\naction extra3 hold hook game-quit\naction home hold switcher\naction extra3 tap game-menu\naction extra3 hold hook game-quit' &&
   $(grep -c "no $t/nomap: the built in button defaults apply" "$t/err") == 1 ]]
 r=$?
 printf 'android 1 1\n' > "$t/current"
@@ -260,6 +265,7 @@ exit "\$rc"
 EOF
   chmod 755 "$hk/$h"
 done
+sed -i "3i [ ! -f '$t/run/blockie-game.paused' ] || echo 'flag blank-off' >> '$t/hooks.log'" "$hk/blank-off"
 nowus() { python3 -c 'import time; print(int(time.clock_gettime(time.CLOCK_MONOTONIC) * 1000000))'; }
 move() {
   echo "$1" > "$t/unit.state"
@@ -290,6 +296,11 @@ case "\$*" in
     cp "$t/unit.stamp" "$t/unit.since" 2> /dev/null || nowus > "$t/unit.since"
     ;;
   is-system-running) cat "$t/sysrun" 2> /dev/null || echo running ;;
+  '--user show -P ActiveState blockie-game.scope')
+    s=\$(cat "$t/scope.state" 2> /dev/null || echo inactive)
+    [ "\$s" != error ] || exit 1
+    echo "\$s"
+    ;;
   *) echo "systemctl \$*" >> "$t/hooks.log" ;;
 esac
 EOF
@@ -304,12 +315,13 @@ live() {
   mkfifo "$t/fifo"
   PATH=$t/fbin:$PATH BLOCKIE_HOTKEYD_INPUT=$t/fifo BLOCKIE_HOTKEYD_HOOKS=$hk BLOCKIE_HOTKEYD_LONG_MS=300 \
     BLOCKIE_HOTKEYD_HOOK_MS=${HOOK_MS:-5000} BLOCKIE_HOTKEYD_BACKSTOP_MS=${BACKSTOP_MS:-20000} BLOCKIE_HOTKEYD_TABLES=$t/usr:$t/etc BLOCKIE_HOTKEYD_CURRENT=$t/current \
-    BLOCKIE_HOTKEYD_BUTTONS="${MAP:-$t/nomap}" \
+    XDG_RUNTIME_DIR=$t/run BLOCKIE_HOTKEYD_BUTTONS="${MAP:-$t/nomap}" \
     BLOCKIE_HOTKEYD_SLEEP=$t/fbin/fake-sleep BLOCKIE_HOTKEYD_SLEPT=$t/slept BLOCKIE_HOTKEYD_SYSFS=$t/psys \
     BLOCKIE_HOTKEYD_KNOB=$t/knob BLOCKIE_HOTKEYD_HOOK_RUNNER=${RUNNER:-$runner} DBUS_SESSION_BUS_ADDRESS=unix:path=$t/nobus \
     BLOCKIE_HOTKEYD_MENU=$t/fbin/fake-menu BLOCKIE_HOTKEYD_BACKLIGHT=$t/fbin/fake-backlight BLOCKIE_BOOT_STATE=$t/boot.state \
     env "${e[@]}" timeout -k 5 30 python3 "$bin" > "$t/out" 2> "$t/err" &
   local pid=$!
+  echo "$pid" > "$t/hk.pid"
   timeout -k 5 60 bash -c "exec > '$t/fifo'; $script"
   wait "$pid"
   endmenu
@@ -835,6 +847,243 @@ FAST='MENU_KILL_MS=800' live "$hold; sleep 0.3; $tap; until_n '^menu term$' $t/h
 g=$(cat "$t/killed.ms" 2> /dev/null || echo -1)
 ((g >= 600 && g < 1400)) && grep -q 'blockie-powermenu still running after 800 ms: killed' "$t/err"
 res $? "menu: a child ignoring SIGTERM is killed at the kill time ($g ms)"
+
+printf '#!/bin/sh\necho game-menu >> "%s"\n' "$t/hooks.log" > "$hk/game-menu"
+printf '#!/bin/sh\necho game-quit >> "%s"\n' "$t/hooks.log" > "$hk/game-quit"
+chmod 755 "$hk/game-menu" "$hk/game-quit"
+printf 'emulation 1 1\n' > "$t/current"
+port=$t/run/blockie-game.port
+flag=$t/run/blockie-game.paused
+pmo="$mo"$'\nmenu mode=pause'
+lt='sleep 0.5; echo extra3 down; echo extra3 up'
+lh='echo extra3 down; sleep 0.5; echo extra3 up'
+running() { rm -f "$flag"; : > "$port"; echo active > "$t/scope.state"; }
+nogame() { rm -f "$port" "$flag" "$t/scope.state"; }
+after() { nt | tail -n +7 | sort | paste -sd '|'; }
+
+running
+mq '0.1 shown'
+PATH=$t/fbin:$PATH run "$lt; sleep 0.5"
+[[ $(cat "$t/out") == $'action extra3 tap game-menu\ngrab keys' && -e $flag ]] && grep -q 'blockie-powermenu started in pause mode' "$t/err"
+r=$?
+nogame
+PATH=$t/fbin:$PATH run "$lt; sleep 0.5"
+[[ $r == 0 && $(cat "$t/out") == 'action extra3 tap game-menu' && ! -e $flag ]]
+res $? "pause (dry): a logo tap with blockie-game.port and an active scope grabs the key nodes and starts the pause child; with neither it is the plain game-menu"
+
+running
+mq '0.1 shown' '0.3 resume' '0.3 exit'
+PATH=$t/fbin:$PATH run "$lt; sleep 1.2"
+[[ $(cat "$t/out") == $'action extra3 tap game-menu\ngrab keys\nungrab\nresync\nresync' && ! -e $flag ]]
+res $? "pause (dry): a pause child's exit runs resync, after the ungrab's own, so a key forwarded by it cannot stay down"
+
+running
+mq '0.1 shown' '0.8 resume'
+live "$lt; sleep 0.4; echo extra3 down; echo extra3 up; sleep 1.2"
+[[ $(nt) == "$woke"$'\n'"$pmo"$'\nmenu stdin back\n'"$woke" && ! -e $flag ]] && ! termed && ! grep -qx game-menu "$t/hooks.log"
+res $? "pause: a logo tap runs menu-on and the pause child, a second tap writes back to it, its resume removes blockie-game.paused before blank-off continues the scope"
+
+ok=0
+nogame
+echo active > "$t/scope.state"
+live "$lt; sleep 0.5"
+logis "$woke"$'\ngame-menu' && [[ ! -e $flag ]] || { ok=1; echo "  no port file: $(paste -sd '|' "$t/hooks.log")"; }
+: > "$port"
+echo inactive > "$t/scope.state"
+live "$lt; sleep 0.5"
+logis "$woke"$'\ngame-menu' && [[ ! -e $flag ]] || { ok=1; echo "  scope inactive: $(paste -sd '|' "$t/hooks.log")"; }
+printf 'android 1 1\n' > "$t/current"
+running
+live "$lt; sleep 0.5"
+logis "$woke" && [[ ! -e $flag ]] || { ok=1; echo "  android: $(paste -sd '|' "$t/hooks.log")"; }
+printf 'emulation 1 1\n' > "$t/current"
+res $ok "pause: without blockie-game.port (scope active) or with the scope inactive the logo tap runs the game-menu hook (RetroArch's menu); in another session nothing"
+
+running
+mq '0.1 shown' '1.2 cancel'
+live "$hold; sleep 0.2; echo extra3 down; echo extra3 up; sleep 1.5"
+logis "$woke"$'\n'"$mo"$'\n'"$woke" && [[ ! -e $flag ]]
+res $? "pause: a logo tap during the power menu does nothing, and after its cancel the state is awake with no pause"
+
+ok=0
+running
+mq '0.1 shown'
+live "$lt; sleep 0.5; $lh; sleep 1"
+[[ $(nt | head -n 6) == "$woke"$'\n'"$pmo" && $(after) == 'exit blank-off|game-quit|start blank-off' && ! -e $flag ]] && termed ||
+  { ok=1; echo "  hold: $(paste -sd '|' "$t/hooks.log")"; }
+running
+mq '0.1 shown' '0.3 quit'
+live "$lt; sleep 1"
+[[ $(nt | head -n 6) == "$woke"$'\n'"$pmo" && $(after) == 'exit blank-off|game-quit|start blank-off' && ! -e $flag ]] && ! termed ||
+  { ok=1; echo "  quit line: $(paste -sd '|' "$t/hooks.log")"; }
+res $ok "pause: a logo hold (SIGTERM to the child) and the child's quit each run the game-quit hook and remove blockie-game.paused before blank-off"
+
+running
+mq '0.1 shown'
+live "$lt; sleep 0.5; $tap; sleep 0.5; [ -e '$flag' ] && : > '$t/kept'; $tap; sleep 1"
+[[ $(nt) == "$woke"$'\n'"$pmo"$'\nstart blank-on\nexit blank-on\n'"$pmo" && -e $flag && -e $t/kept ]] && termed
+res $? "pause: a power tap ends the child and blanks with blockie-game.paused kept; the wake runs menu-on and a new pause child, no blank-off"
+rm -f "$t/kept"
+
+running
+mq '0.1 shown' '2.2 shown power' '0.5 cancel'
+live "$lt; sleep 0.3; $hold; sleep 1.2; echo extra3 down; echo extra3 up; sleep 0.5"
+[[ $(nt) == "$woke"$'\n'"$pmo"$'\nmenu stdin power\nmenu stdin back' && -e $flag ]] && ! termed &&
+  grep -q 'blockie-powermenu: shown power' "$t/err" && grep -q 'blockie-powermenu: cancel' "$t/err"
+res $? "pause: a power hold writes power to the child; its cancel returns to the pause with no hook, and a logo tap then writes back"
+
+running
+mq '0.1 shown'
+FAST='POLL_MS=300' live "$lt; sleep 0.6; echo inactive > '$t/scope.state'; sleep 1"
+[[ $(nt) == "$woke"$'\n'"$pmo"$'\n'"$woke" && ! -e $flag ]] && termed && grep -q 'blockie-game.scope is inactive: the pause ends' "$t/err"
+res $? "pause: the scope going inactive ends the child, removes blockie-game.paused and runs blank-off"
+
+running
+mq '0.1 shown'
+FAST='POLL_MS=300' live "$lt; sleep 0.6; printf 'android 1 1\n' > '$t/current'; sleep 0.8; printf 'emulation 1 1\n' > '$t/current'; sleep 1"
+[[ $(nt) == "$woke"$'\n'"$pmo"$'\nstart blank-off\nflag blank-off\nexit blank-off\n'"$pmo" && -e $flag ]] && termed
+res $? "pause: session-current android ends the child, blank-off keeps the scope stopped with blockie-game.paused kept; back in emulation the pause opens again"
+printf 'emulation 1 1\n' > "$t/current"
+
+ok=0
+running
+: > "$flag"
+mq '0.1 shown'
+live 'sleep 1'
+logis $'start blank-off\nflag blank-off\nexit blank-off\n'"$pmo" && [[ -e $flag ]] ||
+  { ok=1; echo "  active: $(paste -sd '|' "$t/hooks.log")"; }
+echo inactive > "$t/scope.state"
+: > "$flag"
+live 'sleep 1'
+[[ $(grep -v '^flag ' "$t/hooks.log") == "$woke" && ! -e $flag ]] || { ok=1; echo "  inactive: $(paste -sd '|' "$t/hooks.log")"; }
+res $ok "pause: a start with blockie-game.paused runs blank-off with the scope kept stopped, then with an active scope enters the pause (menu-on, a pause child); with the scope not active the file is removed"
+
+running
+mq '0.1 shown'
+FAST='POLL_MS=300' live "$lt; sleep 0.6; echo error > '$t/scope.state'; sleep 1.2"
+[[ $(nt) == "$woke"$'\n'"$pmo" && -e $flag ]] && ! termed && grep -q 'gave no state: the pause stays' "$t/err"
+res $? "pause: a systemctl show with no state keeps the pause and its child, the poll retries"
+
+running
+mq '0.1 shown'
+FAST='POLL_MS=300' live "$lt; sleep 0.6; mv -f '$flag' '$t/flag.gone'; sleep 1"
+[[ $(nt) == "$woke"$'\n'"$pmo"$'\n'"$woke" && ! -e $flag ]] && termed && grep -q 'blockie-game.paused is gone: the pause ends' "$t/err"
+res $? "pause: blockie-game.paused removed from outside ends the pause at the next poll"
+
+running
+mq '0.1 shown'
+live "$lt; sleep 0.6; kill -TERM \$(< '$t/hk.pid'); sleep 0.5"
+[[ $(nt) == "$woke"$'\n'"$pmo" && ! -e $flag ]] && grep -q 'SIGTERM while paused: the pause ends' "$t/err"
+res $? "pause: a SIGTERM to hotkeyd while paused removes blockie-game.paused before hotkeyd quits"
+
+running
+mq '0.1 shown'
+live "$lt; sleep 0.5; $tap; sleep 0.5; mv -f '$port' '$t/port.gone'; $tap; sleep 1"
+[[ $(nt) == "$woke"$'\n'"$pmo"$'\nstart blank-on\nexit blank-on\n'"$woke" && ! -e $flag ]] && termed &&
+  grep -q 'is gone: the pause ends' "$t/err"
+res $? "pause: a wake after the port ended while blanked ends the pause: blank-off with no flag, no new pause child"
+
+running
+echo error > "$t/scope.state"
+mq '0.1 shown'
+live "$lt; sleep 0.8"
+[[ $(nt) == "$woke"$'\n'"$pmo" && -e $flag ]]
+res $? "pause: a logo tap with blockie-game.port and no scope state from systemctl still pauses"
+
+ok=0
+running
+mq '0.1 shown' '2.2 shown power' '0.5 boot reboot' '1.5 failed boot'
+live "$lt; sleep 0.3; $hold; sleep 3; echo extra3 down; echo extra3 up; sleep 0.5"
+[[ $(nt) == "$woke"$'\n'"$pmo"$'\nmenu stdin power\n'"$lit"$'\nsystemctl --user start --no-block blockie-reboot@reboot.service\nstart menu-on\nexit menu-on\nmenu stdin back' && -e $flag ]] &&
+  ! termed && grep -q 'blockie-powermenu: failed boot: back to awake, the redirect decides' "$t/err" || { ok=1; echo "  line: $(paste -sd '|' "$t/hooks.log")"; }
+echo failed > "$t/unit.state"
+echo exit-code > "$t/unit.result"
+running
+mq '0.1 shown' '2.2 shown power' '0.5 boot reboot' '2.4 failed boot'
+FAST='TOAST_MS=1500 POLL_MS=300' live "$lt; sleep 0.3; $hold; sleep 6"
+[[ $(nt | tail -n 2 | paste -sd '|') == 'start menu-on|exit menu-on' && -e $flag ]] && ! termed &&
+  grep -q "waiting for the pause child's failed boot" "$t/err" || { ok=1; echo "  failed unit: $(paste -sd '|' "$t/hooks.log")"; }
+rm -f "$t/unit.state" "$t/unit.result"
+res $ok "pause: a boot from the pause that ran and failed: the child's failed boot moves lit-frozen to paused (menu-on), the child is kept, even when hotkeyd read the failure first"
+
+ok=0
+running
+mq '0.1 shown' '2.2 shown power' '0.5 boot reboot' '1.0 failed boot'
+live "$lt; sleep 0.3; $hold; sleep 1.4; mv -f '$port' '$t/port.gone'; echo inactive > '$t/scope.state'; sleep 2"
+[[ $(nt | tail -n 2 | paste -sd '|') == 'start blank-off|exit blank-off' && ! -e $flag ]] && termed &&
+  [[ $(grep -c '^start menu-on' "$t/hooks.log") == 1 ]] &&
+  [[ $(grep -c '^menu start' "$t/hooks.log") == 1 ]] && ! grep -q 'flag blank-off' "$t/hooks.log" ||
+  { ok=1; echo "  port gone: $(paste -sd '|' "$t/hooks.log")"; }
+echo failed > "$t/unit.state"
+echo exit-code > "$t/unit.result"
+running
+mq '0.1 shown' '2.2 shown power' '0.5 boot reboot'
+FAST='TOAST_MS=1000 POLL_MS=300' live "$lt; sleep 0.3; $hold; sleep 4.5"
+termed && [[ $(grep -c '^menu start' "$t/hooks.log") == 2 && -e $flag ]] || { ok=1; echo "  hung child: $(paste -sd '|' "$t/hooks.log")"; }
+rm -f "$t/unit.state" "$t/unit.result"
+res $ok "pause: after a failed boot with the port gone the pause ends (SIGTERM, blank-off, no dialog over the home); a child that never says failed boot is ended at 2 x the toast time and the pause opens again"
+
+running
+mq '0.1 shown' '2.2 shown power' '0.5 failed gate'
+live "$lt; sleep 0.3; $hold; sleep 1.2; echo extra3 down; echo extra3 up; sleep 0.5"
+[[ $(nt) == "$woke"$'\n'"$pmo"$'\nmenu stdin power\nmenu stdin back' && -e $flag ]] && ! termed &&
+  grep -q 'blockie-powermenu: failed gate' "$t/err"
+res $? "pause: the child's failed gate from the power dialog returns to the pause with no hook, and a logo tap then writes back"
+
+ok=0
+layout "$t/map" extra1.tap=game-menu
+running
+mq '0.1 shown' '0.3 key extra1 1' '0.05 key extra1 0'
+MAP=$t/map live "$lt; sleep 1"
+logis "$woke"$'\n'"$pmo"$'\nmenu stdin back' && [[ -e $flag ]] || { ok=1; echo "  paused: $(paste -sd '|' "$t/hooks.log")"; }
+layout "$t/map" extra1.tap=game-menu
+running
+mq '0.1 shown' '2.0 key extra1 1' '0.05 key extra1 0'
+MAP=$t/map live "$lt; sleep 0.3; $hold; sleep 1.5"
+logis "$woke"$'\n'"$pmo"$'\nmenu stdin power' || { ok=1; echo "  menu: $(paste -sd '|' "$t/hooks.log")"; }
+res $ok "pause: the child's key extra1 lines act as extra1 in paused (its game-menu row writes back), and do nothing in menu"
+
+printf '#!/bin/sh\necho volume-up >> "%s"\n' "$t/hooks.log" > "$hk/volume-up"
+chmod 755 "$hk/volume-up"
+running
+mq '0.1 shown'
+live "$lt; sleep 0.5; echo volup down; echo volup up; sleep 0.3"
+logis "$woke"$'\n'"$pmo"$'\nvolume-up' && [[ -e $flag ]]
+res $? "pause: the volume rows act while paused, as in a game"
+rm -f "$hk/volume-up"
+
+running
+mq '0.1 shown' '0.8 resume'
+live "$lt; sleep 0.4; mv -f '$flag' '$t/flag.gone'; mkdir '$flag'; : > '$flag/x'; sleep 1.2; $tap; sleep 0.4; $tap; sleep 0.6"
+grep -qx 'systemctl --user kill --signal=SIGCONT blockie-game.scope' "$t/hooks.log" && grep -q 'cannot remove' "$t/err" &&
+  [[ $(nt | tail -n 4 | paste -sd '|') == 'start blank-on|exit blank-on|start blank-off|exit blank-off' ]] &&
+  ! grep -qx 'flag blank-off' "$t/hooks.log" && [[ $(grep -c '^menu start' "$t/hooks.log") == 1 ]]
+res $? "T7: when blockie-game.paused cannot be removed hotkeyd sends SIGCONT to the scope itself, and a later blank and wake with the directory still there is a plain wake"
+rm -rf "${flag:?}"
+
+nogame
+mkfifo "$port"
+echo active > "$t/scope.state"
+live "$lt; sleep 0.5"
+logis "$woke"$'\ngame-menu' && [[ ! -e $flag ]]
+res $? "pause: a FIFO at blockie-game.port is no running port: the logo tap runs the game-menu hook and nothing blocks"
+rm -f "$port"
+
+ok=0
+running
+echo 1 > "$hk/menu-on.rc"
+live "$lt; sleep 1"
+logis "$woke"$'\nstart menu-on\nexit menu-on\nstart menu-on\nexit menu-on\n'"$woke" && [[ ! -e $flag ]] &&
+  grep -q 'menu-on failed twice: the pause ends' "$t/err" || { ok=1; echo "  menu-on: $(paste -sd '|' "$t/hooks.log")"; }
+rm -f "$hk/menu-on.rc"
+running
+: > "$t/menu.q"
+FAST='SHOWN_MS=800' live "$lt; sleep 1.5"
+[[ $(nt) == "$woke"$'\n'"$pmo"$'\n'"$woke" && ! -e $flag ]] && termed || { ok=1; echo "  no shown: $(paste -sd '|' "$t/hooks.log")"; }
+res $ok "T7: menu-on failing twice and a child with no shown remove blockie-game.paused before blank-off continues the scope"
+nogame
+rm -f "$hk/game-menu" "$hk/game-quit"
+printf 'nobody-here 1 1\n' > "$t/current"
 
 for h in blank-on blank-off screen-on menu-on; do
   echo 0.1 > "$hk/$h.sleep"
