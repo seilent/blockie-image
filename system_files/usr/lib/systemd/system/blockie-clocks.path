@@ -1,0 +1,15 @@
+[Unit]
+Description=Apply the clocks profile when the settings map changes
+DefaultDependencies=no
+After=blockie-clocks.service
+Requisite=blockie-clocks.service
+PartOf=blockie-clocks.service
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Path]
+PathChanged=/run/blockie-set/settings
+Unit=blockie-clocks-change.service
+
+[Install]
+WantedBy=multi-user.target

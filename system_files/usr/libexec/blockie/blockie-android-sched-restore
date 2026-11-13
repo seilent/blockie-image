@@ -8,14 +8,17 @@ lock=$root/run/blockie-perf.lock
 payload=$root/sys/fs/cgroup/lxc.payload.waydroid
 cpufreq=$root/sys/devices/system/cpu/cpufreq
 wait=${BLOCKIE_SCHED_LOCK_WAIT:-2}
+later=${BLOCKIE_SCHED_DEFERRED_WAIT:-60}
 declare -A path=([policy0]=$cpufreq/policy0/scaling_min_freq [policy6]=$cpufreq/policy6/scaling_min_freq
   [gpu]=$root/sys/kernel/ged/hal/custom_boost_gpu_freq
   [ddr]=$root/sys/devices/platform/10012000.dvfsrc/helio-dvfsrc/dvfsrc_req_ddr_opp)
 declare -A orig=([policy0]=500000 [policy6]=850000 [gpu]=29 [ddr]=255)
 
-for d in "$payload" "$payload/top" "$payload/fg"; do
-  [[ ! -e $d/cpu.uclamp.min ]] || echo 0 > "$d/cpu.uclamp.min" || echo "$me: cannot write $d/cpu.uclamp.min" >&2
-done
+if [[ ${BLOCKIE_SCHED_DEFERRED:-} != 1 ]]; then
+  for d in "$payload" "$payload/top" "$payload/fg"; do
+    [[ ! -e $d/cpu.uclamp.min ]] || echo 0 > "$d/cpu.uclamp.min" || echo "$me: cannot write $d/cpu.uclamp.min" >&2
+  done
+fi
 
 knobs=()
 if [[ -r $state/dirty ]]; then
@@ -53,8 +56,26 @@ fi
 [[ -e $lock ]] || (umask 077 && : >> "$lock")
 exec 9>> "$lock" || { echo "$me: cannot open $lock" >&2; exit 1; }
 if ! flock -w "$wait" 9; then
-  echo "$me: $lock still held after $wait s, left ${knobs[*]} as they are"
+  exec 9>&-
+  if [[ ${BLOCKIE_SCHED_DEFERRED:-} == 1 ]]; then
+    echo "$me: $lock still held after $wait s, left ${knobs[*]} as they are"
+    exit 0
+  fi
+  if systemd-run --no-block --collect --unit=blockie-android-sched-deferred --setenv=BLOCKIE_SCHED_DEFERRED=1 \
+    --setenv=BLOCKIE_SCHED_LOCK_WAIT="$later" --setenv=BLOCKIE_SCHED_ROOT="$root" "$(readlink -f "$0")" > /dev/null 2>&1; then
+    echo "$me: $lock still held after $wait s, the restore of ${knobs[*]} goes to blockie-android-sched-deferred"
+  else
+    echo "$me: $lock still held after $wait s and blockie-android-sched-deferred did not start, left ${knobs[*]} as they are"
+  fi
   exit 0
+fi
+if [[ ${BLOCKIE_SCHED_DEFERRED:-} == 1 ]]; then
+  case $(systemctl is-active blockie-android-sched.service 2> /dev/null) in
+    active | activating | reloading)
+      echo "$me: blockie-android-sched.service runs again and took the dirty list over, the deferred restore writes nothing"
+      exit 0
+      ;;
+  esac
 fi
 failed=()
 for k in "${knobs[@]}"; do

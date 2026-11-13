@@ -183,6 +183,55 @@ done
 for v in FAILED ACTIVE NOT_EXIT1; do
   grep -q "^BLOCKIE_BOOT_OK_$v=" /usr/lib/blockie/boot-ok.conf || fail "boot-ok.conf lacks BLOCKIE_BOOT_OK_$v"
 done
+grep -qxF 'BLOCKIE_BOOT_OK_NOT_EXIT1=${BLOCKIE_BOOT_OK_NOT_EXIT1:-blockie-dl1.service blockie-clocks.service}' \
+  /usr/lib/blockie/boot-ok.conf || fail "boot-ok.conf does not hold blockie-dl1 and blockie-clocks in BLOCKIE_BOOT_OK_NOT_EXIT1"
+grep -qxF 'BLOCKIE_BOOT_OK_NO_FILE=${BLOCKIE_BOOT_OK_NO_FILE:-/run/blockie-clocks/failed}' /usr/lib/blockie/boot-ok.conf ||
+  fail "boot-ok.conf does not name /run/blockie-clocks/failed in BLOCKIE_BOOT_OK_NO_FILE"
+sd=/usr/lib/systemd/system
+for l in Type=oneshot RemainAfterExit=yes SuccessExitStatus=2 'ExecStart=/usr/libexec/blockie/blockie-clocks apply' \
+  'ExecStop=/usr/libexec/blockie/blockie-clocks restore' TimeoutStartSec=60s TimeoutStopSec=5s \
+  'Wants=blockie-setd.service blockie-clocks-change.service' After=blockie-setd.service Before=waydroid-container.service \
+  '[Install]' WantedBy=multi-user.target; do
+  grep -qxF "$l" $sd/blockie-clocks.service || fail "blockie-clocks.service lacks '$l'"
+done
+for l in Type=oneshot SuccessExitStatus=2 'ExecStart=/usr/libexec/blockie/blockie-clocks change' TimeoutStartSec=60s \
+  After=blockie-clocks.service Requisite=blockie-clocks.service PartOf=blockie-clocks.service; do
+  grep -qxF "$l" $sd/blockie-clocks-change.service || fail "blockie-clocks-change.service lacks '$l'"
+done
+sed -n '/^\[Unit\]/,/^\[/p' $sd/blockie-clocks-change.service | grep -qxF StartLimitIntervalSec=0 ||
+  fail "blockie-clocks-change.service lacks StartLimitIntervalSec=0 in [Unit]"
+! grep -q '^\[Install\]' $sd/blockie-clocks-change.service || fail "blockie-clocks-change.service has an [Install] section"
+for l in DefaultDependencies=no After=blockie-clocks.service Requisite=blockie-clocks.service PartOf=blockie-clocks.service \
+  Conflicts=shutdown.target Before=shutdown.target PathChanged=/run/blockie-set/settings Unit=blockie-clocks-change.service \
+  '[Install]' WantedBy=multi-user.target; do
+  grep -qxF "$l" $sd/blockie-clocks.path || fail "blockie-clocks.path lacks '$l'"
+done
+for l in OnActiveSec=60s OnUnitInactiveSec=60s Unit=blockie-clocks-change.service After=blockie-clocks.service \
+  Requisite=blockie-clocks.service PartOf=blockie-clocks.service '[Install]' WantedBy=multi-user.target; do
+  grep -qxF "$l" $sd/blockie-clocks-change.timer || fail "blockie-clocks-change.timer lacks '$l'"
+done
+! grep -q '^RuntimeDirectory' $sd/blockie-clocks.service $sd/blockie-clocks-change.service $sd/blockie-clocks.path \
+  $sd/blockie-clocks-change.timer || fail "a clocks unit carries RuntimeDirectory="
+for u in blockie-clocks.service blockie-clocks.path blockie-clocks-change.timer; do
+  [[ -L /etc/systemd/system/multi-user.target.wants/$u ]] || fail "$u is not enabled"
+done
+cmp -s <(printf '[Unit]\nAfter=blockie-clocks.service\n') "$sd/user@.service.d/60-blockie-clocks.conf" ||
+  fail "the user@ drop-in is not After=blockie-clocks.service alone"
+[[ $(stat -c %a /usr/libexec/blockie/blockie-clocks 2> /dev/null) == 755 ]] || fail "blockie-clocks is not a 755 file"
+cfs=$(sed -n 's/^\[\(.*\)\]$/\1/p' /usr/lib/blockie/clocks.conf | paste -sd' ')
+cenum=$(jq -r '.keys["power.clocks"].enum | join(" ")' /usr/share/blockie/schema.d/30-clocks.json)
+[[ $cenum == "$cfs" ]] || fail "power.clocks enum $cenum, clocks.conf sections $cfs"
+cdef=$(jq -r '.keys["power.clocks"].default' /usr/share/blockie/schema.d/30-clocks.json)
+[[ $(sed -n 's/^default=//p' /usr/lib/blockie/clocks.conf) == "$cdef" ]] ||
+  fail "clocks.conf default=$(sed -n 's/^default=//p' /usr/lib/blockie/clocks.conf), power.clocks default $cdef"
+jq -e '.keys["power.clocks"] | .type == "s" and .map == true and .group == "power"' \
+  /usr/share/blockie/schema.d/30-clocks.json > /dev/null || fail "30-clocks.json: power.clocks is not a mapped s key on power"
+for f in line_65000:trip-65000.line line_72000:trip-72000.line line_80000:trip-80000.line read_boot:tzcpu-boot.read \
+  read_65000:tzcpu-65000.read read_72000:tzcpu-72000.read read_80000:tzcpu-80000.read; do
+  pin=$(sed -n "s/^pin_${f%%:*}=\([0-9a-f]\{64\}\)\$/\1/p" /usr/libexec/blockie/blockie-clocks)
+  [[ -n $pin && $(sha256sum < "/usr/lib/blockie/clocks/${f#*:}") == "$pin  -" ]] ||
+    fail "/usr/lib/blockie/clocks/${f#*:} does not hash to pin_${f%%:*} in blockie-clocks"
+done
 [[ -d /usr/share/blockie/blobs.d ]] || fail "no blobs.d"
 rpm -q blockie-gpu > /dev/null || fail "blockie-gpu not installed"
 [[ -f /usr/share/blockie/blobs.d/rk-g29p1.conf && -f /usr/share/blockie/vulkan/rk-g29p1.json ]] || fail "gpu conf or icd missing"

@@ -44,8 +44,9 @@ setup() {
   cat > "$d/conf" << 'EOF'
 BLOCKIE_BOOT_OK_FAILED="ostree-remount.service blockie-adbd.service NetworkManager.service"
 BLOCKIE_BOOT_OK_ACTIVE="NetworkManager.service"
-BLOCKIE_BOOT_OK_NOT_EXIT1="blockie-dl1.service"
+BLOCKIE_BOOT_OK_NOT_EXIT1="blockie-dl1.service blockie-clocks.service"
 EOF
+  echo "BLOCKIE_BOOT_OK_NO_FILE=$d/clocks-failed" >> "$d/conf"
   cat > "$d/bin/findmnt" << EOF
 #!/bin/sh
 cat "$d/varsrc"
@@ -55,7 +56,12 @@ EOF
 case "\$1" in
 is-failed) grep -qxF "\$3" "$d/failed" ;;
 is-active) grep -qxF "\$3" "$d/active" ;;
-show) cat "$d/exit.\$5" 2> /dev/null || echo 0 ;;
+show)
+  case "\$3" in
+  ExecMainStatus) cat "$d/exit.\$5" 2> /dev/null || echo 0 ;;
+  Result) cat "$d/result.\$5" 2> /dev/null || echo success ;;
+  *) exit 9 ;;
+  esac ;;
 --user)
   echo "\$*" >> "$d/shows"
   [ "\$2" = show ] && cat "$d/user.show" 2> /dev/null ;;
@@ -141,6 +147,7 @@ res $? "no tries file: confirmed, empty tries"
 
 setup dl1-exit2
 echo 2 > "$d/exit.blockie-dl1.service"
+echo exit-code > "$d/result.blockie-dl1.service"
 run
 [[ $rc == 0 && $(cat "$d/state/confirmed") == "$A" ]]
 res $? "dl1 exit 2 (no card): confirmed"
@@ -190,6 +197,37 @@ setup dl1-exit1
 echo 1 > "$d/exit.blockie-dl1.service"
 run
 refused "dl1 exit 1 refused" "blockie-dl1.service exited 1"
+
+setup clocks-exit2
+echo 2 > "$d/exit.blockie-clocks.service"
+run
+[[ $rc == 0 && $(cat "$d/state/confirmed") == "$A" ]]
+res $? "clocks exit 2 with Result=success (SuccessExitStatus=2): confirmed"
+
+setup clocks-exit1
+echo 1 > "$d/exit.blockie-clocks.service"
+echo exit-code > "$d/result.blockie-clocks.service"
+run
+refused "clocks exit 1 refused" "blockie-clocks.service exited 1"
+
+for r in timeout signal; do
+  setup "clocks-$r"
+  echo 15 > "$d/exit.blockie-clocks.service"
+  echo "$r" > "$d/result.blockie-clocks.service"
+  run
+  refused "clocks stopped with Result=$r and status 15 refused" "blockie-clocks.service ended with Result=$r"
+done
+
+setup dl1-killed
+echo 9 > "$d/exit.blockie-dl1.service"
+echo signal > "$d/result.blockie-dl1.service"
+run
+refused "dl1 killed (Result=signal) refused" "blockie-dl1.service ended with Result=signal"
+
+setup clocks-failed
+: > "$d/clocks-failed"
+run
+refused "the clocks failure file refuses the ok pass" "clocks-failed exists"
 
 setup glob
 sed -i 's/pick=default/pick=d*/' "$d/cmdline"
@@ -359,6 +397,12 @@ echo blockie-adbd.service > "$d/failed"
 run healthy
 [[ $rc == 1 && ! -e $d/state/confirmed && ! -s $d/calls ]] && grep -q "blockie-adbd.service failed" "$d/out"
 res $? "healthy re-runs the unit checks: a failed blockie-adbd refuses, no re-arm"
+
+product healthy-clocks-failed
+: > "$d/clocks-failed"
+run healthy
+[[ $rc == 1 && ! -e $d/state/confirmed && ! -s $d/calls ]] && grep -q "clocks-failed exists" "$d/out"
+res $? "healthy re-runs the checks: the clocks failure file refuses, no re-arm"
 
 product healthy-fallback
 sed -i 's/pick=default/pick=fallback/' "$d/cmdline"

@@ -1,0 +1,13 @@
+{
+  "owner": "blockie-set",
+  "keys": {
+    "power.clocks": {
+      "type": "s",
+      "default": "trip72-big1443",
+      "enum": ["trip72-big1443", "trip65", "trip72", "trip80"],
+      "group": "power",
+      "label": "Clocks",
+      "map": true
+    }
+  }
+}

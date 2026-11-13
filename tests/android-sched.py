@@ -21,6 +21,15 @@ sys.dont_write_bytecode = True
 BIN = os.environ["SCHED_BIN"]
 RESTORE = os.environ["RESTORE_BIN"]
 T = os.environ["T"]
+NOSR = os.path.join(T, "no-systemd-run")
+os.makedirs(NOSR, exist_ok=True)
+with open(NOSR + "/systemd-run", "w") as _fh:
+    _fh.write("#!/bin/sh\nexit 1\n")
+with open(NOSR + "/systemctl", "w") as _fh:
+    _fh.write("#!/bin/sh\necho inactive\nexit 3\n")
+os.chmod(NOSR + "/systemd-run", 0o755)
+os.chmod(NOSR + "/systemctl", 0o755)
+os.environ["PATH"] = NOSR + ":" + os.environ["PATH"]
 loader = importlib.machinery.SourceFileLoader("sched", BIN)
 m = importlib.util.module_from_spec(importlib.util.spec_from_loader("sched", loader))
 loader.exec_module(m)
@@ -962,8 +971,8 @@ def _(c):
 
 
 @case("ExecStopPost script: payload, top and fg mins to 0, the dirty knobs to orig under the lock and dirty emptied; "
-      "a bad orig uses the built in values; nothing dirty takes no lock; a held lock is waited for up to the bound, "
-      "then the knobs are left as they are")
+      "a bad orig uses the built in values; nothing dirty takes no lock; in the deferred run a held lock is waited for "
+      "up to the bound, then the knobs are left as they are")
 def _(c):
     w = World()
     for g in ("top", "fg", "bg"):
@@ -999,7 +1008,7 @@ def _(c):
     c(r.returncode == 0 and dt < 1 and w.state()["payload"] == 0, f"nothing dirty: {dt:.2f} s")
     w.f(CPU + "/policy0/scaling_min_freq", "1800000\n")
     w.f(STATE + "/dirty", "policy0\n")
-    r, dt = restore(BLOCKIE_SCHED_LOCK_WAIT="1")
+    r, dt = restore(BLOCKIE_SCHED_LOCK_WAIT="1", BLOCKIE_SCHED_DEFERRED="1")
     c(r.returncode == 0 and 0.9 <= dt < 3 and w.state()["policy0"] == 1800000 and w.dirty() == ["policy0"]
       and "still held" in r.stdout, f"held: {dt:.2f} s {r.stdout}")
     threading.Timer(0.5, fh.close).start()
@@ -1016,6 +1025,101 @@ def _(c):
     r, _ = restore()
     c(r.returncode == 1 and w.rd(GED) == "29" and w.dirty() == ["policy6"] and "left policy6" in r.stdout
       and "missing or bad" not in r.stdout, f"failed write: rc {r.returncode} {r.stdout} {w.dirty()}")
+
+
+@case("ExecStopPost script on a busy lock: after its 2 s wait it hands the restore to a transient unit (systemd-run "
+      "--no-block --collect, the deferred flag, a longer wait) and returns 0 at once; the deferred run restores the "
+      "knobs once the lock is free and, still busy at its bound, hands off nothing again; with "
+      "blockie-android-sched.service active or activating again it writes nothing; it never writes the uclamp mins")
+def _(c):
+    w = World()
+    w.f(STATE + "/orig", "policy0 774000\npolicy6 850000\ngpu 29\nddr 255\n")
+    bindir = w.r + "/fakebin"
+    os.makedirs(bindir)
+    calls = w.r + "/systemd-run.calls"
+    with open(bindir + "/systemd-run", "w") as fh:
+        fh.write("#!/usr/bin/env python3\n"
+                 "import os, subprocess, sys\n"
+                 f"with open({calls!r}, 'a') as f:\n"
+                 "    f.write(' '.join(sys.argv[1:]) + '\\n')\n"
+                 "env = dict(os.environ)\n"
+                 "args = sys.argv[1:]\n"
+                 "while args and args[0].startswith('-'):\n"
+                 "    a = args.pop(0)\n"
+                 "    if a.startswith('--setenv='):\n"
+                 "        k, _, v = a[len('--setenv='):].partition('=')\n"
+                 "        env[k] = v\n"
+                 "subprocess.Popen(['bash'] + args, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,\n"
+                 "                 stderr=subprocess.DEVNULL, start_new_session=True)\n")
+    os.chmod(bindir + "/systemd-run", 0o755)
+
+    def ncalls():
+        try:
+            with open(calls) as fh:
+                return fh.read().splitlines()
+        except FileNotFoundError:
+            return []
+
+    def wait_for(cond, s):
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < s:
+            if cond():
+                return True
+            time.sleep(0.05)
+        return cond()
+
+    env = dict(os.environ, BLOCKIE_SCHED_ROOT=w.r, PATH=bindir + ":" + os.environ["PATH"])
+    env.pop("BLOCKIE_SCHED_LOCK_WAIT", None)
+    env.pop("BLOCKIE_SCHED_DEFERRED", None)
+    for leg, later in (("release", "5"), ("busy", "1")):
+        w.f(CPU + "/policy0/scaling_min_freq", "1800000\n")
+        w.f(STATE + "/dirty", "policy0\n")
+        before = len(ncalls())
+        fh = open(w.r + LOCK, "a")
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        t0 = time.monotonic()
+        r = subprocess.run(["bash", RESTORE], env=dict(env, BLOCKIE_SCHED_DEFERRED_WAIT=later), capture_output=True,
+                           text=True)
+        dt = time.monotonic() - t0
+        got = ncalls()[before:]
+        c(r.returncode == 0 and 1.8 <= dt < 4 and "goes to blockie-android-sched-deferred" in r.stdout and len(got) == 1
+          and all(x in got[0].split() for x in ("--no-block", "--collect", "--unit=blockie-android-sched-deferred",
+                                                 "--setenv=BLOCKIE_SCHED_DEFERRED=1",
+                                                 f"--setenv=BLOCKIE_SCHED_LOCK_WAIT={later}"))
+          and w.state()["policy0"] == 1800000, f"{leg}: hand-off rc {r.returncode} {dt:.2f} s {r.stdout} {got}")
+        if leg == "release":
+            time.sleep(0.5)
+            fh.close()
+            c(wait_for(lambda: w.state()["policy0"] == 774000 and w.dirty() == [], 10),
+              f"release: the deferred run restored nothing {w.state()} {w.dirty()}")
+        else:
+            time.sleep(3)
+            c(len(ncalls()) == before + 1 and w.state()["policy0"] == 1800000 and w.dirty() == ["policy0"],
+              f"busy: the deferred run handed off again or wrote {ncalls()} {w.state()}")
+            fh.close()
+        c(len(ncalls()) == before + 1, f"{leg}: a second hand-off {ncalls()}")
+    with open(bindir + "/systemctl", "w") as fh:
+        fh.write("#!/bin/sh\n"
+                 "[ \"$1 $2\" = \"is-active blockie-android-sched.service\" ] || exit 9\n"
+                 "cat \"$BLOCKIE_SCHED_ROOT/unit-state\"\n")
+    os.chmod(bindir + "/systemctl", 0o755)
+    for g in ("top", "fg"):
+        w.mkdir(w.r + PAY + "/" + g)
+    for st in ("active", "activating", "inactive"):
+        w.f("/unit-state", st + "\n")
+        w.f(PAY + "/cpu.uclamp.min", "100\n")
+        w.f(PAY + "/top/cpu.uclamp.min", "100\n")
+        w.f(CPU + "/policy0/scaling_min_freq", "1800000\n")
+        w.f(STATE + "/dirty", "policy0\n")
+        r = subprocess.run(["bash", RESTORE], env=dict(env, BLOCKIE_SCHED_DEFERRED="1", BLOCKIE_SCHED_LOCK_WAIT="1"),
+                           capture_output=True, text=True)
+        c(w.state()["payload"] == 100 and w.state()["top"] == 100, f"deferred, service {st}: uclamp written {w.state()}")
+        if st == "inactive":
+            c(r.returncode == 0 and w.state()["policy0"] == 774000 and w.dirty() == [],
+              f"deferred, service {st}: not restored {r.stdout} {w.state()}")
+        else:
+            c(r.returncode == 0 and w.state()["policy0"] == 1800000 and w.dirty() == ["policy0"]
+              and "took the dirty list over" in r.stdout, f"deferred, service {st}: wrote {r.stdout} {w.state()}")
 
 
 @case("daemon: READY and WATCHDOG over NOTIFY_SOCKET; a launch window writes the knobs and dirty; after kill -9 the "
