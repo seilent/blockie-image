@@ -78,12 +78,16 @@ cmd = a[0]
 if cmd == "--supervise":
     i = a[1]
     rc = wrapper(i).wait()
+    if os.path.exists(f"{T}/linger"):
+        time.sleep(1)
     with open(f"{UNITS}/{i}.rc", "w") as f:
         f.write(str(rc))
     post(i)
     sys.exit(rc)
 if cmd == "start":
     i = inst_of(a[-1])
+    if os.path.exists(f"{T}/start-live") and pid_of(i) is not None:
+        sys.exit(0)
     end = time.monotonic() + 10
     while pid_of(i) is not None and time.monotonic() < end:
         time.sleep(0.02)

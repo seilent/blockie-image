@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import contextlib
+import fcntl
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -99,6 +100,7 @@ def case(name):
         m.free_bytes = FREE
         m.LOGIN_S = 300
         m.STALL_S = 120
+        m.INACTIVE_S = 10
         m.BATCH = 256 << 20
         os.sync = SYNC
         res(ok, name, why)
@@ -131,7 +133,8 @@ def setup(world=None, rows=(ROW,), apps=("alpha.zip\t900001\t" + "a" * 32,), lis
         if os.path.lexists(p):
             shutil.rmtree(p)
     for p in (DDLOG, f"{T}/systemctl.log", f"{T}/inhibit.log", f"{T}/unit.log", f"{T}/dd-pass.count",
-              f"{T}/dd-get.count", f"{T}/inhibit-refused", f"{T}/start-fails", f"{T}/start-noexec"):
+              f"{T}/dd-get.count", f"{T}/inhibit-refused", f"{T}/start-fails", f"{T}/start-noexec",
+              f"{T}/start-live", f"{T}/linger"):
         if os.path.lexists(p):
             os.unlink(p)
     for d in (SSTATE, SDIR, DL, f"{SRUN}/req", RUN, f"{USR}/steam-files", f"{DATA}/cache/ports-tmp"):
@@ -252,7 +255,7 @@ def _(c):
     for n in ("beta", "gamma", "delta"):
         write(f"{PORTS}/{n}/port.json", json.dumps({"name": f"{n}.zip", "items": [n]}))
     rc, lines = call("index")
-    c(tsv() == ["signed\t0", "port\talpha.zip\tget", "port\tdelta.zip\tget"], f"tsv {tsv()}")
+    c(tsv() == ["signed\t0", "bound\t0", "port\talpha.zip\tget", "port\tdelta.zip\tget"], f"tsv {tsv()}")
     write(f"{DL}/signed", "signed 1\n")
     call("index")
     c(tsv()[0] == "signed\t1", f"flag {tsv()[:1]}")
@@ -290,7 +293,7 @@ def _(c):
     got = json.loads(rd(f"{SSTATE}/alpha.zip.got"))
     c(got["digest"] == m.load_map()["alpha.zip"]["digest"] and sorted(got["placed"]) == sorted(f"alpha/{p}" for p in GAME),
       f"got {got}")
-    c(tsv() == ["signed\t1", "port\talpha.zip\tgot"], f"tsv {tsv()}")
+    c(tsv() == ["signed\t1", "bound\t0", "port\talpha.zip\tgot"], f"tsv {tsv()}")
     c(not [x for x in os.listdir(DL) if x.startswith("alpha.zip.")], f"steam-dl left {os.listdir(DL)}")
     c(not os.listdir(f"{STATE}/txn"), "journal left")
     c(not os.path.exists(f"{SSTATE}/beta.zip.owned"), "the sign in left an owned mark")
@@ -401,21 +404,25 @@ APP_LIB = ["app\t9000301\tgame\tInvented", "owned\t9000301", "lang\t9000301\t-",
 APP_GOOD = {"login": "token", "os": "windows", "choice": "-", "drop": []}
 
 
-def app_unit(op, env=None):
+def fifo_unit(inst, req, env=None):
     with contextlib.suppress(FileNotFoundError):
-        os.unlink(f"{SRUN}/app-9000301.fifo")
-    write(f"{SRUN}/req/app-9000301", json.dumps(dict(APP_GOOD, op=op, port="app-9000301")), 0o640)
-    p = subprocess.Popen([BIN, "steam-unit", "app-9000301"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        os.unlink(f"{SRUN}/{inst}.fifo")
+    write(f"{SRUN}/req/{inst}", json.dumps(req), 0o640)
+    p = subprocess.Popen([BIN, "steam-unit", inst], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
                          env=dict(os.environ, **(env or {})))
     end = time.monotonic() + 10
-    while not os.path.exists(f"{SRUN}/app-9000301.fifo") and time.monotonic() < end:
+    while not os.path.exists(f"{SRUN}/{inst}.fifo") and time.monotonic() < end:
         time.sleep(0.02)
-    fd = os.open(f"{SRUN}/app-9000301.fifo", os.O_RDONLY | os.O_NONBLOCK)
+    fd = os.open(f"{SRUN}/{inst}.fifo", os.O_RDONLY | os.O_NONBLOCK)
     p.wait(timeout=20)
     time.sleep(0.1)
     got = os.read(fd, 4096)
     os.close(fd)
-    return p.returncode, got
+    return p.returncode, got, p.stderr.read()
+
+
+def app_unit(op, env=None):
+    return fifo_unit("app-9000301", dict(APP_GOOD, op=op, port="app-9000301"), env)[:2]
 
 
 @case("app instances: the unit takes app-<digits> only for a kept app of library.tsv and refuses, before any FIFO or "
@@ -990,24 +997,24 @@ def _(c):
 def _(c):
     setup(signed=True)
     call("steam-get", "alpha.zip")
-    c(tsv()[1:] == ["port\talpha.zip\tgot"], f"{tsv()}")
+    c(tsv()[2:] == ["port\talpha.zip\tgot"], f"{tsv()}")
     write(f"{USR}/steam-map.tsv", ROW.replace("\t-\t-\t-\t-", "\t-\t-\t-\talpha/game.port") + "\n")
     call("index")
-    c(tsv()[1:] == ["port\talpha.zip\tget"], f"check path {tsv()}")
+    c(tsv()[2:] == ["port\talpha.zip\tget"], f"check path {tsv()}")
     write(f"{PORTS}/alpha/game.port", "patched")
     shutil.rmtree(f"{PORTS}/alpha/gamedata")
     call("index")
-    c(tsv()[1:] == ["port\talpha.zip\tgot"], f"a port that consumed its placed files with the check path {tsv()}")
+    c(tsv()[2:] == ["port\talpha.zip\tgot"], f"a port that consumed its placed files with the check path {tsv()}")
     os.unlink(f"{PORTS}/alpha/game.port")
     call("steam-get", "alpha.zip")
     write(f"{PORTS}/alpha/game.port", "patched")
     write(f"{USR}/steam-map.tsv", ROW.replace("\t-\t-\talpha\t", "\t900222\t-\talpha\t") + "\n")
     call("index")
-    c(tsv()[1:] == ["port\talpha.zip\tget"], f"digest {tsv()}")
+    c(tsv()[2:] == ["port\talpha.zip\tget"], f"digest {tsv()}")
     write(f"{USR}/steam-map.tsv", ROW + "\n")
     shutil.rmtree(f"{PORTS}/alpha/gamedata")
     call("index")
-    c(tsv()[1:] == ["port\talpha.zip\tget"], f"placed gone {tsv()}")
+    c(tsv()[2:] == ["port\talpha.zip\tget"], f"placed gone {tsv()}")
 
 
 @case("steam-logout: the unit's logout, signed 0, the owned marks cleared, done steam-logout")
@@ -1129,7 +1136,7 @@ def _(c):
     for n in ("beta", "gamma"):
         write(f"{PORTS}/{n}/port.json", json.dumps({"name": f"{n}.zip", "items": [n]}))
     call("index")
-    c(tsv()[1:] == ["port\talpha.zip\tget", "port\tgamma.zip\tget"], f"tsv {tsv()}")
+    c(tsv()[2:] == ["port\talpha.zip\tget", "port\tgamma.zip\tget"], f"tsv {tsv()}")
 
 
 @case("a 512 byte https code is shown")
@@ -1183,6 +1190,207 @@ def _(c):
     c(st is not None and st.st_uid == pw.pw_uid and stat.S_IMODE(st.st_mode) & 0o077 == 0, "token owner or mode")
     c(os.stat(f"{PORTS}/alpha/gamedata/data.win").st_uid == 0, "a placed file is not the helper's")
     c(rd(f"{DL}/signed") == "signed 1\n" and os.stat(f"{DL}/signed").st_uid == pw.pw_uid, "signed flag")
+
+
+def sctl():
+    return [json.loads(x) for x in rd(f"{T}/systemctl.log").splitlines()]
+
+
+def starts(inst="alpha.zip"):
+    return [a for a in sctl() if a[0] == "start" and "--wait" not in a and a[-1] == m.UNIT.format(inst)]
+
+
+def rows_of(rows):
+    return [(r["op"], r["result"], r["backoff"]) for r in rows]
+
+
+@case("login bounds: a rate row refuses a port's pass and get at the unit with fail bound before DepotDownloader and "
+      "writes no row; the helper sends fail <port> bound with no QR retry; past the backoff both run and end ok")
+def _(c):
+    setup(signed=True)
+    now = int(time.time())
+    rate = {"op": "get", "start": now - 300, "result": "rate", "at": now - 300, "backoff": 600}
+    os.makedirs(m.LIB_DIR, exist_ok=True)
+    m.write_logins([rate])
+    for op in ("pass", "get"):
+        rc, got, _ = fifo_unit("alpha.zip", {"op": op, "port": "alpha.zip", "login": "token"})
+        c(rc == 1 and got == b"fail\tbound\nrc\t1\n" and not dd_runs() and m.read_logins() == [rate],
+          f"{op}: rc {rc} {got!r} {m.read_logins()}")
+    rc, lines = call("steam-get", "alpha.zip")
+    c(last(lines) == "fail\talpha.zip\tbound" and not [x for x in lines if x.startswith("qr\t")] and not dd_runs() and
+      len(starts()) == 1 and m.read_logins() == [rate], f"{lines[-2:]} {starts()} {m.read_logins()}")
+    c(tsv()[1] == f"bound\t{now + 300}", f"tsv {tsv()[:2]}")
+    m.write_logins([dict(rate, start=now - 601, at=now - 601)])
+    rc, lines = call("steam-get", "alpha.zip")
+    rows = m.read_logins()[1:]
+    c(rc == 0 and [r["op"] for r in dd_runs()] == ["pass", "get"], f"{lines[-2:]} {LOG[-3:]}")
+    c(rows_of(rows) == [("pass", "ok", 0), ("get", "ok", 0)] and all(now <= r["start"] <= r["at"] for r in rows),
+      f"rows {rows}")
+    c(tsv()[1] == "bound\t0", f"tsv {tsv()[:2]}")
+
+
+@case("login bounds: a port get failing rate at logon writes a rate row of backoff 600 and the next get is refused "
+      "bound; a pass ending network writes its row, which refuses nothing")
+def _(c):
+    setup({"get": [{"fail": "rate"}]}, signed=True)
+    rc, lines = call("steam-get", "alpha.zip")
+    rows = m.read_logins()
+    c(last(lines) == "fail\talpha.zip\tnetwork" and rows_of(rows) == [("pass", "ok", 0), ("get", "rate", 600)],
+      f"{lines[-1:]} {rows}")
+    c(tsv()[1] == f"bound\t{rows[-1]['at'] + 600}", f"tsv {tsv()[:2]}")
+    rc, lines = call("steam-get", "alpha.zip")
+    c(last(lines) == "fail\talpha.zip\tbound" and len(dd_runs()) == 2 and m.read_logins() == rows, f"{lines[-1:]}")
+    setup({"pass": [{"fail": "network"}, {}]}, signed=True)
+    rc, lines = call("steam-get", "alpha.zip")
+    rows = m.read_logins()
+    c(last(lines) == "fail\talpha.zip\tnetwork" and rows_of(rows) == [("pass", "network", 600)], f"{lines[-1:]} {rows}")
+    c(tsv()[1] == "bound\t0", f"tsv {tsv()[:2]}")
+    rc, lines = call("steam-get", "alpha.zip")
+    c(rc == 0 and rows_of(m.read_logins())[1:] == [("pass", "ok", 0), ("get", "ok", 0)],
+      f"{lines[-1:]} {m.read_logins()}")
+
+
+@case("login bounds: the unit lock is free while DepotDownloader runs; a run the helper's stop kills leaves its row "
+      "at -, which binds nothing")
+def _(c):
+    setup({"pass": [{"loop": 30}, {}]}, signed=True)
+    p = sub("steam-get", "alpha.zip")
+    end = time.monotonic() + 15
+    while not dd_runs("pass") and time.monotonic() < end:
+        time.sleep(0.05)
+    fd = os.open(f"{m.LIB_DIR}/lock", os.O_RDWR | os.O_CLOEXEC)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        free = True
+    except BlockingIOError:
+        free = False
+    finally:
+        os.close(fd)
+    c(free and dd_runs("pass"), "the lock was held while the fake ran")
+    p.send_signal(signal.SIGTERM)
+    out, _ = p.communicate(timeout=60)
+    rows = m.read_logins()
+    c(last(out.splitlines()) == "fail\talpha.zip\tcancel" and rows_of(rows) == [("pass", "-", 0)],
+      f"{out[-80:]!r} {rows}")
+    c(tsv()[1] == "bound\t0", f"tsv {tsv()[:2]}")
+    rc, lines = call("steam-get", "alpha.zip")
+    c(rc == 0 and rows_of(m.read_logins())[1:] == [("pass", "ok", 0), ("get", "ok", 0)],
+      f"{lines[-1:]} {m.read_logins()}")
+
+
+@case("login bounds: a port run whose DepotDownloader cannot start closes its row as other; an OSError from closing "
+      "the row is logged and the rc line still sent")
+def _(c):
+    setup({"pass": [{"block_logins": True}]}, signed=True)
+    req = {"op": "pass", "port": "alpha.zip", "login": "token"}
+    rc, got, _ = fifo_unit("alpha.zip", req, {"BLOCKIE_PORTS_DD": f"{T}/no-such-dd"})
+    c(rc == 1 and got == b"" and rows_of(m.read_logins()) == [("pass", "other", 0)],
+      f"rc {rc} {got!r} {m.read_logins()}")
+    rc, got, err = fifo_unit("alpha.zip", req)
+    c(rc == 0 and got.endswith(b"end\nrc\t0\n") and "the login row was not closed" in err and
+      rows_of(m.read_logins())[1:] == [("pass", "-", 0)], f"rc {rc} {got[-40:]!r} {err[-200:]!r} {m.read_logins()}")
+
+
+@case("the restart: a get started while the pass's unit lingers 1 s after its FIFO closed, its start a no op on a live "
+      "unit, waits for the unit to go inactive and runs")
+def _(c):
+    setup(signed=True)
+    write(f"{T}/start-live", "")
+    write(f"{T}/linger", "")
+    rc, lines = call("steam-get", "alpha.zip")
+    c(rc == 0 and last(lines) == "done\talpha.zip" and [r["op"] for r in dd_runs()] == ["pass", "get"],
+      f"{lines[-2:]} {LOG[-3:]}")
+
+
+@case("the restart for a unit operation: a crash with no fail line while the get's unit lingers, its start a no op "
+      "on a live unit, still resets .DepotDownloader once the unit is inactive")
+def _(c):
+    setup({"get": [{}]}, signed=True)
+    os.makedirs(f"{DL}/alpha.zip.part/.DepotDownloader")
+    write(f"{DL}/alpha.zip.part/.DepotDownloader/depot.config", "bad")
+    write(f"{T}/start-live", "")
+    write(f"{T}/linger", "")
+    rc, lines = call("steam-get", "alpha.zip")
+    c(last(lines) == "fail\talpha.zip\tother" and not os.path.exists(f"{DL}/alpha.zip.part/.DepotDownloader") and
+      os.path.exists(f"{SSTATE}/alpha.zip.dropped"), f"{lines[-1:]} {LOG[-3:]}")
+
+
+@case("the inactive wait: a stop during it stops the unit and ends the run cancel at once, a unit still active after "
+      "INACTIVE_S ends other; either way the request is removed and nothing starts")
+def _(c):
+    setup(signed=True)
+    os.makedirs(f"{T}/units", exist_ok=True)
+    r, w = os.pipe()
+    try:
+        for stop, limit in ((True, 3), (False, 1)):
+            m.INACTIVE_S = limit
+            q = subprocess.Popen(["sleep", "60"], start_new_session=True)
+            write(f"{T}/units/alpha.zip.pid", str(q.pid))
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(f"{T}/systemctl.log")
+            if stop:
+                threading.Timer(0.5, m.CANCEL.__setitem__, (0, True)).start()
+            LOG.clear()
+            run = why = None
+            t0 = time.monotonic()
+            try:
+                run = m.steam_dd(m.Proto(w), "get", "alpha.zip", "token")
+            except m.Fail as err:
+                why = err.why
+            took = time.monotonic() - t0
+            m.CANCEL[0] = False
+            stops = [a for a in sctl() if a == ["stop", m.UNIT.format("alpha.zip")]]
+            if stop:
+                c(why is None and run.stopped == "cancel" and m.outcome(run, "alpha.zip", "get") == "cancel" and
+                  took < 2.5 and stops and q.poll() is not None, f"cancel: {why} after {took:.1f} s, stops {stops}")
+            else:
+                c(why == "other" and 1 <= took < 5 and not stops and any("still active after 1 s" in x for x in LOG),
+                  f"other: {why} after {took:.1f} s, stops {stops} {LOG[-2:]}")
+            c(not starts() and not dd_runs() and not os.path.exists(f"{SRUN}/req/alpha.zip"),
+              f"{stop}: starts {starts()} {dd_runs()}")
+            q.kill()
+            q.wait()
+    finally:
+        m.CANCEL[0] = False
+        os.close(w)
+        os.close(r)
+
+
+@case("steam.tsv: line 2 is bound 0 with no binding row or an unreadable logins.tsv, else the latest end of the rate "
+      "rows that bind a get; the port lines either way")
+def _(c):
+    setup()
+    call("index")
+    c(tsv() == ["signed\t0", "bound\t0", "port\talpha.zip\tget"], f"free {tsv()}")
+    now = int(time.time())
+    os.makedirs(m.LIB_DIR, exist_ok=True)
+    m.write_logins([{"op": "get", "start": now - 100, "result": "rate", "at": now - 100, "backoff": 600},
+                    {"op": "library", "start": now - 50, "result": "rate", "at": now - 50, "backoff": 1200},
+                    {"op": "pass", "start": now - 3000, "result": "rate", "at": now - 3000, "backoff": 1200},
+                    {"op": "scan", "start": now - 10, "result": "network", "at": now - 10, "backoff": 86400},
+                    {"op": "get", "start": now - 5, "result": "-", "at": now - 5, "backoff": 0},
+                    {"op": "get", "start": now + 500, "result": "rate", "at": now + 500, "backoff": 86400}])
+    call("index")
+    c(tsv() == ["signed\t0", f"bound\t{now + 1150}", "port\talpha.zip\tget"], f"bound {tsv()}")
+    os.unlink(m.LOGINS)
+    os.makedirs(m.LOGINS)
+    call("index")
+    c(tsv() == ["signed\t0", "bound\t0", "port\talpha.zip\tget"], f"unreadable {tsv()}")
+
+
+@case("replay: the journal of a port whose name holds .tmp- is replayed; only the helper's own temp names "
+      "(<name>.tmp-<pid>) are dropped unread")
+def _(c):
+    setup()
+    write(f"{PORTS}/beta-new.sh", "x")
+    m.journal("beta.tmp-1.zip", {"op": "install", "name": "beta.tmp-1.zip", "new": [f"{PORTS}/beta-new.sh"]})
+    write(f"{STATE}/txn/alpha.zip.tmp-4242", json.dumps({"op": "install", "name": "alpha.zip",
+                                                          "new": [f"{PORTS}/Alpha.sh"]}))
+    with m.game_lock():
+        m.replay()
+    c(not os.path.exists(f"{PORTS}/beta-new.sh") and "replayed the journal of beta.tmp-1.zip" in LOG, f"{LOG[-2:]}")
+    c(os.path.exists(f"{PORTS}/Alpha.sh") and not os.listdir(f"{STATE}/txn") and
+      not any("alpha.zip.tmp-4242" in x for x in LOG), f"a temp was replayed {LOG[-2:]}")
 
 
 print(f"ports-steam: {fails} failed" if fails else "ports-steam: python cases ok", flush=True)

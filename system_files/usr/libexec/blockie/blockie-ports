@@ -83,6 +83,7 @@ INHIBIT = os.environ.get("BLOCKIE_PORTS_INHIBIT", "/usr/bin/systemd-inhibit")
 SETPRIV = os.environ.get("BLOCKIE_PORTS_SETPRIV", "/usr/bin/setpriv")
 LOGIN_S = float(os.environ.get("BLOCKIE_PORTS_STEAM_LOGIN_S", "300"))
 STALL_S = float(os.environ.get("BLOCKIE_PORTS_STEAM_STALL_S", "120"))
+INACTIVE_S = 10
 BATCH = int(os.environ.get("BLOCKIE_PORTS_STEAM_BATCH", str(256 << 20)))
 STEAM_DIR = os.path.join(DATA, "steam")
 STEAM_DL = os.path.join(DATA, "steam-dl")
@@ -104,7 +105,7 @@ APP_URL = re.compile(r"store\.steampowered\.com/app/([0-9]+)")
 APP_DEPOT = re.compile(r"\b(?:download_depot|depot)\s+([0-9]+)\s+[0-9]+|-app\s+([0-9]+)\s+-depot\s+[0-9]+")
 QR_URL = re.compile(r"https://[\x21-\x7e]{1,504}")
 STEAM_CMDS = ("steam-get", "steam-logout")
-STEAM_TSV_CMDS = ("sync", "refresh", "index", "install", "update", "uninstall") + STEAM_CMDS
+STEAM_TSV_CMDS = ("sync", "refresh", "index", "install", "update", "uninstall", "steam-lib") + STEAM_CMDS
 LINE_MAX = 1 << 16
 STEAM_LIB_USR = os.environ.get("BLOCKIE_PORTS_STEAM_LIB", "/usr/share/blockie/steam")
 ENGINES = os.path.join(STEAM_LIB_USR, "engines.tsv")
@@ -510,7 +511,7 @@ def replay():
             continue
         for n in names:
             p = os.path.join(txn, n)
-            if ".tmp-" not in n:
+            if not re.fullmatch(r".+\.tmp-[0-9]+", n):
                 try:
                     with open(p) as f:
                         data = json.load(f)
@@ -1420,7 +1421,9 @@ def write_steam_tsv():
     apps = read_apps()
     dirs = installed_dirs()
     updates = updates_offered()
-    lines = [f"signed\t{int(read_signed())}\n"]
+    now = int(time.time())
+    until = max((r["at"] + r["backoff"] for r in read_logins() if login_bound([r], "get", now)), default=0)
+    lines = [f"signed\t{int(read_signed())}\n", f"bound\t{until}\n"]
     for name in sorted(dirs):
         if row_offered(name, rows.get(name), apps, dirs, updates):
             lines.append(f"port\t{name}\t{'got' if row_got(name, rows[name]) else 'get'}\n")
@@ -1455,6 +1458,18 @@ def stop_units():
     systemctl("stop", UNIT.format("*"), timeout=30)
 
 
+def wait_inactive(inst, cancel):
+    end = time.monotonic() + INACTIVE_S
+    while unit_active(inst):
+        if cancel and CANCEL[0]:
+            return "cancel"
+        if time.monotonic() >= end:
+            log(f"{inst}: the unit is still active after {INACTIVE_S} s")
+            return "other"
+        time.sleep(0.1)
+    return None
+
+
 def request(inst, data):
     path = os.path.join(STEAM_REQ, inst)
     write_atomic(path, json.dumps(data).encode(), 0o640)
@@ -1464,7 +1479,7 @@ def request(inst, data):
 def steam_op(inst, op, **extra):
     req = request(inst, dict(op=op, port=None if inst == ACCOUNT else inst, **extra))
     try:
-        if systemctl("start", "--wait", UNIT.format(inst), timeout=600) != 0:
+        if wait_inactive(inst, False) or systemctl("start", "--wait", UNIT.format(inst), timeout=600) != 0:
             raise Fail("other")
     finally:
         remove(req)
@@ -1556,6 +1571,15 @@ def steam_dd(proto, op, name, login, paths=None, total=None, extra=None, on_line
     stall = max(STALL_S, (SCAN_S if op == "scan" else LIBRARY_RUN_S) + 30) if op in LIB_OPS else STALL_S
     if op in ("pass", "get"):
         proto.progress("login" if qr_run else "check" if op == "pass" else "download", 0, total)
+    why = wait_inactive(inst, True)
+    if why == "cancel":
+        remove(req)
+        systemctl("stop", UNIT.format(inst), timeout=30)
+        run.stopped = "cancel"
+        return run
+    if why:
+        remove(req)
+        raise Fail(why)
     t0 = time.monotonic()
     first = None
     if systemctl("start", UNIT.format(inst), timeout=60) != 0:
@@ -3104,13 +3128,12 @@ def unit_dd(req, row, port):
     rc = 1
     start, result = None, "other"
     try:
-        if APP_INST.fullmatch(port):
-            try:
-                start = unit_login(op, int(time.time()))
-            except Fail as err:
-                unit_send(fifo, f"fail\t{err.why}")
-                unit_send(fifo, "rc\t1")
-                return 1
+        try:
+            start = unit_login(op, int(time.time()))
+        except Fail as err:
+            unit_send(fifo, f"fail\t{err.why}")
+            unit_send(fifo, "rc\t1")
+            return 1
         work = os.path.join(STEAM_DL, f"{port}.{'check' if op == 'pass' else 'part'}")
         try:
             if not unit_own(work):

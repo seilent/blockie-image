@@ -32,6 +32,8 @@ with open(log, "a") as f:
     f.write(json.dumps({"op": op, "n": n, "args": args, "pid": os.getpid(), "filelist": filelist,
                         "env": {k: os.environ.get(k) for k in ("BLOCKIE_DD_CONFIG", "BLOCKIE_DD_DEVICE", "HOME",
                                                                 "TMPDIR", "DOTNET_EnableDiagnostics")}}) + "\n")
+if step.get("block_logins"):
+    os.makedirs(f"{os.environ['BLOCKIE_PORTS_DATA']}/steam-dl/lib/logins.tsv.tmp-{os.getppid()}")
 
 
 def out(*fields):

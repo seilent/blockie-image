@@ -1719,5 +1719,15 @@ def _(c):
           any("dropped the unreadable journal" in x for x in LOG), f"{keys}: {LOG}")
 
 
+@case("steam-lib commands end by writing steam.tsv with its bound line")
+def _(c):
+    setup()
+    now = int(time.time())
+    m.unit_login_end("scan", m.unit_login("scan", now), "rate", now)
+    rc, out = call("steam-lib", "index")
+    c(rc == 0 and rd(f"{PORTS}/.blockie/steam.tsv").splitlines() == ["signed\t0", f"bound\t{now + 600}"],
+      f"{rc} {out} {rd(f'{PORTS}/.blockie/steam.tsv')!r}")
+
+
 print(f"steam-lib: {fails} failed" if fails else "steam-lib: python cases ok", flush=True)
 sys.exit(1 if fails else 0)
