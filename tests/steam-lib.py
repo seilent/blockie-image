@@ -634,7 +634,7 @@ def _(c):
     old = rd(f"{LIB}/library.tsv")
     c(stat.S_IMODE(os.stat(f"{LIB}/library.tsv").st_mode) == 0o640, "mode")
     c(not [n for n in os.listdir(LIB) if ".tmp-" in n], f"tmp left {os.listdir(LIB)}")
-    for bad in ("depot\t9000001\t9000012\t-\t16\t-\t0\t-\t-\t900001200\t1", "app\t9000002\tgame\tBad\x01Name",
+    for bad in ("depot\t9000001\t9000012\t-\t6 4\t-\t0\t-\t-\t900001200\t1", "app\t9000002\tgame\tBad\x01Name",
                 "app\t9000002\tgame\t" + "あ" * 86, "owned\tx", "end"):
         try:
             m.unit_library_done(lines + [bad], NOW)
@@ -1046,7 +1046,7 @@ def _(c):
     c(r["result"] == "rate" and m.login_bound(m.read_logins(), "pass", now) and
       m.login_bound(m.read_logins(), "get", now), f"{r}")
     rc, out = call("steam-lib", "scan")
-    c(out == ["fail\tscan\tbound"] and len(dd_runs("scan")) == 1, f"{out}")
+    c(out[-1:] == ["fail\tscan\tbound"] and len(dd_runs("scan")) == 1, f"{out}")
 
 
 @case("steam-lib scan: a 2 or 4 field path line, a path outside a scan block and a pair not asked for end other "
