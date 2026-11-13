@@ -6,6 +6,7 @@ After=pipewire.service wireplumber.service
 UnsetEnvironment=LD_LIBRARY_PATH VK_DRIVER_FILES
 Environment=FUNEOS_LIBRARY_ROOT=/var/lib/blockie/data/music
 Environment=FUNEOS_MOUNT_ROOT=/var/lib/blockie/data
+Environment=FUNEOS_DATA_DIR=/var/lib/blockie/data/funeos
 Environment=FUNEOS_RUN_DIR=%t/funeos
 Environment=FUNEOS_SWITCH_FILE=/run/blockie-session/session-starting
 Environment="FUNEOS_LEAVE_CMD=blockie-session switch {} app"

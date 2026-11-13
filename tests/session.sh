@@ -775,6 +775,13 @@ r7=$?
 res $? "blockie-funeos: the dev dir wins for both tools, check needs funeos and a mounted data dir, a bad verb exits 2"
 BLOCKIE_ROOT=$sf bs list | grep -qxF "$(printf 'funeos\tfuneOS\tno')"
 res $? "the shipped funeos.conf is listed"
+fu=$sf/usr/lib/systemd/user/blockie-funeos.service
+fd=$(sed -n 's/^Environment=FUNEOS_DATA_DIR=//p' "$fu")
+fr=$(sed -n 's/^Environment=FUNEOS_LIBRARY_ROOT=//p' "$fu")
+[[ $fd == /var/lib/blockie/data/funeos && -n $fr && $fd != "$fr"/* ]] &&
+  grep -qxF "d $fd 0755 blockie blockie -" "$sf/usr/lib/blockie/data-tmpfiles.conf" &&
+  grep -qxF 'ExecStartPre=/usr/bin/mountpoint -q /var/lib/blockie/data' "$fu"
+res $? "blockie-funeos.service keeps funeOS's data dir on the data partition outside the library root, made by data-tmpfiles"
 
 for n in g h k; do
   : > "$R/usr/lib/systemd/user/blockie-test-$n.service"
