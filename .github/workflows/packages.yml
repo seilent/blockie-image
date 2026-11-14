@@ -342,9 +342,17 @@ jobs:
             art=$(cd "$RUNNER_TEMP/src" && oras attach --artifact-type "$SOURCE_TYPE" --format go-template --template '{{.digest}}' \
               "$REPO@$digest" "${src[@]}")
             [[ $art =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::no source referrer digest from oras attach: $art"; exit 1; }
-            oras discover --artifact-type "$SOURCE_TYPE" --format json "$REPO@$digest" |
-              jq -e --arg d "$art" '[.referrers[].digest] | index($d) != null' > /dev/null ||
-              { echo "::error::$REPO@$art is not a source referrer of $REPO@$digest"; exit 1; }
+            found=false
+            for _ in $(seq 20); do
+              if oras discover --artifact-type "$SOURCE_TYPE" --format json "$REPO@$digest" |
+                jq -e --arg d "$art" '[.referrers[].digest] | index($d) != null' > /dev/null; then
+                found=true
+                break
+              fi
+              echo "::warning::$REPO@$art not yet listed as a source referrer of $REPO@$digest"
+              sleep 15
+            done
+            [[ $found == true ]] || { echo "::error::$REPO@$art is not a source referrer of $REPO@$digest"; exit 1; }
             cosign sign --yes --new-bundle-format=false --key env://COSIGN_PRIVATE_KEY "$REPO@$art"
             cosign verify --key "$PUBKEY" "$REPO@$art" > /dev/null
             echo "$REPO@$art source"
