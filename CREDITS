@@ -80,6 +80,10 @@ LICENSE.TXT of https://github.com/dotnet/runtime (v9.0.4 and v5.0.0, the same te
 Microsoft.Win32.Registry; ZstdSharp-LICENSE.txt, CsWin32-LICENSE.txt, protobuf-net-Licence.txt and QRCoder-LICENSE.txt
 are the LICENSE files of oleg-st/ZstdSharp (0.8.5), microsoft/CsWin32 (v0.3.183), protobuf-net/protobuf-net (3.2.52,
 line endings made LF) and codebude/QRCoder (v1.6.0); Apache-2.0.txt is the Apache License 2.0 text.
+packages/gl4es: gl4es (https://github.com/ptitSeb/gl4es, 8b1a3da, MIT, Copyright (c) 2016-2018 Sebastien Chevalier and
+(c) 2013-2016 Ryan Hileman), built unchanged into /usr/lib64/gl4es. It holds MIT code by Matthäus G. Chajdas, Benjamin
+Dobell, Attractive Chaos and Brian Paul (Mesa), and public domain stb_dxt; their notices are in
+/usr/share/licenses/gl4es/THIRD-PARTY beside LICENSE.
 system_files/usr/share/blockie/ports/steam-map.tsv and steam-files/: made from the PortMaster-New catalogue and port
 zips (https://github.com/PortsMaster/PortMaster-New, MIT, ports.json of 2026-11-02_1442), with depot ids from public
 Steam app data.

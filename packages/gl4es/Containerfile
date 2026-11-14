@@ -1,0 +1,23 @@
+FROM localhost/blockie-pkg-builder
+
+COPY SOURCE.env SOURCE.sha256 /tmp/src/
+RUN . /tmp/src/SOURCE.env \
+ && umask 022 \
+ && d=/var/tmp/src/${SOURCE_TAR%.tar.gz} \
+ && git init -q "$d" \
+ && git -C "$d" fetch -q --depth 1 "$SOURCE_URL" "$SOURCE_COMMIT" \
+ && git -C "$d" -c advice.detachedHead=false checkout -q FETCH_HEAD \
+ && test "$(git -C "$d" rev-parse HEAD)" = "$SOURCE_COMMIT" \
+ && { test -z "${SOURCE_SUBMODULES:-}" \
+      || git -C "$d" submodule update -q --init --recursive --depth 1 -- $SOURCE_SUBMODULES \
+      || git -C "$d" submodule update -q --init --recursive -- $SOURCE_SUBMODULES; } \
+ && install -d /srcpkg \
+ && tar -C /var/tmp/src --sort=name --mtime="@$SOURCE_EPOCH" --owner=0 --group=0 --numeric-owner --format=gnu \
+      --exclude=.git -cf - "${d##*/}" | gzip -n > "/srcpkg/$SOURCE_TAR" \
+ && (cd /srcpkg && sha256sum "$SOURCE_TAR" && sha256sum -c /tmp/src/SOURCE.sha256) \
+ && rm -rf /var/tmp/src /tmp/src
+
+COPY gl4es.spec /tmp/spec/
+RUN dnf -y --setopt=install_weak_deps=False builddep /tmp/spec/gl4es.spec \
+ && dnf clean all \
+ && rm -rf /tmp/spec
