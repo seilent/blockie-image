@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 %global _build_id_links none
-%global commit 209492893749c9a6b6dbfded4ba4f7fbcaacc4cc
-%global shortcommit 2094928
+%global commit c7a105ffc78818b9f2bb7588bff666e55efcb25f
+%global shortcommit c7a105f
 %global steam_files 1
 %global qrdir qrcodegen-720f62bd
 
@@ -79,7 +79,8 @@ BLOCKIE_FE_CACHE=$PWD/.fe-cache BLOCKIE_FE_OUT=$PWD/.fe-out ./build.sh install D
 
 %check
 BLOCKIE_FE_CACHE=$PWD/.fe-cache BLOCKIE_FE_OUT=$PWD/.fe-out BLOCKIE_FE_JOBS=%{_smp_build_ncpus} CC=gcc CXX=g++ \
-  BLOCKIE_FE_CFLAGS="%{build_cflags}" BLOCKIE_FE_LDFLAGS="%{build_ldflags}" BLOCKIE_FE_COMMIT=%{shortcommit} ./build.sh test
+  BLOCKIE_FE_CFLAGS="%{build_cflags}" BLOCKIE_FE_LDFLAGS="%{build_ldflags}" BLOCKIE_FE_COMMIT=%{shortcommit} \
+  BLOCKIE_FE_STEAM_FILES=%{steam_files} ./build.sh test
 
 %files
 %license LICENSE third-party/*

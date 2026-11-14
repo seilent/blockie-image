@@ -57,4 +57,6 @@ sc=$(sed -n 's/^[0-9][0-9]*\.git\([0-9a-f]\{7\}\)\..*$/\1/p' <<< "$rel")
 [[ -n $sc ]] || fail "release $rel has no short commit"
 rodata=$(LC_ALL=C readelf -p .rodata "$bin")
 grep -qE "^ +\[ *[0-9a-f]+\]  $sc\$" <<< "$rodata" || fail "blockie-frontend does not carry its short commit $sc"
+grep -qF 'steam_files=1' <<< "$rodata" && ! grep -qF 'steam_files=0' <<< "$rodata" ||
+  fail "blockie-frontend is not built with steam files on"
 echo "pkg-blockie-frontend: ok"
