@@ -55,7 +55,8 @@ grep -qx 'd /var/home/blockie 0700 blockie blockie -' /usr/lib/tmpfiles.d/blocki
   getent group blockie > /dev/null || fail "/dev/uinput is not 0660 to the blockie group"
 cmp -s <(printf 'd /var/lib/blockie/data/%s\n' 'cache 0755 blockie blockie -' 'roms 0755 root root -' \
   'roms/ports 0755 blockie blockie -' 'ports-home 0700 blockie blockie -' 'cache/ports-tmp 0700 blockie blockie -') \
-  <(grep -E '^d /var/lib/blockie/data/(cache|roms|ports-home)[/ ]' /usr/lib/blockie/data-tmpfiles.conf) ||
+  <(grep -E '^d /var/lib/blockie/data/(cache|roms|roms/ports|ports-home|cache/ports-tmp) ' \
+    /usr/lib/blockie/data-tmpfiles.conf) ||
   fail "the data tmpfiles do not make cache, roms, roms/ports, ports-home and cache/ports-tmp in that order"
 [[ -s /usr/share/blockie/ports/alsa.conf ]] || fail "the ports alsa.conf is missing"
 for p in /var/cache/libX11 /var/cache/libX11/compose /var/lib/alsa /var/lib/bluetooth /var/lib/bluetooth/mesh /var/lib/geoclue \
