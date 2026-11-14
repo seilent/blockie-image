@@ -13,6 +13,7 @@ Summary:        OpenGL 2.1 over GLES2 for Box64 runners
 License:        MIT AND LicenseRef-Fedora-Public-Domain
 URL:            https://github.com/ptitSeb/gl4es
 Source0:        gl4es-%{commit}.tar.gz
+Patch0:         egl-attrib-ptr.patch
 BuildRequires:  gcc
 BuildRequires:  cmake
 BuildRequires:  ninja-build
@@ -25,13 +26,13 @@ LD_LIBRARY_PATH; only an EGL desktop GL runner adds the egl dir too, with LIBGL_
 blob's absolute paths.
 
 %prep
-%autosetup -n gl4es-%{commit}
+%autosetup -p1 -n gl4es-%{commit}
 
 %build
 %set_build_flags
 export CFLAGS="$CFLAGS -ffile-prefix-map=%{_builddir}=."
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_SKIP_RPATH=ON -DDEFAULT_ES=2 -DEGL_WRAPPER=ON
-ninja -C build %{?_smp_mflags}
+ninja -C build -k 0 %{?_smp_mflags}
 
 %install
 dir=%{buildroot}%{gl4esdir}

@@ -1,0 +1,39 @@
+diff --git a/src/gl/loader.h b/src/gl/loader.h
+index 065949c..a87a4f1 100644
+--- a/src/gl/loader.h
++++ b/src/gl/loader.h
+@@ -29,7 +29,7 @@ typedef EGLContext (*eglGetCurrentContext_PTR)();
+ typedef EGLDisplay (*eglGetCurrentDisplay_PTR)();
+ typedef EGLSurface (*eglGetCurrentSurface_PTR)(EGLint readdraw);
+ typedef EGLDisplay (*eglGetDisplay_PTR)(EGLNativeDisplayType display_id);
+-typedef EGLDisplay (*eglGetPlatformDisplay_PTR)(EGLenum platform, void * native_display, const EGLint * attrib_list);
++typedef EGLDisplay (*eglGetPlatformDisplay_PTR)(EGLenum platform, void * native_display, const EGLAttrib * attrib_list);
+ typedef EGLint (*eglGetError_PTR)();
+ typedef __eglMustCastToProperFunctionPointerType (*eglGetProcAddress_PTR)(const char * procname);
+ typedef EGLBoolean (*eglInitialize_PTR)(EGLDisplay dpy, EGLint * major, EGLint * minor);
+diff --git a/src/glx/glx.c b/src/glx/glx.c
+index cea831c..07d066d 100644
+--- a/src/glx/glx.c
++++ b/src/glx/glx.c
+@@ -389,7 +389,7 @@ static void init_display(Display *display) {
+     }
+ 
+ #ifdef HYBRIS
+-    EGLint attribs[] = { EGL_NONE };
++    EGLAttrib attribs[] = { EGL_NONE };
+     eglDisplay = egl_eglGetPlatformDisplay(EGL_PLATFORM_ANDROID_KHR, EGL_DEFAULT_DISPLAY, attribs);
+ #endif
+ 
+diff --git a/src/glx/hardext.c b/src/glx/hardext.c
+index e8d66c4..32ae593 100644
+--- a/src/glx/hardext.c
++++ b/src/glx/hardext.c
+@@ -256,7 +256,7 @@ void GetHardwareExtensions(int notest)
+ #endif
+ #ifdef HYBRIS
+     {
+-        EGLint attribs[] = { EGL_NONE };
++        EGLAttrib attribs[] = { EGL_NONE };
+         eglDisplay = egl_eglGetPlatformDisplay(EGL_PLATFORM_ANDROID_KHR, EGL_DEFAULT_DISPLAY, attribs);
+     }
+ #else
