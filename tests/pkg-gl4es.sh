@@ -62,4 +62,14 @@ syms=$(readelf --dyn-syms -W "$t$dir/egl/libEGL.so.1" | awk '$7 != "UND" { print
 for s in eglGetDisplay eglBindAPI eglCreateContext; do
   grep -qxF "$s" <<< "$syms" || fail "libEGL.so.1 does not export $s"
 done
+both=0
+for p in libGL.so.1 egl/libEGL.so.1; do
+  dsyms=$(readelf --dyn-syms -W "$t$dir/$p")
+  core=$(awk '$7 != "UND" && $8 == "eglGetPlatformDisplay" { print $2 }' <<< "$dsyms")
+  ext=$(awk '$7 != "UND" && $8 == "eglGetPlatformDisplayEXT" { print $2 }' <<< "$dsyms")
+  [[ -n $core && -n $ext ]] || continue
+  both=1
+  [[ $core != "$ext" ]] || fail "${p##*/} exports eglGetPlatformDisplayEXT as an alias of eglGetPlatformDisplay"
+done
+(( both )) || fail "no library exports both eglGetPlatformDisplay and eglGetPlatformDisplayEXT"
 echo "pkg-$name: ok"

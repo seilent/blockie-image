@@ -1,13 +1,109 @@
+diff --git a/src/egl/egl.c b/src/egl/egl.c
+index ec1e920..b747e6a 100644
+--- a/src/egl/egl.c
++++ b/src/egl/egl.c
+@@ -164,14 +164,52 @@ EGLDisplay gl4es_eglGetCurrentDisplay(void) {
+     return egl_eglGetCurrentDisplay();
+ }
+ 
++#define PLATFORM_ATTRIBS_MAX 64
++
+ EGLDisplay gl4es_eglGetPlatformDisplay(EGLenum platform, void *native_display, const EGLAttrib *attrib_list) {
+-    LOAD_EGL_EXT(eglGetPlatformDisplay);
++    LOAD_LIB_SILENT(egl, eglGetPlatformDisplay);
+     if (egl_eglGetPlatformDisplay)
+         return egl_eglGetPlatformDisplay(platform, native_display, attrib_list);
+-    else {
+-        LOAD_EGL(eglGetDisplay);
+-        return egl_eglGetDisplay((EGLNativeDisplayType)native_display);
++    LOAD_LIB_SILENT(egl, eglGetPlatformDisplayEXT);
++    if (!egl_eglGetPlatformDisplayEXT) {
++        LOAD_EGL(eglGetProcAddress);
++        if (egl_eglGetProcAddress)
++            egl_eglGetPlatformDisplayEXT = (eglGetPlatformDisplayEXT_PTR)egl_eglGetProcAddress("eglGetPlatformDisplayEXT");
++    }
++    if (egl_eglGetPlatformDisplayEXT) {
++        EGLint list[PLATFORM_ATTRIBS_MAX];
++        int n = 0;
++        if (attrib_list) {
++            while (attrib_list[n] != EGL_NONE) {
++                if (n + 2 >= PLATFORM_ATTRIBS_MAX || attrib_list[n] != (EGLint)attrib_list[n] ||
++                    attrib_list[n + 1] != (EGLint)attrib_list[n + 1])
++                    return EGL_NO_DISPLAY;
++                list[n] = (EGLint)attrib_list[n];
++                list[n + 1] = (EGLint)attrib_list[n + 1];
++                n += 2;
++            }
++            list[n] = EGL_NONE;
++        }
++        return egl_eglGetPlatformDisplayEXT(platform, native_display, attrib_list ? list : NULL);
++    }
++    LOAD_EGL(eglGetDisplay);
++    return egl_eglGetDisplay((EGLNativeDisplayType)native_display);
++}
++
++EGLDisplay gl4es_eglGetPlatformDisplayEXT(EGLenum platform, void *native_display, const EGLint *attrib_list) {
++    EGLAttrib list[PLATFORM_ATTRIBS_MAX];
++    int n = 0;
++    if (attrib_list) {
++        while (attrib_list[n] != EGL_NONE) {
++            if (n + 2 >= PLATFORM_ATTRIBS_MAX)
++                return EGL_NO_DISPLAY;
++            list[n] = attrib_list[n];
++            list[n + 1] = attrib_list[n + 1];
++            n += 2;
++        }
++        list[n] = EGL_NONE;
+     }
++    return gl4es_eglGetPlatformDisplay(platform, native_display, attrib_list ? list : NULL);
+ }
+ 
+ EGLBoolean gl4es_eglQueryContext(EGLDisplay dpy, EGLContext ctx, EGLint attribute, EGLint *value) {
+@@ -255,7 +293,7 @@ AliasExport(EGLContext, eglGetCurrentContext,,(void));
+ AliasExport(EGLSurface, eglGetCurrentSurface,,(EGLint readdraw));
+ AliasExport(EGLDisplay, eglGetCurrentDisplay,,(void));
+ AliasExport(EGLDisplay, eglGetPlatformDisplay,, (EGLenum platform, void *native_display, const EGLAttrib *attrib_list));
+-AliasExport(EGLDisplay, eglGetPlatformDisplay, EXT, (EGLenum platform, void *native_display, const EGLAttrib *attrib_list));
++AliasExport(EGLDisplay, eglGetPlatformDisplayEXT,, (EGLenum platform, void *native_display, const EGLint *attrib_list));
+ AliasExport(EGLBoolean, eglQueryContext,,(EGLDisplay dpy, EGLContext ctx, EGLint attribute, EGLint *value));
+ AliasExport(EGLBoolean, eglWaitGL,,(void));
+ AliasExport(EGLBoolean, eglWaitNative,,(EGLint engine));
+diff --git a/src/egl/egl.h b/src/egl/egl.h
+index c780a2d..1c32956 100644
+--- a/src/egl/egl.h
++++ b/src/egl/egl.h
+@@ -41,6 +41,7 @@ EGLContext gl4es_eglGetCurrentContext(void);
+ EGLSurface gl4es_eglGetCurrentSurface(EGLint readdraw);
+ EGLDisplay gl4es_eglGetCurrentDisplay(void);
+ EGLDisplay gl4es_eglGetPlatformDisplay(EGLenum platform, void *native_display, const EGLAttrib *attrib_list);
++EGLDisplay gl4es_eglGetPlatformDisplayEXT(EGLenum platform, void *native_display, const EGLint *attrib_list);
+ EGLBoolean gl4es_eglQueryContext(EGLDisplay dpy, EGLContext ctx, EGLint attribute, EGLint *value);
+ EGLBoolean gl4es_eglWaitGL(void);
+ EGLBoolean gl4es_eglWaitNative(EGLint engine);
+diff --git a/src/egl/lookup.c b/src/egl/lookup.c
+index 9421bef..9427ac3 100644
+--- a/src/egl/lookup.c
++++ b/src/egl/lookup.c
+@@ -48,7 +48,7 @@ void* gl4es_eglGetProcAddress(const char *name) {
+     _EX(eglGetCurrentSurface);
+     _EX(eglGetCurrentDisplay);
+     _EX(eglGetPlatformDisplay);
+-    _EXT(eglGetPlatformDisplay);
++    _EX(eglGetPlatformDisplayEXT);
+     _EX(eglQueryContext);
+     _EX(eglWaitGL);
+     _EX(eglWaitNative);
 diff --git a/src/gl/loader.h b/src/gl/loader.h
-index 065949c..a87a4f1 100644
+index 065949c..a744fa4 100644
 --- a/src/gl/loader.h
 +++ b/src/gl/loader.h
-@@ -29,7 +29,7 @@ typedef EGLContext (*eglGetCurrentContext_PTR)();
+@@ -29,7 +29,8 @@ typedef EGLContext (*eglGetCurrentContext_PTR)();
  typedef EGLDisplay (*eglGetCurrentDisplay_PTR)();
  typedef EGLSurface (*eglGetCurrentSurface_PTR)(EGLint readdraw);
  typedef EGLDisplay (*eglGetDisplay_PTR)(EGLNativeDisplayType display_id);
 -typedef EGLDisplay (*eglGetPlatformDisplay_PTR)(EGLenum platform, void * native_display, const EGLint * attrib_list);
 +typedef EGLDisplay (*eglGetPlatformDisplay_PTR)(EGLenum platform, void * native_display, const EGLAttrib * attrib_list);
++typedef EGLDisplay (*eglGetPlatformDisplayEXT_PTR)(EGLenum platform, void * native_display, const EGLint * attrib_list);
  typedef EGLint (*eglGetError_PTR)();
  typedef __eglMustCastToProperFunctionPointerType (*eglGetProcAddress_PTR)(const char * procname);
  typedef EGLBoolean (*eglInitialize_PTR)(EGLDisplay dpy, EGLint * major, EGLint * minor);
