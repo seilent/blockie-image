@@ -10,10 +10,15 @@ t=$(mktemp -d "${TMPDIR:-/tmp}/game.XXXXXX")
 fails=0
 rd=/usr/share/blockie/steam/runners.d
 dl1=/usr/libexec/blockie/dl1
+gk=/usr/lib64/blockie-ports/gptokeyb
+pmmod=/usr/share/blockie/portmaster/mod_Blockie.txt
 cp -p "$share/shader-defaults" "$t/shader-defaults"
 [[ ! -d $rd ]] || cp -a "$rd" "$t/runners.d"
 cp -p "$dl1" "$t/dl1.orig"
-trap 'cp -p "$t/shader-defaults" "$share/shader-defaults"; cp -p "$t/dl1.orig" "$dl1"
+cp -p "$gk" "$t/gptokeyb.orig"
+cp -p "$pmmod" "$t/mod.orig"
+trap 'cp -p "$t/shader-defaults" "$share/shader-defaults"; cp -p "$t/dl1.orig" "$dl1"; cp -p "$t/gptokeyb.orig" "$gk"
+  cp -p "$t/mod.orig" "$pmmod"
   rm -f "${rd:?}/aaa.conf" "${rd:?}/nwjs.conf" "${rd:?}/Zz.conf" "${rd:?}/aa.conf"
   if [[ -d $t/runners.d ]]; then cp -a "$t/runners.d/." "$rd/"; else rmdir "$rd" 2> /dev/null; fi
   rm -rf "${t:?}"' EXIT
@@ -838,8 +843,8 @@ while IFS= read -r p; do
 done < <(sown)
 mkdir -p "$rd" "$games/.blockie" "$g/$groot" "$g/sub" "$games/abc" "$games/9000003" "$games/9000004" \
   "$games/9000005" "$games/9000006" "$games/9000008/$groot" "$stmp" "$data/steam-home"
-printf '%s\n' 'CLASSES="rmmz:windows rmmv:windows"' URL=https://example.invalid/nw.tar.gz "SHA256=$sha" \
-  > "$rd/nwjs.conf"
+printf '%s\n' 'CLASSES="rmmz:windows rmmv:windows invented:windows"' URL=https://example.invalid/nw.tar.gz \
+  "SHA256=$sha" > "$rd/nwjs.conf"
 printf 'CLASSES=gamemaker:linux\nURL=https://example.invalid/a.tar.gz\nSHA256=%s\n' "$sha" > "$rd/aaa.conf"
 gotf() {
   printf '{"digest": "x", "placed": [], "class": "%s", "os": "%s", "root": "%s", "depots": []}\n' "$2" "$3" "$4" \
@@ -863,6 +868,25 @@ pwd > "$FAKE/nw.cwd"
 ls -A "$TMPDIR" > "$FAKE/nw.tmp"
 case ${FAKE_NW:-} in
   kill) kill -KILL $$ ;;
+  padkill)
+    for _ in $(seq 50); do
+      [[ -s $FAKE/gptokeyb.pid ]] && break
+      sleep 0.1
+    done
+    kill -KILL $$
+    ;;
+  pad | padsleep)
+    echo "$PPID" > "$FAKE/nw.ppid"
+    for _ in $(seq 50); do
+      [[ -s $FAKE/gptokeyb.pid ]] && break
+      sleep 0.1
+    done
+    if [[ $FAKE_NW == padsleep ]]; then
+      trap 'exit 143' TERM
+      sleep 30 &
+      wait
+    fi
+    ;;
   ids)
     printf '%s\n' 'net.seilent.steam.nwjs: x' 'steam-nwjs: Invented' > "$FAKE/toplevels"
     for _ in $(seq 50); do
@@ -889,10 +913,26 @@ mkrunner() {
   echo "$(($(stat -c %s "$rdir/nw") + 13)) 2" > "$rdir/.blockie-size"
 }
 splay() {
-  rm -f "${FAKE:?}"/nw.* "${FAKE:?}/toplevels" "${t:?}/dl1.log"
+  rm -f "${FAKE:?}"/nw.* "${FAKE:?}"/gptokeyb.* "${FAKE:?}/scope" "${FAKE:?}/toplevels" "${t:?}/dl1.log"
   play steam "$@"
 }
 nenv() { grep -qxF -- "$1" "$FAKE/nw.env"; }
+cat > "$FAKE/gptokeyb" << 'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$@" > "$FAKE/gptokeyb.argv"
+echo "$PPID" > "$FAKE/gptokeyb.ppid"
+printf '%s\n' "${LD_LIBRARY_PATH-unset}" > "$FAKE/gptokeyb.ldpath"
+printf '%s\n' "${SDL_GAMECONTROLLERCONFIG_FILE-unset}" > "$FAKE/gptokeyb.dbpath"
+cp -- "${SDL_GAMECONTROLLERCONFIG_FILE:-/nonexistent}" "$FAKE/gptokeyb.db" 2> /dev/null
+echo "$$" > "$FAKE/gptokeyb.pid"
+exec sleep 30
+EOF
+cp "$FAKE/gptokeyb" "$gk"
+chmod 755 "$gk"
+padrun='(. "$1" && get_controls && exec env -u LD_LIBRARY_PATH "$2" -1 nw -c "$3") & '
+padrun+='"${@:4}"; rc=$?; kill -KILL %1 2> /dev/null; exit "$rc"'
+spad="bash -c $padrun blockie-steam /usr/share/blockie/portmaster/mod_Blockie.txt $gk"
+gone_pid() { [[ ! -e /proc/$1 || $(sed -n 's/^State:[[:space:]]*//p' "/proc/$1/status" 2> /dev/null) == Z* ]]; }
 mkrunner
 
 mkdir -p /run/blockie-gpu
@@ -905,10 +945,10 @@ sargv+=" -p After=blockie-frontend.service -p MemoryHigh=80% -p MemoryMax=90% -p
 sargv+=" -p TimeoutStopSec=10s -- env -u XDG_CONFIG_HOME -u XDG_DATA_HOME -u XDG_CACHE_HOME -u SDL_AUDIODRIVER"
 sargv+=" HOME=$data/steam-home TMPDIR=$stmp ALSA_CONFIG_PATH=/usr/share/blockie/ports/alsa.conf"
 sargv+=" LD_LIBRARY_PATH=$rdir/lib:/invented/farm DBUS_SESSION_BUS_ADDRESS=disabled:"
-sargv+=" $rdir/nw --ozone-platform=wayland --ignore-gpu-blocklist --use-gl=angle"
-sargv+=" --use-angle=gles --host-resolver-rules=MAP * ~NOTFOUND --user-data-dir=$g/.blockie/nw"
-sargv+=" --disk-cache-dir=$stmp/nw-cache ."
-[[ $rc == 0 && $(< "$FAKE/systemd-run.log") == "$sargv" ]] &&
+nwargv=" $rdir/nw --ozone-platform=wayland --ignore-gpu-blocklist --use-gl=angle"
+nwargv+=" --use-angle=gles --host-resolver-rules=MAP * ~NOTFOUND --user-data-dir=$g/.blockie/nw"
+nwargv+=" --disk-cache-dir=$stmp/nw-cache ."
+[[ $rc == 0 && $(< "$FAKE/systemd-run.log") == "$sargv $spad /usr/share/blockie/steam/controls/rmmz.gptk$nwargv" ]] &&
   [[ $(sed -n 5p "$FAKE/nw.argv") == '--host-resolver-rules=MAP * ~NOTFOUND' && $(wc -l < "$FAKE/nw.argv") == 8 ]] &&
   nenv "HOME=$data/steam-home" && nenv "TMPDIR=$stmp" && nenv "LD_LIBRARY_PATH=$rdir/lib:/invented/farm" &&
   nenv ALSA_CONFIG_PATH=/usr/share/blockie/ports/alsa.conf && nenv DBUS_SESSION_BUS_ADDRESS=disabled: &&
@@ -917,12 +957,26 @@ sargv+=" --disk-cache-dir=$stmp/nw-cache ."
   [[ $(< "$FAKE/nw.umask") == 0022 && $(< "$FAKE/nw.cwd") == "$g/$groot" && ! -s $FAKE/nw.tmp && -d $g/.blockie/nw ]] &&
   grep -qx blockie-game.port "$FAKE/rundir" && [[ ! -e $t/run/blockie-game.port && ! -e $t/run/blockie-game.cmd ]] &&
   [[ $(< "$t/dl1.log") == $'check\nset' ]]
-res $? "steam: the .got's class and root pick nwjs.conf's runner dir by its SHA256; one scope with a 10 s stop runs nw from the root with the flags, the resolver block as one argument, the profile in <install>/.blockie/nw, the disk cache under the emptied TMPDIR, HOME steam-home, the runner lib before gpu.env's, the ALSA redirect, the session bus disabled for nw only (systemd-run keeps it, so Chromium cannot move itself into a scope of its own), XDG and SDL_AUDIODRIVER unset, umask 022; blockie-game.port while it runs, gone after; dl1 check before, set after"
+res $? "steam: the .got's class and root pick nwjs.conf's runner dir by its SHA256; one scope with a 10 s stop runs nw (behind the pad wrapper with rmmz.gptk) from the root with the flags, the resolver block as one argument, the profile in <install>/.blockie/nw, the disk cache under the emptied TMPDIR, HOME steam-home, the runner lib before gpu.env's, the ALSA redirect, the session bus disabled for nw only (systemd-run keeps it, so Chromium cannot move itself into a scope of its own), XDG and SDL_AUDIODRIVER unset, umask 022; blockie-game.port while it runs, gone after; dl1 check before, set after"
 rm -rf /run/blockie-gpu
 
 FAKE_NW=kill splay "$g"
 [[ $rc == 1 ]]
 res $? "steam: nw killed (137) with no QUIT gives 1, as a port does"
+
+FAKE_NW=padkill splay "$g"
+gp=$(cat "$FAKE/gptokeyb.pid" 2> /dev/null)
+[[ $rc == 1 && -n $gp ]] && gone_pid "$gp"
+res $? "steam controls: nw killed after gptokeyb started gives 1 and the wrapper kills gptokeyb"
+
+ok=0
+chmod 644 "$gk"
+refused steam "$g" && grep -q "the rmmz controls need $pmmod and $gk" "$t/out" || ok=1
+chmod 755 "$gk"
+rm -f "${pmmod:?}"
+refused steam "$g" && grep -q "the rmmz controls need" "$t/out" || ok=1
+cp -p "$t/mod.orig" "$pmmod"
+res $ok "steam controls: a class with a .gptk exits 64 before anything starts when gptokeyb is not executable or the mod is missing"
 
 FAKE_NW=ids splay "$g"
 [[ $rc == 0 && $(cat "$FAKE/nw.appids" 2> /dev/null) == steam-nwjs && ! -e $t/run/blockie-game.appids ]]
@@ -979,6 +1033,85 @@ r1=$?
 rm -f "${rd:?}/Zz.conf" "${rd:?}/aa.conf"
 [[ $r1 == 0 ]]
 res $? "steam: runner confs are read in C order, as the helper's sorted(): Zz.conf comes before aa.conf and nwjs.conf"
+
+ok=0
+names="back start guide a b x y l1 l2 l3 r1 r2 r3 up down left right left_analog_up left_analog_down left_analog_left
+  left_analog_right right_analog_up right_analog_down right_analog_left right_analog_right a_hk b_hk x_hk y_hk l1_hk l2_hk
+  r1_hk r2_hk"
+cdir=/usr/share/blockie/steam/controls
+cmp -s "$cdir/rmmz.gptk" "$cdir/rmmv.gptk" || { ok=1; echo "  rmmv.gptk is not rmmz.gptk"; }
+[[ $(wc -l < "$cdir/rmmz.gptk") == $(wc -w <<< "$names") ]] || { ok=1; echo "  rmmz.gptk has lines beside the button list"; }
+for n in $names; do
+  [[ $(grep -c "^$n = [^ ]*$" "$cdir/rmmz.gptk") == 1 ]] || { ok=1; echo "  $n is not set once"; }
+done
+declare -A keys=([a]=enter [a_hk]=enter [b]=esc [b_hk]=esc [y]=esc [y_hk]=esc [start]=esc [back]=esc [x]=shift
+  [x_hk]=shift [l1]=pageup [l1_hk]=pageup [r1]=pagedown [r1_hk]=pagedown [up]=up [down]=down [left]=left [right]=right
+  [left_analog_up]=up [left_analog_down]=down [left_analog_left]=left [left_analog_right]=right)
+for n in $names; do
+  grep -qxF "$n = ${keys[$n]:-\\\"}" "$cdir/rmmz.gptk" || { ok=1; echo "  $n is not ${keys[$n]:-unbound}"; }
+done
+res $ok "steam controls: rmmz.gptk and rmmv.gptk are one file setting every button gptokeyb has a default for once: bottom (a) Enter, right (b), top (y), start and back Escape, left (x) Shift, L1 PageUp, R1 PageDown, D-pad and left stick arrows, the hotkey forms the same, guide, L2, R2, L3, R3 and the right stick unbound"
+
+mkdir -p "$FAKE/grp"
+cat > "$FAKE/grp/systemd-run" << 'EOF'
+#!/usr/bin/env bash
+echo "$$" > "$FAKE/scope"
+exec setsid "$FAKE/bin/systemd-run" "$@"
+EOF
+cat > "$FAKE/grp/systemctl" << 'EOF'
+#!/usr/bin/env bash
+case "$*" in
+  "--user stop --no-block blockie-game.scope" | "--user stop blockie-game.scope")
+    g=$(cat "$FAKE/scope" 2> /dev/null)
+    [[ -z $g ]] || kill -TERM -- "-$g" 2> /dev/null
+    ;;
+esac
+exec "$FAKE/bin/systemctl" "$@"
+EOF
+chmod 755 "$FAKE/grp/systemd-run" "$FAKE/grp/systemctl"
+gplay() {
+  rm -f "${FAKE:?}"/nw.* "${FAKE:?}"/gptokeyb.* "${FAKE:?}/scope" "${FAKE:?}"/*.log "${t:?}/dl1.log"
+  PATH=$FAKE/grp:$FAKE/bin:$PATH XDG_RUNTIME_DIR=$t/run DL1_CARDS=$t/nocard "$game" steam "$g" > "$t/out" 2>&1
+}
+
+FAKE_NW=pad gplay
+rc=$?
+gp=$(cat "$FAKE/gptokeyb.pid" 2> /dev/null)
+[[ $rc == 0 && -n $gp && $(< "$FAKE/gptokeyb.argv") == $'-1\nnw\n-c\n'"$cdir/rmmz.gptk" ]] &&
+  [[ $(< "$FAKE/gptokeyb.ppid") == "$(< "$FAKE/scope")" && $(< "$FAKE/nw.ppid") == "$(< "$FAKE/scope")" ]] &&
+  [[ $(< "$FAKE/gptokeyb.dbpath") == "$t/run/blockie-ports/gamecontrollerdb.txt" ]] &&
+  [[ $(< "$FAKE/gptokeyb.ldpath") == unset ]] && nenv "LD_LIBRARY_PATH=$rdir/lib" &&
+  grep -q ',AYANEO Controller,a:b1,b:b0,x:b3,y:b2,' "$FAKE/gptokeyb.db" &&
+  ! grep -q '^SDL_GAMECONTROLLERCONFIG_FILE=' "$FAKE/nw.env" && gone_pid "$gp" && grep -qx blockie-game.port "$FAKE/rundir"
+res $? "steam controls: rmmz starts gptokeyb -1 nw -c rmmz.gptk as the ports' gptokeyb with no LD_LIBRARY_PATH (nw keeps the runner's), with the ports' AYANEO pad map by position from get_controls, as a child of the scope's process beside nw (so the scope's SIGSTOP and SIGCONT pause and resume both, with blockie-game.port written); nw's env has no pad map; gptokeyb is killed when nw exits"
+
+gotf 9000001 rmmv windows "$groot"
+FAKE_NW=pad splay "$g"
+gp=$(cat "$FAKE/gptokeyb.pid" 2> /dev/null)
+[[ $rc == 0 && -n $gp && $(< "$FAKE/gptokeyb.argv") == $'-1\nnw\n-c\n'"$cdir/rmmv.gptk" ]] && gone_pid "$gp"
+r1=$?
+gotf 9000001 invented windows "$groot"
+FAKE_NW=pad splay "$g"
+[[ $rc == 0 && ! -e $FAKE/gptokeyb.argv && ! -e $FAKE/gptokeyb.pid ]] &&
+  [[ $(< "$FAKE/systemd-run.log") == "${sargv/lib:\/invented\/farm /lib }$nwargv" ]]
+r2=$?
+gotf 9000001 rmmz windows "$groot"
+[[ $r1 == 0 && $r2 == 0 ]]
+res $? "steam controls: the .got's class picks the file (rmmv.gptk for rmmv); a class with no file under controls runs nw alone with no gptokeyb"
+
+FAKE_NW=padsleep gplay &
+w=$!
+for _ in $(seq 50); do
+  [[ -s $FAKE/gptokeyb.pid && -s $FAKE/nw.ppid ]] && break
+  sleep 0.1
+done
+gp=$(cat "$FAKE/gptokeyb.pid" 2> /dev/null)
+XDG_RUNTIME_DIR=$t/run timeout 5 "$gcmd" QUIT > /dev/null 2>&1
+wait "$w"
+rc=$?
+[[ $rc == 0 && -n $gp ]] && gone_pid "$gp" && grep -qx -- '--user stop --no-block blockie-game.scope' "$FAKE/systemctl.log" &&
+  [[ ! -e $t/run/blockie-game.port ]]
+res $? "steam controls: QUIT on the FIFO stops the scope, which ends gptokeyb with nw; exit 0, blockie-game.port gone"
 cp -p "$t/dl1.orig" "$dl1"
 while IFS= read -r p; do
   rm -rf -- "${p:?}"

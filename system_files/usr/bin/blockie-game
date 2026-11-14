@@ -16,6 +16,9 @@ shims=/usr/libexec/blockie/ports/bin
 games=$data/steam-games
 runners=$data/steam-runners
 runnersd=/usr/share/blockie/steam/runners.d
+controls=/usr/share/blockie/steam/controls
+pmmod=/usr/share/blockie/portmaster/mod_Blockie.txt
+gptokeyb=/usr/lib64/blockie-ports/gptokeyb
 appre='^[A-Za-z0-9][A-Za-z0-9._-]*$'
 
 usage() { echo "usage: $me <system> <rompath> [--core <id>] [--config <file>] [--theme dark|light]" >&2; exit 64; }
@@ -152,6 +155,14 @@ if [[ $system == steam ]]; then
   fi
   [[ $wb =~ ^[0-9]+$ && $wn =~ ^[0-9]+$ && $wb == "$sum" && $wn == "$n" ]] ||
     refuse "the $runner runner in $rdir is missing or not whole"
+  pad=()
+  gptk=$controls/${keys[0]}.gptk
+  padrun='(. "$1" && get_controls && exec env -u LD_LIBRARY_PATH "$2" -1 nw -c "$3") & '
+  padrun+='"${@:4}"; rc=$?; kill -KILL %1 2> /dev/null; exit "$rc"'
+  if [[ -f $gptk ]]; then
+    [[ -f $pmmod && -x $gptokeyb ]] || refuse "the ${keys[0]} controls need $pmmod and $gptokeyb"
+    pad=(bash -c "$padrun" blockie-steam "$pmmod" "$gptokeyb" "$gptk")
+  fi
 fi
 
 lines=()
@@ -364,7 +375,7 @@ elif [[ $system == steam ]]; then
   mkdir -p -m 0700 -- "$rom/.blockie/nw" || die "cannot make $rom/.blockie/nw"
   port "$run/blockie-steam/last.log" "$stmp" "$cwd" HOME="$data/steam-home" TMPDIR="$stmp" \
     ALSA_CONFIG_PATH=/usr/share/blockie/ports/alsa.conf LD_LIBRARY_PATH="$rdir/lib${gpulib:+:$gpulib}" \
-    DBUS_SESSION_BUS_ADDRESS=disabled: "$rdir/nw" \
+    DBUS_SESSION_BUS_ADDRESS=disabled: "${pad[@]}" "$rdir/nw" \
     --ozone-platform=wayland --ignore-gpu-blocklist --use-gl=angle --use-angle=gles \
     "--host-resolver-rules=MAP * ~NOTFOUND" --user-data-dir="$rom/.blockie/nw" --disk-cache-dir="$stmp/nw-cache" .
 fi
