@@ -10,13 +10,14 @@ gpu=${BLOCKIE_GPU:-/var/lib/blockie/gpu}
 run=${BLOCKIE_GPU_RUN:-/run/blockie-gpu}
 deploys=${BLOCKIE_SYSROOT:-/sysroot}/ostree/deploy/default/deploy
 icddir=${BLOCKIE_ICD_DIR:-/usr/share/blockie/vulkan}
+runners=${BLOCKIE_STEAM_RUNNERS:-/var/lib/blockie/data/steam-runners}
 name_re='^[A-Za-z0-9][A-Za-z0-9._+-]*$'
 
 field() { sed -n "s/^$1=//p" "$2" | tail -n 1; }
 
 prune() {
   local d c h n=0
-  declare -A want=()
+  declare -A want=() keep=()
   shopt -s nullglob
   for d in "$deploys"/*/; do
     [[ ${d%/} =~ /[0-9a-f]{64}\.[0-9]+$ ]] || continue
@@ -25,6 +26,12 @@ prune() {
       h=$(field SHA256 "$c")
       [[ $h =~ ^[0-9a-f]{64}$ ]] || die "$c: SHA256 '$h'"
       want[$h]=1
+    done
+    for c in "$d"usr/share/blockie/steam/runners.d/*.conf; do
+      [[ -n $(field URL "$c") ]] || continue
+      h=$(field SHA256 "$c")
+      [[ $h =~ ^[0-9a-f]{64}$ ]] || die "$c: SHA256 '$h'"
+      keep[${h:0:16}]=1
     done
   done
   (( n )) || die "no deployment under $deploys, nothing pruned"
@@ -35,7 +42,14 @@ prune() {
     rm -f -- "$c"
     echo "$me: pruned $h"
   done
-  echo "$me: prune kept ${#want[@]} listed blobs from $n deployments"
+  for c in "$runners"/*; do
+    h=${c##*/}
+    [[ $h =~ ^[0-9a-f]{16}$ && -d $c && ! -L $c ]] || continue
+    [[ -n ${keep[$h]:-} ]] && continue
+    rm -rf -- "${c:?}"
+    echo "$me: pruned runner $h"
+  done
+  echo "$me: prune kept ${#want[@]} listed blobs and ${#keep[@]} runners from $n deployments"
 }
 
 relink() {

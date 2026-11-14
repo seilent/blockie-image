@@ -16,6 +16,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import tarfile
 import threading
 import time
 import traceback
@@ -159,7 +160,16 @@ CURL = os.environ.get("BLOCKIE_PORTS_CURL", "curl")
 APP_INST = re.compile(r"app-([0-9]+)")
 GAMES_TXN = os.path.join(GAMES_STATE, "txn")
 APP_REQ = ("op", "port", "login", "paths", "os", "choice", "drop")
-LIB_ARGS = {"get": 1, "remove": 1, "lang": 2}
+LIB_ARGS = {"get": 1, "remove": 1, "lang": 2, "runner": 1}
+RUNNER_STORE = os.path.join(DATA, "steam-runners")
+RUNNER_SIZE = ".blockie-size"
+RUNNER_NAME = re.compile(r"[a-z0-9][a-z0-9-]*")
+RUNNER_TMP = re.compile(r"\.tmp-([0-9]+)")
+NW_APP = "steam-nwjs"
+NW_JSON_MAX = 1 << 16
+NW_BIN = "nw"
+NW_ARGS_MAX = 1024
+NW_ARGS = re.compile(r"--force-color-profile=[A-Za-z0-9_.-]+")
 
 
 class Fail(Exception):
@@ -1948,8 +1958,10 @@ def finish(name, data):
     if APP_INST.fullmatch(name):
         app_keys(data)
         kept = drop_unchanged(name, data.get("orphans", []), False)
-        got.update(data["got"], placed=got["placed"] + [x[0] for x in kept],
-                   files={x[0]: [x[1], x[2]] for x in [*data["placed"], *kept]})
+        placed = nw_package(name, data)
+        kept = [x for x in kept if x[0] not in {p[0] for p in placed}]
+        got.update(data["got"], placed=[x[0] for x in [*placed, *kept]],
+                   files={x[0]: [x[1], x[2]] for x in [*placed, *kept]})
     write_atomic(mark(name, "got"), json.dumps(got).encode(), 0o600)
     remove(mark(name, "replaced"))
     remove(mark(name, "dropped"))
@@ -2054,6 +2066,13 @@ def steam_get(proto, name, row=None):
             return "other"
         if app and not app_reclass(row, lst):
             return "class"
+        if app:
+            try:
+                runner_fetch(proto, runner_of(f"{row['got']['class']}:{row['os']}"))
+            except Fail as err:
+                if err.why == "cancel":
+                    return "cancel"
+                raise
         plan = merge(name, row, lst)
         if not plan["fetch"]:
             break
@@ -2208,6 +2227,216 @@ def load_offered():
                 if CLASS.fullmatch(cls) and os_name in LIB_OSES and x not in out:
                     out.append(x)
     return out
+
+
+def runner_fields(path):
+    out = {}
+    for line in read_lines(path) or []:
+        key, sep, value = line.partition("=")
+        if sep:
+            out[key] = value.strip().strip("\"'")
+    return out
+
+
+def runner_of(cls_os):
+    return next((p for p in runner_confs() if cls_os in runner_fields(p).get("CLASSES", "").split()), None)
+
+
+def runner_pin(path):
+    f = runner_fields(path)
+    if "URL" not in f:
+        return None
+    if not (f["URL"].startswith("https://") and not CTRL.search(f["URL"]) and " " not in f["URL"]
+            and SHA256.fullmatch(f.get("SHA256", "")) and RUNTIME.fullmatch(f.get("FILE", ""))
+            and all(DIGITS.fullmatch(f.get(k, "")) for k in ("SIZE", "UNPACKED"))):
+        log(f"runner {os.path.basename(path)}: URL, SHA256, FILE, SIZE or UNPACKED out of form")
+        raise Fail("runner")
+    return {"url": f["URL"], "sha256": f["SHA256"], "file": f["FILE"], "size": int(f["SIZE"]),
+            "unpacked": int(f["UNPACKED"])}
+
+
+def tree_size(top):
+    total = n = 0
+    for root, dirs, files in os.walk(top):
+        for e in files:
+            if root == top and e == RUNNER_SIZE:
+                continue
+            st = os.lstat(os.path.join(root, e))
+            if stat.S_ISREG(st.st_mode):
+                total += st.st_size
+                n += 1
+    return total, n
+
+
+def runner_ok(dst, path):
+    try:
+        if not stat.S_ISDIR(os.lstat(dst).st_mode):
+            return False
+        if os.path.basename(path) == "nwjs.conf":
+            st = os.lstat(os.path.join(dst, NW_BIN))
+            if not (stat.S_ISREG(st.st_mode) and st.st_mode & 0o100):
+                return False
+        with open(os.path.join(dst, RUNNER_SIZE)) as f:
+            want = f.read(64).split()
+        return want == [str(x) for x in tree_size(dst)]
+    except (OSError, ValueError):
+        return False
+
+
+def runner_curl(proto, pin, part):
+    proto.progress("runner", 0, pin["size"])
+    try:
+        p = subprocess.Popen([CURL, "-fsSL", "--proto", "=https", "--proto-redir", "=https", "--max-time", "3600",
+                              "--speed-limit", "1", "--speed-time", "120", "--max-filesize", str(pin["size"]),
+                              "-o", part, pin["url"]], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+    except OSError as err:
+        log(f"runner: curl {type(err).__name__}")
+        raise Fail("runner")
+    shown = 0
+    try:
+        while p.poll() is None:
+            if CANCEL[0]:
+                raise Fail("cancel")
+            time.sleep(0.5)
+            with contextlib.suppress(OSError):
+                done = os.lstat(part).st_size
+                if done != shown:
+                    proto.progress("runner", done, pin["size"])
+                    shown = done
+    finally:
+        if p.poll() is None:
+            p.kill()
+        rc = p.wait()
+    if rc != 0:
+        log(f"runner: curl ended {rc}")
+        raise Fail("runner")
+    with contextlib.suppress(OSError):
+        done = os.lstat(part).st_size
+        if done != shown:
+            proto.progress("runner", done, pin["size"])
+
+
+def runner_unpack(part, into):
+    os.makedirs(into, 0o700)
+    tops = set()
+    try:
+        with tarfile.open(part, "r:gz") as tf:
+            for mem in tf:
+                if CANCEL[0]:
+                    raise Fail("cancel")
+                name = mem.name.removeprefix("./").rstrip("/")
+                if name in ("", "."):
+                    continue
+                if not rel_ok(name):
+                    raise Fail("runner")
+                tops.add(name.split("/", 1)[0])
+                if len(tops) > 1:
+                    raise Fail("runner")
+                tf.extract(mem, into, filter="data")
+    except (tarfile.TarError, EOFError, zlib.error, gzip.BadGzipFile) as err:
+        log(f"runner: the tarball does not unpack, {type(err).__name__}")
+        raise Fail("runner")
+    top = os.path.join(into, tops.pop()) if tops else into
+    if top == into or not stat.S_ISDIR(os.lstat(top).st_mode):
+        log("runner: the tarball has no top dir")
+        raise Fail("runner")
+    return top
+
+
+def runner_fetch(proto, path):
+    pin = None if path is None else runner_pin(path)
+    if pin is None:
+        return None
+    dst = os.path.join(RUNNER_STORE, pin["sha256"][:16])
+    if runner_ok(dst, path):
+        return dst
+    os.makedirs(RUNNER_STORE, 0o755, exist_ok=True)
+    for e in os.listdir(RUNNER_STORE):
+        old = RUNNER_TMP.fullmatch(e)
+        if old and (int(old.group(1)) == os.getpid() or not os.path.exists(f"/proc/{old.group(1)}")):
+            remove(os.path.join(RUNNER_STORE, e))
+    need(pin["size"] + pin["unpacked"])
+    tmp = os.path.join(RUNNER_STORE, f".tmp-{os.getpid()}")
+    os.makedirs(tmp, 0o700)
+    try:
+        part = os.path.join(tmp, pin["file"])
+        runner_curl(proto, pin, part)
+        try:
+            with open(part, "rb") as f:
+                size = os.fstat(f.fileno()).st_size
+                got = hashlib.file_digest(f, "sha256").hexdigest()
+        except FileNotFoundError:
+            size = got = None
+        if size != pin["size"] or got != pin["sha256"]:
+            log(f"runner {os.path.basename(path)}: the download is not the pinned file")
+            raise Fail("runner")
+        top = runner_unpack(part, os.path.join(tmp, "x"))
+        total, n = tree_size(top)
+        if total != pin["unpacked"]:
+            log(f"runner {os.path.basename(path)}: unpacks to {total} bytes in {n} files, the conf says "
+                f"{pin['unpacked']}")
+        write_atomic(os.path.join(top, RUNNER_SIZE), f"{total} {n}\n".encode())
+        os.sync()
+        remove(dst)
+        os.rename(top, dst)
+        fsync_dir(RUNNER_STORE)
+    finally:
+        remove(tmp)
+    return dst
+
+
+def nw_package(name, data):
+    placed = [list(x) for x in data["placed"]]
+    keys = data["got"]
+    conf = runner_of(f"{keys['class']}:{keys['os']}")
+    if conf is None or os.path.basename(conf) != "nwjs.conf":
+        return placed
+    want = "/".join(x for x in (where(name)[2], keys["root"], "package.json") if x).lower()
+    hits = [x for x in placed if x[0].lower() == want]
+    hit = next((x for x in hits if x[0].endswith("/package.json")), hits[0] if hits else None)
+    if hit is None:
+        return placed
+    dst = f"{os.path.dirname(hit[0])}/package.json"
+    if not (inside_port_dst(name, hit[0]) and inside_port_dst(name, dst)):
+        return placed
+    full = os.path.join(GAMES, hit[0])
+    src = full if hit[0] == dst or os.path.lexists(full) else os.path.join(GAMES, dst)
+    depot = None
+    try:
+        fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        with os.fdopen(fd, "rb") as f:
+            raw = f.read(NW_JSON_MAX + 1)
+        if len(raw) <= NW_JSON_MAX:
+            depot = json.loads(raw)
+    except (OSError, ValueError):
+        pass
+    if not isinstance(depot, dict):
+        log(f"{name}: package.json does not read, the Blockie one has no window keys of its own")
+        depot = {}
+    main = depot.get("main")
+    window = depot.get("window") if isinstance(depot.get("window"), dict) else {}
+    out = {"name": NW_APP, "main": main if rel_ok(main) and len(main) <= 256 else "index.html",
+           "window": {**window, "fullscreen": True}}
+    for key in ("chromium-args", "js-flags"):
+        v = depot.get(key)
+        if not isinstance(v, str) or len(v) > NW_ARGS_MAX or CTRL.search(v):
+            continue
+        if key == "chromium-args":
+            toks = v.split()
+            v = " ".join(t for t in toks if NW_ARGS.fullmatch(t))
+            if len(v.split()) < len(toks):
+                log(f"{name}: package.json chromium-args: {len(toks) - len(v.split())} dropped")
+            if not v:
+                continue
+        out[key] = v
+    body = json.dumps(out).encode()
+    write_atomic(os.path.join(GAMES, dst), body)
+    if hit[0] != dst:
+        remove(full)
+        log(f"{name}: package.json written in place of {os.path.basename(hit[0])}")
+    hit[:] = [dst, len(body), hashlib.sha1(body).hexdigest()]
+    return placed
 
 
 def table_hash():
@@ -2850,6 +3079,21 @@ def lib_lang(app, choice):
 def cmd_steam_lib(name, ctx):
     if name == "index":
         lib_index()
+        return
+    if name == "runner":
+        conf = os.path.join(RUNNERS, f"{ctx.args[0]}.conf")
+        if not RUNNER_NAME.fullmatch(ctx.args[0]) or conf not in runner_confs() or runner_pin(conf) is None:
+            raise Fail("other")
+        if scope_active():
+            raise Fail("busy")
+        if offline():
+            raise Fail("network")
+        os.makedirs(STEAM_STATE, 0o755, exist_ok=True)
+        hold = idle_hold()
+        try:
+            runner_fetch(ctx.proto, conf)
+        finally:
+            idle_release(hold)
         return
     if name in LIB_ARGS:
         app = ctx.args[0]
@@ -3640,7 +3884,7 @@ def run(argv, proto):
     if n is None or len(argv) != 2 + n or any(CTRL.search(a) for a in argv[2:]):
         log(f"usage: {ME} sync|refresh|index|install <name>|update <name>|uninstall <name>|runtime <name>|"
             f"unpack <file>|steam-get <name>|steam-logout|steam-lib index|refresh|scan|art|get <app>|remove <app>|"
-            f"lang <app> <choice>")
+            f"lang <app> <choice>|runner <name>")
         return 64
     cmd = argv[1]
     arg = argv[2] if len(argv) > 2 else cmd

@@ -82,4 +82,5 @@ dnf -y "${opts[@]}" install \
   sdl2-compat \
   openal-soft \
   libtheora \
-  libvorbis
+  libvorbis \
+  libatomic

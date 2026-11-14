@@ -23,7 +23,8 @@ Requires:       systemd
 blockie-wifi loads the MT6768 Wi-Fi modules, runs blk-wmt and waits for wlan0.
 blockie-bt loads the MT6768 Bluetooth module and waits for /dev/stpbt.
 blockie-boot-ok confirms the booted deployment; blockie-blobs checks the pinned blobs
-and links them for the GPU. abctl reads and writes the slot table and the bootloader
+and links them for the GPU, and its prune drops the blobs and fetched Steam runners no
+deployment names. abctl reads and writes the slot table and the bootloader
 message in misc; blockie-bootctl re-arms slot a at the healthy point and writes the
 reboot targets and their gates.
 

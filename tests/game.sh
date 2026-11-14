@@ -8,8 +8,15 @@ share=/usr/share/blockie/retroarch
 data=/var/lib/blockie/data
 t=$(mktemp -d "${TMPDIR:-/tmp}/game.XXXXXX")
 fails=0
+rd=/usr/share/blockie/steam/runners.d
+dl1=/usr/libexec/blockie/dl1
 cp -p "$share/shader-defaults" "$t/shader-defaults"
-trap 'cp -p "$t/shader-defaults" "$share/shader-defaults"; rm -rf "${t:?}"' EXIT
+[[ ! -d $rd ]] || cp -a "$rd" "$t/runners.d"
+cp -p "$dl1" "$t/dl1.orig"
+trap 'cp -p "$t/shader-defaults" "$share/shader-defaults"; cp -p "$t/dl1.orig" "$dl1"
+  rm -f "${rd:?}/aaa.conf" "${rd:?}/nwjs.conf" "${rd:?}/Zz.conf" "${rd:?}/aa.conf"
+  if [[ -d $t/runners.d ]]; then cp -a "$t/runners.d/." "$rd/"; else rmdir "$rd" 2> /dev/null; fi
+  rm -rf "${t:?}"' EXIT
 : > "$share/shader-defaults"
 
 res() {
@@ -807,6 +814,172 @@ done
 ! grep -Eq '^input_(enable_hotkey|menu_toggle|exit_emulator)_btn' "$share/blockie.cfg" || { ok=1; echo "  a pad hotkey in blockie.cfg"; }
 ! grep -q 'input_menu_toggle_btn' "$pad" || { ok=1; echo "  a pad menu toggle in the autoconfig"; }
 res $ok "base config: dirs, sram autosave every 60 s, cores, pipewire, midi, info cache, gamemode, no save on exit, menu ok on south, positional face buttons with physical labels, shader defaults, volume, no DSP filter, stdin commands, no pad hotkeys"
+
+games=$data/steam-games
+g=$games/9000001
+groot="Invented Root"
+stmp=$data/cache/steam-tmp/run
+sha=$(printf 'invented runner\n' | sha256sum | cut -d' ' -f1)
+rdir=$data/steam-runners/${sha:0:16}
+sids="9000001 9000002 9000003 9000004 9000005 9000006 9000008"
+sown() {
+  local i
+  printf '%s\n' "$games/abc" "$rdir" "$rdir.real"
+  for i in $sids; do
+    printf '%s\n' "$games/$i" "$games/.blockie/$i.got"
+  done
+}
+while IFS= read -r p; do
+  [[ ! -e $p && ! -L $p ]] && continue
+  res 1 "steam: $p was there before the steam cases, none ran and nothing was removed"
+  echo "game: $fails failed"
+  exit 1
+done < <(sown)
+mkdir -p "$rd" "$games/.blockie" "$g/$groot" "$g/sub" "$games/abc" "$games/9000003" "$games/9000004" \
+  "$games/9000005" "$games/9000006" "$games/9000008/$groot" "$stmp" "$data/steam-home"
+printf '%s\n' 'CLASSES="rmmz:windows rmmv:windows"' URL=https://example.invalid/nw.tar.gz "SHA256=$sha" \
+  > "$rd/nwjs.conf"
+printf 'CLASSES=gamemaker:linux\nURL=https://example.invalid/a.tar.gz\nSHA256=%s\n' "$sha" > "$rd/aaa.conf"
+gotf() {
+  printf '{"digest": "x", "placed": [], "class": "%s", "os": "%s", "root": "%s", "depots": []}\n' "$2" "$3" "$4" \
+    > "$games/.blockie/$1.got"
+}
+gotf 9000001 rmmz windows "$groot"
+ln -sfn 9000001 "$games/9000002"
+gotf 9000002 rmmz windows "$groot"
+printf 'not json\n' > "$games/.blockie/9000004.got"
+gotf 9000005 unity linux ''
+gotf 9000006 rmmz windows '../9000001'
+gotf 9000008 gamemaker linux "$groot"
+printf '#!/bin/sh\necho "$1" >> "%s/dl1.log"\n' "$t" > "$dl1"
+chmod 755 "$dl1"
+cat > "$FAKE/nw" << 'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$@" > "$FAKE/nw.argv"
+env > "$FAKE/nw.env"
+umask > "$FAKE/nw.umask"
+pwd > "$FAKE/nw.cwd"
+ls -A "$TMPDIR" > "$FAKE/nw.tmp"
+case ${FAKE_NW:-} in
+  kill) kill -KILL $$ ;;
+  ids)
+    printf '%s\n' 'net.seilent.steam.nwjs: x' 'steam-nwjs: Invented' > "$FAKE/toplevels"
+    for _ in $(seq 50); do
+      [[ -s $XDG_RUNTIME_DIR/blockie-game.appids ]] && break
+      sleep 0.1
+    done
+    cp "$XDG_RUNTIME_DIR/blockie-game.appids" "$FAKE/nw.appids"
+    ;;
+esac
+exit 0
+EOF
+cat > "$FAKE/bin/wlrctl" << 'EOF'
+#!/usr/bin/env bash
+[[ "$*" == "toplevel list" ]] && cat "$FAKE/toplevels" 2> /dev/null
+exit 0
+EOF
+chmod 755 "$FAKE/bin/wlrctl"
+mkrunner() {
+  rm -rf "${rdir:?}"
+  mkdir -p "$rdir/lib"
+  cp "$FAKE/nw" "$rdir/nw"
+  chmod 755 "$rdir/nw"
+  printf 'invented lib\n' > "$rdir/lib/libinvented.so"
+  echo "$(($(stat -c %s "$rdir/nw") + 13)) 2" > "$rdir/.blockie-size"
+}
+splay() {
+  rm -f "${FAKE:?}"/nw.* "${FAKE:?}/toplevels" "${t:?}/dl1.log"
+  play steam "$@"
+}
+nenv() { grep -qxF -- "$1" "$FAKE/nw.env"; }
+mkrunner
+
+mkdir -p /run/blockie-gpu
+printf 'LD_LIBRARY_PATH=/invented/farm\n' > /run/blockie-gpu/gpu.env
+echo invented > "$stmp/stale"
+rm -f "$FAKE/rundir"
+XDG_CONFIG_HOME=/invented SDL_AUDIODRIVER=alsa splay "$g"
+sargv="--user --scope --quiet --unit=blockie-game --collect --slice=blockie-emulation.slice -p BindsTo=blockie-frontend.service"
+sargv+=" -p After=blockie-frontend.service -p MemoryHigh=80% -p MemoryMax=90% -p TasksMax=512 -p OOMPolicy=kill"
+sargv+=" -p TimeoutStopSec=10s -- env -u XDG_CONFIG_HOME -u XDG_DATA_HOME -u XDG_CACHE_HOME -u SDL_AUDIODRIVER"
+sargv+=" HOME=$data/steam-home TMPDIR=$stmp ALSA_CONFIG_PATH=/usr/share/blockie/ports/alsa.conf"
+sargv+=" LD_LIBRARY_PATH=$rdir/lib:/invented/farm $rdir/nw --ozone-platform=wayland --ignore-gpu-blocklist --use-gl=angle"
+sargv+=" --use-angle=gles --host-resolver-rules=MAP * ~NOTFOUND --user-data-dir=$g/.blockie/nw"
+sargv+=" --disk-cache-dir=$stmp/nw-cache ."
+[[ $rc == 0 && $(< "$FAKE/systemd-run.log") == "$sargv" ]] &&
+  [[ $(sed -n 5p "$FAKE/nw.argv") == '--host-resolver-rules=MAP * ~NOTFOUND' && $(wc -l < "$FAKE/nw.argv") == 8 ]] &&
+  nenv "HOME=$data/steam-home" && nenv "TMPDIR=$stmp" && nenv "LD_LIBRARY_PATH=$rdir/lib:/invented/farm" &&
+  nenv ALSA_CONFIG_PATH=/usr/share/blockie/ports/alsa.conf &&
+  ! grep -qE '^(XDG_CONFIG_HOME|SDL_AUDIODRIVER)=' "$FAKE/nw.env" &&
+  [[ $(< "$FAKE/nw.umask") == 0022 && $(< "$FAKE/nw.cwd") == "$g/$groot" && ! -s $FAKE/nw.tmp && -d $g/.blockie/nw ]] &&
+  grep -qx blockie-game.port "$FAKE/rundir" && [[ ! -e $t/run/blockie-game.port && ! -e $t/run/blockie-game.cmd ]] &&
+  [[ $(< "$t/dl1.log") == $'check\nset' ]]
+res $? "steam: the .got's class and root pick nwjs.conf's runner dir by its SHA256; one scope with a 10 s stop runs nw from the root with the flags, the resolver block as one argument, the profile in <install>/.blockie/nw, the disk cache under the emptied TMPDIR, HOME steam-home, the runner lib before gpu.env's, the ALSA redirect, XDG and SDL_AUDIODRIVER unset, umask 022; blockie-game.port while it runs, gone after; dl1 check before, set after"
+rm -rf /run/blockie-gpu
+
+FAKE_NW=kill splay "$g"
+[[ $rc == 1 ]]
+res $? "steam: nw killed (137) with no QUIT gives 1, as a port does"
+
+FAKE_NW=ids splay "$g"
+[[ $rc == 0 && $(cat "$FAKE/nw.appids" 2> /dev/null) == steam-nwjs && ! -e $t/run/blockie-game.appids ]]
+res $? "steam: the app id steam-nwjs passes the app id poll, net.seilent.steam.nwjs does not; the list is gone after"
+
+ok=0
+refused steam steam-games/9000001 || ok=1
+refused steam "$games/abc" || ok=1
+refused steam "$games/9000002" || ok=1
+refused steam "$g/sub" || ok=1
+refused steam "$g/" || ok=1
+refused steam "$games/.blockie" || ok=1
+refused steam "$games/9000003" || ok=1
+refused steam "$games/9000004" || ok=1
+refused steam "$games/9000005" || ok=1
+refused steam "$games/9000006" || ok=1
+refused steam "$games/9000008" || ok=1
+refused steam "$g" --core mgba || ok=1
+refused steam "$g" --config "$t/game.cfg" || ok=1
+res $ok "steam: a relative path, a non digits dir, a symlink, a subdir, a trailing slash, the state dir, no .got, a .got out of form, a class no conf names, a root outside the game, a runner with no launch, --core or --config exit 64 before anything starts"
+
+ok=0
+rm -f "${rdir:?}/lib/libinvented.so"
+refused steam "$g" || ok=1
+mkrunner
+echo 1 2 > "$rdir/.blockie-size"
+refused steam "$g" || ok=1
+rm -rf "${rdir:?}"
+refused steam "$g" || ok=1
+mkrunner
+mv "$rdir" "$rdir.real"
+ln -s "$rdir.real" "$rdir"
+refused steam "$g" || ok=1
+rm -f "${rdir:?}"
+mv "$rdir.real" "$rdir"
+splay "$g"
+[[ $rc == 0 ]] || ok=1
+res $ok "steam: a runner dir with a file gone, a size marker that does not match, none or a symlink exits 64; the whole one runs"
+
+gotf 9000001 rmmv windows "$groot"
+splay "$g"
+r1=$rc
+gotf 9000001 gamemaker linux "$groot"
+refused steam "$g"
+r2=$?
+gotf 9000001 rmmz windows "$groot"
+[[ $r1 == 0 && $r2 == 0 ]]
+res $? "steam: the class comes from the .got: rmmv:windows, also in nwjs.conf's CLASSES, runs; gamemaker:linux, named only by a conf with no launch, exits 64"
+
+printf 'CLASSES=rmmz:windows\nURL=https://example.invalid/b.tar.gz\nSHA256=%s\n' "$sha" > "$rd/Zz.conf"
+printf 'CLASSES=rmmz:windows\nURL=https://example.invalid/b.tar.gz\nSHA256=%s\n' "$sha" > "$rd/aa.conf"
+refused steam "$g" && grep -q 'no launch for the runner Zz' "$t/out"
+r1=$?
+rm -f "${rd:?}/Zz.conf" "${rd:?}/aa.conf"
+[[ $r1 == 0 ]]
+res $? "steam: runner confs are read in C order, as the helper's sorted(): Zz.conf comes before aa.conf and nwjs.conf"
+cp -p "$t/dl1.orig" "$dl1"
+while IFS= read -r p; do
+  rm -rf -- "${p:?}"
+done < <(sown)
 
 if [[ $fails == 0 ]]; then
   echo "game: all ok"
