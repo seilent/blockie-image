@@ -1,0 +1,177 @@
+[
+ {
+  "file": "system_files/usr/libexec/blockie/blockie-hotkeyd",
+  "old": "            if not wake:\n                self.want(\"blanked\")\n",
+  "new": "            if not wake:\n                self.want(\"blanked\", idle=True)\n",
+  "test": "tests/hotkeyd.sh",
+  "expected_failure": "FAILED K4 tap blank:"
+ },
+ {
+  "file": "system_files/usr/libexec/blockie/blockie-hotkeyd",
+  "old": "        self.idle_blank = idle and state == \"blanked\"\n",
+  "new": "        self.idle_blank = self.idle_blank or (idle and state == \"blanked\")\n",
+  "test": "tests/hotkeyd.sh",
+  "expected_failure": "FAILED K4 menu from idle, cancel, tap blank:"
+ },
+ {
+  "file": "system_files/usr/libexec/blockie/blockie-hotkeyd",
+  "old": "            self.want(\"blanked\", idle=m.pause or self.menu_from == \"awake\" or self.dark_idle)\n",
+  "new": "            self.want(\"blanked\", idle=True)\n",
+  "test": "tests/hotkeyd.sh",
+  "expected_failure": "FAILED K4 tap blank, power hold, screen-off:"
+ },
+ {
+  "file": "system_files/usr/libexec/blockie/blockie-hotkeyd",
+  "old": "            self.want(\"blanked\", idle=m.pause or self.menu_from == \"awake\" or self.dark_idle)\n",
+  "new": "            self.want(\"blanked\", idle=m.pause or self.menu_from == \"awake\")\n",
+  "test": "tests/hotkeyd.sh",
+  "expected_failure": "FAILED K1f idle blank, power hold, screen-off:"
+ },
+ {
+  "file": "system_files/usr/libexec/blockie/blockie-hotkeyd",
+  "old": "    return sysfs(ONLINE) == \"1\" and not os.path.exists(KNOB)\n",
+  "new": "    return not os.path.exists(KNOB)\n",
+  "test": "tests/hotkeyd.sh",
+  "expected_failure": "FAILED K4 online 0:"
+ },
+ {
+  "file": "system_files/usr/libexec/blockie/blockie-hotkeyd",
+  "old": "    return sysfs(ONLINE) == \"1\" and not os.path.exists(KNOB)\n",
+  "new": "    return sysfs(ONLINE) == \"1\"\n",
+  "test": "tests/hotkeyd.sh",
+  "expected_failure": "FAILED K4 knob:"
+ },
+ {
+  "file": "system_files/usr/libexec/blockie/blockie-hotkeyd",
+  "old": "                self.key_wake(key)\n",
+  "new": "                self.key_wake(key)\n                k.consumed = False\n",
+  "test": "tests/hotkeyd.sh",
+  "expected_failure": "FAILED K1 home:"
+ },
+ {
+  "file": "system_files/usr/libexec/blockie/blockie-hotkeyd",
+  "old": "        self.hold = self.grabbed\n",
+  "new": "",
+  "test": "tests/hotkeyd.sh",
+  "expected_failure": "FAILED K1 east:"
+ },
+ {
+  "file": "system_files/usr/libexec/blockie/blockie-hotkeyd",
+  "old": "        nodes += [(path, dev, ()) for path, (dev, _, _) in self.extra.items()]\n",
+  "new": "",
+  "test": "tests/hotkeyd.sh",
+  "expected_failure": "FAILED K1b touch still down:"
+ },
+ {
+  "file": "system_files/usr/libexec/blockie/blockie-hotkeyd",
+  "old": "        if self.hold is not None and mode == \"all\":\n            self.end_hold()\n",
+  "new": "",
+  "test": "tests/hotkeyd.sh",
+  "expected_failure": "FAILED K5 power tap in the hold:"
+ },
+ {
+  "file": "system_files/usr/libexec/blockie/blockie-hotkeyd",
+  "old": "        self.hold_timer = GLib.timeout_add(UP_MS, self.hold_over)\n",
+  "new": "",
+  "test": "tests/hotkeyd.sh",
+  "expected_failure": "FAILED K3 bound:"
+ },
+ {
+  "file": "system_files/usr/libexec/blockie/blockie-hotkeyd",
+  "old": "        if self.hold_timer:\n            GLib.source_remove(self.hold_timer)\n            self.hold_timer = 0\n        return mode\n\n    def hold_over(self):\n        self.hold_timer = 0\n        if self.hold is not None:\n",
+  "new": "        return mode\n\n    def hold_over(self):\n        self.hold_timer = 0\n        if True:\n",
+  "test": "tests/hotkeyd.sh",
+  "expected_failure": "FAILED K5 power tap in the hold:"
+ },
+ {
+  "file": "system_files/usr/libexec/blockie/blockie-hotkeyd",
+  "old": "UP_MS = min(int(os.environ.get(\"BLOCKIE_HOTKEYD_UP_MS\", \"1000\")), 1000)\n",
+  "new": "UP_MS = int(os.environ.get(\"BLOCKIE_HOTKEYD_UP_MS\", \"1000\"))\n",
+  "test": "tests/hotkeyd.sh",
+  "expected_failure": "FAIL defaults: the power off backstop 35000 ms"
+ },
+ {
+  "file": "system_files/usr/libexec/blockie/blockie-hotkeyd",
+  "old": "            self.hold = mode\n",
+  "new": "            self.hold = \"\"\n",
+  "test": "tests/hotkeyd.sh",
+  "expected_failure": "FAILED K2 pause:"
+ },
+ {
+  "file": "system_files/usr/libexec/blockie/blockie-hotkeyd",
+  "old": "            down = ev.type == evdev.ecodes.EV_ABS and ev.code in (ABS_HAT0X, ABS_HAT0Y) and ev.value != 0\n",
+  "new": "            down = False\n",
+  "test": "tests/hotkeyd.sh",
+  "expected_failure": "FAILED K1 hat:"
+ },
+ {
+  "file": "system_files/usr/libexec/blockie/blockie-hotkeyd",
+  "old": "            watch = GLib.io_add_watch(dev.fd, GLib.PRIORITY_DEFAULT, GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR,\n                                      self.extra_readable, path)\n",
+  "new": "            watch = 0\n",
+  "test": "tests/hotkeyd.sh",
+  "expected_failure": "FAILED K1 touch:"
+ },
+ {
+  "file": "system_files/usr/libexec/blockie/blockie-hotkeyd",
+  "old": "        except OSError:\n            return False\n\n    def hold_check(self):\n",
+  "new": "        except OSError:\n            return True\n\n    def hold_check(self):\n",
+  "test": "tests/hotkeyd.sh",
+  "expected_failure": "FAILED K1c touch keys error:"
+ },
+ {
+  "file": "system_files/usr/libexec/blockie/blockie-hotkeyd",
+  "old": "        return (self.wanted == \"blanked\" and self.idle_blank and usb_awake() and not self.draining\n                and path not in self.regrab)\n",
+  "new": "        return (self.wanted == \"blanked\" and self.idle_blank and usb_awake() and not self.draining)\n",
+  "test": "tests/hotkeyd.sh",
+  "expected_failure": "FAILED K1d retry set:"
+ },
+ {
+  "file": "system_files/usr/libexec/blockie/blockie-hotkeyd",
+  "old": "            self.regrab.pop(path, None)\n            self.close_extra(path)\n            log(f\"{path} gone\")\n",
+  "new": "            self.gone(path)\n",
+  "test": "tests/hotkeyd.sh",
+  "expected_failure": "FAILED K1e touch read error:"
+ },
+ {
+  "file": "system_files/usr/libexec/blockie/blockie-hotkeyd",
+  "old": "            log(f\"{path} gone\")\n            self.hold_check()\n            return False\n",
+  "new": "            log(f\"{path} gone\")\n            return False\n",
+  "test": "tests/hotkeyd.sh",
+  "expected_failure": "FAILED K1e touch read error:"
+ },
+ {
+  "file": "system_files/usr/libexec/blockie/blockie-hotkeyd",
+  "old": "            down = ev.value == 1 and ev.code != KEY_POWER\n",
+  "new": "            down = ev.code != KEY_POWER\n",
+  "test": "tests/hotkeyd.sh",
+  "expected_failure": "FAILED K4 value 0:"
+ },
+ {
+  "file": "system_files/usr/libexec/blockie/blockie-hotkeyd",
+  "old": "        return (self.wanted == \"blanked\" and self.idle_blank and usb_awake() and not self.draining\n",
+  "new": "        return (self.wanted == \"blanked\" and self.idle_blank and usb_awake()\n",
+  "test": "tests/hotkeyd.sh",
+  "expected_failure": "FAILED K4 draining:"
+ },
+ {
+  "file": "system_files/usr/libexec/blockie/blockie-hotkeyd",
+  "old": "        dev, _, watch = self.extra.pop(path)\n        if watch:\n            GLib.source_remove(watch)\n",
+  "new": "        dev, _, watch = self.extra.pop(path)\n",
+  "test": "tests/hotkeyd.sh",
+  "expected_failure": "FAILED K1 touch:"
+ },
+ {
+  "file": "system_files/usr/libexec/blockie/blockie-hotkeyd",
+  "old": "        if not any(self.node_down(dev, keys) for path, dev, keys in nodes if path not in self.regrab):\n",
+  "new": "        if not any(self.node_down(dev, keys) for path, dev, keys in nodes):\n",
+  "test": "tests/hotkeyd.sh",
+  "expected_failure": "FAILED K1h a node in the retry set holds nothing:"
+ },
+ {
+  "file": "system_files/usr/libexec/blockie/blockie-hotkeyd",
+  "old": "        for path in list(self.extra):\n            while path in self.extra:\n                try:\n                    list(self.extra[path][0].read())\n                except BlockingIOError:\n                    break\n                except OSError:\n                    self.regrab.pop(path, None)\n                    self.close_extra(path)\n                    log(f\"{path} gone\")\n",
+  "new": "",
+  "test": "tests/hotkeyd.sh",
+  "expected_failure": "FAILED K1g resume drains the extras:"
+ }
+]
