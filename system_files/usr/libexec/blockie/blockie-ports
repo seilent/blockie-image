@@ -97,6 +97,7 @@ APPS = os.path.join(STEAM_STATE, "apps.tsv")
 INHIBIT_PID = os.path.join(STEAM_STATE, "inhibit.pid")
 ACCOUNT = "account"
 UNIT = "blockie-steam-dd@{}.service"
+UNIT_DONE = ("inactive", "failed")
 OSES = ("windows", "linux", "macos")
 DIGITS = re.compile(r"[0-9]+")
 SHA1 = re.compile(r"[0-9a-f]{40}")
@@ -1452,18 +1453,19 @@ def clear_owned():
             remove(os.path.join(STEAM_STATE, n))
 
 
-def systemctl(*args, timeout=60, out=False):
+def systemctl(*args, timeout=60, out=False, quiet=False):
     try:
         r = subprocess.run([SYSTEMCTL, *args], stdin=subprocess.DEVNULL, capture_output=True, text=True,
                            timeout=timeout)
     except (OSError, subprocess.TimeoutExpired) as err:
-        log(f"systemctl {args[0]}: {type(err).__name__}")
+        if not quiet:
+            log(f"systemctl {args[0]}: {type(err).__name__}")
         return None
     return r.stdout.strip() if out else r.returncode
 
 
-def unit_active(inst):
-    return systemctl("is-active", "--quiet", UNIT.format(inst), timeout=10) == 0
+def unit_state(inst, quiet=False):
+    return systemctl("is-active", UNIT.format(inst), timeout=10, out=True, quiet=quiet)
 
 
 def stop_units():
@@ -1472,14 +1474,18 @@ def stop_units():
 
 def wait_inactive(inst, cancel):
     end = time.monotonic() + INACTIVE_S
-    while unit_active(inst):
+    said = False
+    while True:
+        state = unit_state(inst, said)
+        if state in UNIT_DONE:
+            return None
+        said = said or state is None
         if cancel and CANCEL[0]:
             return "cancel"
         if time.monotonic() >= end:
             log(f"{inst}: the unit is still active after {INACTIVE_S} s")
             return "other"
         time.sleep(0.1)
-    return None
 
 
 def request(inst, data):
@@ -1558,12 +1564,15 @@ def open_fifo(inst):
     path = os.path.join(STEAM_RUN, f"{inst}.fifo")
     uid = uid_of(STEAM_USER)
     end = time.monotonic() + 10
+    said = False
     while time.monotonic() < end and not CANCEL[0]:
         try:
             fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
         except FileNotFoundError:
-            if not unit_active(inst):
+            state = unit_state(inst, said)
+            if state in UNIT_DONE:
                 return None
+            said = said or state is None
             time.sleep(0.1)
             continue
         st = os.fstat(fd)
@@ -1684,7 +1693,13 @@ def steam_dd(proto, op, name, login, paths=None, total=None, extra=None, on_line
             now = time.monotonic()
             if first is None and now - alive >= 2:
                 alive = now
-                if not unit_active(inst):
+                state = unit_state(inst)
+                if state in UNIT_DONE:
+                    break
+                if not state:
+                    log(f"{inst}: the unit state is unreadable")
+                    run.stopped = "other"
+                    systemctl("stop", UNIT.format(inst), timeout=30)
                     break
                 try:
                     moved = os.stat(fifo).st_ino != os.fstat(fd).st_ino

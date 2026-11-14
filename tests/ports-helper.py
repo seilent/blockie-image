@@ -251,7 +251,8 @@ def last(lines):
 
 
 os.makedirs(FIX, exist_ok=True)
-tool("systemctl", f'#!/bin/sh\nexit "$(cat {T}/scope-rc)"\n')
+tool("systemctl", f'#!/bin/sh\nrc=$(cat {T}/scope-rc)\n'
+     '[ "$1" != is-active ] || { [ "$rc" = 0 ] && echo active || echo inactive; }\nexit "$rc"\n')
 tool("nmcli", f"#!/bin/sh\ncat {T}/nm\n")
 tool("unsquashfs", """#!/usr/bin/env python3
 import os

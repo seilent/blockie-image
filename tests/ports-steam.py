@@ -134,7 +134,7 @@ def setup(world=None, rows=(ROW,), apps=("alpha.zip\t900001\t" + "a" * 32,), lis
             shutil.rmtree(p)
     for p in (DDLOG, f"{T}/systemctl.log", f"{T}/inhibit.log", f"{T}/unit.log", f"{T}/dd-pass.count",
               f"{T}/dd-get.count", f"{T}/inhibit-refused", f"{T}/start-fails", f"{T}/start-noexec",
-              f"{T}/start-live", f"{T}/linger"):
+              f"{T}/start-live", f"{T}/linger", f"{T}/is-active"):
         if os.path.lexists(p):
             os.unlink(p)
     for d in (SSTATE, SDIR, DL, f"{SRUN}/req", RUN, f"{USR}/steam-files", f"{DATA}/cache/ports-tmp"):
@@ -1354,6 +1354,96 @@ def _(c):
         m.CANCEL[0] = False
         os.close(w)
         os.close(r)
+
+
+@case("the inactive wait reads the state: activating and deactivating keep it waiting until inactive or failed, an "
+      "unreadable state (empty, systemctl missing) waits out INACTIVE_S and ends other, a missing systemctl logged once")
+def _(c):
+    setup(signed=True)
+    state = f"{T}/is-active"
+    bin_ = m.SYSTEMCTL
+    timers = []
+    try:
+        m.INACTIVE_S = 3
+        for busy in ("activating", "deactivating"):
+            for done in ("inactive", "failed"):
+                write(state, busy + "\n")
+                timers.append(threading.Timer(0.5, write, (state, done + "\n")))
+                timers[-1].start()
+                t0 = time.monotonic()
+                why = m.wait_inactive("alpha.zip", False)
+                took = time.monotonic() - t0
+                c(why is None and 0.4 <= took < 2, f"{busy} then {done}: {why} after {took:.1f} s")
+        m.INACTIVE_S = 1
+        for what in ("empty", "missing"):
+            write(state, "")
+            if what == "missing":
+                m.SYSTEMCTL = f"{T}/no-systemctl"
+            LOG.clear()
+            t0 = time.monotonic()
+            why = m.wait_inactive("alpha.zip", False)
+            took = time.monotonic() - t0
+            m.SYSTEMCTL = bin_
+            said = sum(x == "systemctl is-active: FileNotFoundError" for x in LOG)
+            c(why == "other" and 1 <= took < 3 and any("still active after 1 s" in x for x in LOG) and
+              said == (what == "missing"), f"{what}: {why} after {took:.1f} s, {said} said {LOG[-2:]}")
+    finally:
+        for t in timers:
+            t.cancel()
+            t.join()
+        m.SYSTEMCTL = bin_
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(state)
+
+
+@case("before the first line an unreadable unit state (empty, systemctl missing) stops the unit and ends the run other "
+      "at once, not network at the stall bound")
+def _(c):
+    state = f"{T}/is-active"
+    bin_ = m.SYSTEMCTL
+    timers = []
+    r, w = os.pipe()
+    changed = []
+
+    def after_start(change):
+        end = time.monotonic() + 15
+        while not os.path.exists(f"{SRUN}/alpha.zip.fifo") and time.monotonic() < end:
+            time.sleep(0.05)
+        change()
+        changed.append(time.monotonic())
+
+    try:
+        for what in ("empty", "missing"):
+            setup({"pass": [{"loop": 10}]}, signed=True)
+            m.STALL_S = 6
+            if what == "empty":
+                change = lambda: write(state, "")
+            else:
+                change = lambda: setattr(m, "SYSTEMCTL", f"{T}/no-systemctl")
+            timers.append(threading.Timer(0, after_start, (change,)))
+            changed.clear()
+            timers[-1].start()
+            LOG.clear()
+            run = m.steam_dd(m.Proto(w), "pass", "alpha.zip", "token")
+            end = time.monotonic()
+            timers[-1].join()
+            took = end - changed[0] if changed else float("inf")
+            m.SYSTEMCTL = bin_
+            stops = [a for a in sctl() if a == ["stop", m.UNIT.format("alpha.zip")]]
+            c(run.stopped == "other" and m.outcome(run, "alpha.zip", "pass") == "other" and took < 5 and
+              "alpha.zip: the unit state is unreadable" in LOG and (bool(stops) or what == "missing"),
+              f"{what}: {run.stopped} after {took:.1f} s, stops {stops} {LOG[-3:]}")
+            subprocess.run([f"{BINS}/fake-systemctl", "stop", "blockie-steam-dd@*.service"], capture_output=True,
+                           timeout=60)
+    finally:
+        for t in timers:
+            t.cancel()
+            t.join()
+        m.SYSTEMCTL = bin_
+        os.close(w)
+        os.close(r)
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(state)
 
 
 @case("steam.tsv: line 2 is bound 0 with no binding row or an unreadable logins.tsv, else the latest end of the rate "

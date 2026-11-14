@@ -115,7 +115,14 @@ if cmd == "stop":
             stop(inst_of(u))
     sys.exit(0)
 if cmd == "is-active":
-    sys.exit(0 if pid_of(inst_of(a[-1])) is not None else 3)
+    i = inst_of(a[-1])
+    try:
+        with open(f"{T}/is-active") as f:
+            state = f.read().strip()
+    except FileNotFoundError:
+        state = "active" if pid_of(i) is not None else "inactive"
+    print(state)
+    sys.exit(0 if state in ("active", "reloading") else 3)
 if cmd == "show":
     print("1048576")
     sys.exit(0)
