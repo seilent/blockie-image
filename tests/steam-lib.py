@@ -13,6 +13,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tarfile
 import threading
 import time
 import traceback
@@ -54,6 +55,17 @@ a = sys.argv[1:]
 url = a[-1]
 with open("{T}/curl.log", "a") as f:
     f.write(url + "\\n")
+if "/apps/" not in url:
+    r = json.load(open("{T}/runner.json"))
+    if r.get("how") == "hang":
+        with open("{T}/curl.pid", "w") as f:
+            f.write(str(os.getpid()))
+        time.sleep(30)
+    if r.get("how") != "ok":
+        sys.exit(22)
+    with open(r["src"], "rb") as s, open(a[a.index("-o") + 1], "wb") as f:
+        f.write(s.read())
+    sys.exit(0)
 app = url.split("/apps/", 1)[1].split("/", 1)[0]
 how = json.load(open("{T}/curl.json")).get(app, "fail")
 if how == "hang":
@@ -194,7 +206,8 @@ GM = ["Invented", "assets/game.unx", "assets/audiogroup1.dat"]
 
 
 @case("the shipped engines.tsv loads whole after its header; *.node is firm on rmmz and rmmv, every Steamworks deny "
-      "provisional; corrections.tsv is its header only; no runner conf ships")
+      "provisional; corrections.tsv is its header only; runners.d holds no conf or only nwjs.conf, rmmz:windows "
+      "with a whole pin")
 def _(c):
     setup()
     rows = m.load_engines()
@@ -213,7 +226,14 @@ def _(c):
             c(f[5] == "-", f"{f[0]}:{f[1]}: no deny but {f[5]}")
     c(rd(f"{SHIP}/corrections.tsv") == "app\tgid\tclass\n" and m.load_corrections() == [] and not LOG,
       f"corrections {rd(f'{SHIP}/corrections.tsv')!r} {LOG[:3]}")
-    c(not os.path.exists(f"{SHIP}/runners.d"), "a runner conf ships before its gate")
+    shipped = sorted(os.listdir(f"{SHIP}/runners.d")) if os.path.isdir(f"{SHIP}/runners.d") else []
+    c(shipped in ([], ["nwjs.conf"]), f"runner confs {shipped}")
+    if shipped:
+        nw = f"{SHIP}/runners.d/nwjs.conf"
+        f = m.runner_fields(nw)
+        pin = m.runner_pin(nw)
+        c(f.get("CLASSES") == "rmmz:windows" and pin is not None and pin["url"].endswith(f"/{pin['file']}") and
+          pin["size"] < pin["unpacked"], f"nwjs.conf {f}")
 
 
 @case("engines.tsv loader: a bad os, root, deny status, an absolute or .. pattern and a % outside the first item "
@@ -1727,6 +1747,336 @@ def _(c):
     rc, out = call("steam-lib", "index")
     c(rc == 0 and rd(f"{PORTS}/.blockie/steam.tsv").splitlines() == ["signed\t0", f"bound\t{now + 600}"],
       f"{rc} {out} {rd(f'{PORTS}/.blockie/steam.tsv')!r}")
+
+
+def cancel_at_curl():
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(f"{T}/curl.pid")
+
+    def stop():
+        end = time.monotonic() + 20
+        while not os.path.exists(f"{T}/curl.pid") and time.monotonic() < end:
+            time.sleep(0.05)
+        m.CANCEL[0] = True
+    threading.Thread(target=stop, daemon=True).start()
+
+
+NWT = [("nwjs-invented", None, 0o755), ("nwjs-invented/nw", b"invented nw\n", 0o755),
+       ("nwjs-invented/lib", None, 0o755), ("nwjs-invented/lib/libinvented.so", b"invented lib\n", 0o644),
+       ("nwjs-invented/lib/libalias.so", ("sym", "libinvented.so"), 0o777)]
+NW_URL = "https://example.invalid/nwjs-invented.tar.gz"
+
+
+def runner_tar(entries, name="runner.tar.gz"):
+    path = f"{T}/{name}"
+    with tarfile.open(path, "w:gz") as tf:
+        for n, data, mode in entries:
+            ti = tarfile.TarInfo(n)
+            ti.mode = mode
+            if data is None:
+                ti.type = tarfile.DIRTYPE
+                tf.addfile(ti)
+            elif isinstance(data, tuple):
+                ti.type = {"sym": tarfile.SYMTYPE, "hard": tarfile.LNKTYPE, "fifo": tarfile.FIFOTYPE,
+                           "chr": tarfile.CHRTYPE}[data[0]]
+                ti.linkname = data[1] if len(data) > 1 else ""
+                tf.addfile(ti)
+            else:
+                ti.size = len(data)
+                tf.addfile(ti, io.BytesIO(data))
+    with open(path, "rb") as f:
+        raw = f.read()
+    return path, hashlib.sha256(raw).hexdigest(), len(raw)
+
+
+def runner_conf(sha, size, name="nwjs", classes="rmmz:windows", unpacked=25):
+    write(f"{USR}/runners.d/{name}.conf", f"CLASSES={classes}\nFILE=nwjs-invented.tar.gz\nURL={NW_URL}\n"
+                                          f"SHA256={sha}\nSIZE={size}\nUNPACKED={unpacked}\n")
+
+
+def serve(how="ok", src=None):
+    write(f"{T}/runner.json", json.dumps({"how": how, "src": src}))
+
+
+def runners():
+    try:
+        return sorted(os.listdir(f"{DATA}/steam-runners"))
+    except FileNotFoundError:
+        return []
+
+
+def curls():
+    try:
+        return [x for x in rd(f"{T}/curl.log").splitlines() if "/apps/" not in x]
+    except FileNotFoundError:
+        return []
+
+
+def nw_ready(files=None):
+    get_ready(files=files)
+    os.unlink(f"{USR}/runners.d/test.conf")
+    path, sha, size = runner_tar(NWT)
+    runner_conf(sha, size)
+    serve(src=path)
+    return sha
+
+
+@case("steam-lib runner: curl after the floor into steam-runners/.tmp-<pid>, size and sha256 checked, unpacked, "
+      "renamed to the sha256's first 16 with its size marker; progress runner from 0 to the size; a second call "
+      "fetches nothing; a temp of a gone pid is removed")
+def _(c):
+    setup()
+    e2e()
+    path, sha, size = runner_tar(NWT)
+    runner_conf(sha, size)
+    serve(src=path)
+    os.makedirs(f"{DATA}/steam-runners/.tmp-999999999/x")
+    rc, out = call("steam-lib", "runner", "nwjs")
+    dst = f"{DATA}/steam-runners/{sha[:16]}"
+    c(rc == 0 and out[-1] == "done\tnwjs", f"{rc} {out[-3:]} {LOG[-3:]}")
+    c(out[0] == f"progress\trunner\t0\t{size}" and f"progress\trunner\t{size}\t{size}" in out, f"{out}")
+    c(rd(f"{dst}/nw") == "invented nw\n" and stat.S_IMODE(os.stat(f"{dst}/nw").st_mode) == 0o755 and
+      os.readlink(f"{dst}/lib/libalias.so") == "libinvented.so", f"{sorted(os.listdir(dst))}")
+    c(rd(f"{dst}/.blockie-size") == "25 2\n" and runners() == [sha[:16]] and curls() == [NW_URL],
+      f"{runners()} {curls()}")
+    rc, out = call("steam-lib", "runner", "nwjs")
+    c(out == ["done\tnwjs"] and curls() == [NW_URL], f"{out} {curls()}")
+
+
+@case("steam-lib runner: a wrong sha256, a wrong size or a curl failure is fail runner with no temp and no runner dir, "
+      "and the next call fetches; two top dirs, a .. member or an absolute one is fail runner with nothing outside")
+def _(c):
+    setup()
+    e2e()
+    path, sha, size = runner_tar(NWT)
+    serve(src=path)
+    for bad in (("0" * 64, size), (sha, size + 1)):
+        runner_conf(*bad)
+        rc, out = call("steam-lib", "runner", "nwjs")
+        c(out[-1] == "fail\tnwjs\trunner" and runners() == [], f"{bad}: {out[-1:]} {runners()}")
+    runner_conf(sha, size)
+    serve("fail")
+    rc, out = call("steam-lib", "runner", "nwjs")
+    c(out[-1] == "fail\tnwjs\trunner" and runners() == [], f"curl fail: {out[-1:]} {runners()}")
+    serve(src=path)
+    rc, out = call("steam-lib", "runner", "nwjs")
+    c(out[-1] == "done\tnwjs" and runners() == [sha[:16]], f"retry: {out[-1:]} {runners()}")
+    for entries in (NWT + [("other/x", b"x", 0o644)], NWT + [("nwjs-invented/../x", b"x", 0o644)],
+                    [("/abs", b"x", 0o644)] + NWT):
+        p2, s2, z2 = runner_tar(entries, "bad.tar.gz")
+        runner_conf(s2, z2)
+        serve(src=p2)
+        rc, out = call("steam-lib", "runner", "nwjs")
+        c(out[-1] == "fail\tnwjs\trunner" and runners() == [sha[:16]] and not os.path.exists(f"{DATA}/x") and
+          not os.path.exists(f"{DATA}/other"), f"{[e[0] for e in entries[-1:]]}: {out[-1:]} {runners()}")
+
+
+@case("steam-lib runner: the tar data filter: a symlink to an absolute path or out by ../.. with a file written "
+      "through it, a hardlink out of the dir, a FIFO and a character device are each fail runner with nothing "
+      "written outside steam-runners and no runner dir")
+def _(c):
+    setup()
+    e2e()
+    out_dir = f"{T}/outside"
+    if os.path.lexists(out_dir):
+        shutil.rmtree(out_dir)
+    os.makedirs(out_dir)
+    write(f"{T}/victim", "invented victim")
+    base = NWT[:2]
+    for label, extra in (
+            ("absolute symlink", [("nwjs-invented/l", ("sym", out_dir), 0o777), ("nwjs-invented/l/x", b"x", 0o644)]),
+            ("../.. symlink", [("nwjs-invented/l", ("sym", "../../../../../../../../../../.." + out_dir), 0o777),
+                               ("nwjs-invented/l/x", b"x", 0o644)]),
+            ("outside hardlink", [("nwjs-invented/h", ("hard", "../../../../victim"), 0o644)]),
+            ("fifo", [("nwjs-invented/f", ("fifo",), 0o644)]),
+            ("character device", [("nwjs-invented/d", ("chr",), 0o644)])):
+        p2, s2, z2 = runner_tar(base + extra, "bad.tar.gz")
+        runner_conf(s2, z2)
+        serve(src=p2)
+        rc, out = call("steam-lib", "runner", "nwjs")
+        c(out[-1] == "fail\tnwjs\trunner" and runners() == [] and os.listdir(out_dir) == [] and
+          rd(f"{T}/victim") == "invented victim" and os.stat(f"{T}/victim").st_nlink == 1,
+          f"{label}: {out[-1:]} {runners()} {os.listdir(out_dir)} {LOG[-2:]}")
+
+
+@case("steam-lib runner: a stop during the download kills curl and ends fail nwjs cancel with no temp and no runner "
+      "dir; a stop in a get's runner fetch ends fail <app> cancel through the get's cancel clean")
+def _(c):
+    setup()
+    e2e()
+    path, sha, size = runner_tar(NWT)
+    runner_conf(sha, size)
+    serve("hang")
+    cancel_at_curl()
+    t0 = time.monotonic()
+    rc, out = call("steam-lib", "runner", "nwjs")
+    c(out[-1] == "fail\tnwjs\tcancel" and time.monotonic() - t0 < 10 and runners() == [], f"{out[-1:]} {runners()}")
+    pid = int(rd(f"{T}/curl.pid")) if os.path.exists(f"{T}/curl.pid") else None
+    c(pid is not None and not alive(pid), f"curl {pid} alive")
+    nw_ready()
+    serve("hang")
+    cancel_at_curl()
+    rc, out = call("steam-lib", "get", "9000201")
+    c(out[-1] == "fail\t9000201\tcancel" and not dd_runs("get") and runners() == [] and
+      not os.path.exists(f"{GAMES}/9000201/Game.exe"), f"{out[-2:]} {LOG[-3:]}")
+    c(not [n for n in os.listdir(DL) if n.startswith("app-9000201.")], f"the get's clean: {os.listdir(DL)}")
+
+
+@case("steam-lib runner: a damaged runner is fetched again; an unknown name, a name out of form and a conf with no "
+      "URL fail other with no fetch; a pin out of form fails runner; busy with a scope, network offline; under the "
+      "floor fail space with no fetch")
+def _(c):
+    setup()
+    e2e()
+    path, sha, size = runner_tar(NWT)
+    runner_conf(sha, size)
+    serve(src=path)
+    call("steam-lib", "runner", "nwjs")
+    dst = f"{DATA}/steam-runners/{sha[:16]}"
+    os.unlink(f"{dst}/lib/libinvented.so")
+    rc, out = call("steam-lib", "runner", "nwjs")
+    c(out[-1] == "done\tnwjs" and rd(f"{dst}/lib/libinvented.so") == "invented lib\n" and len(curls()) == 2,
+      f"{out[-1:]} {curls()}")
+    os.chmod(f"{dst}/nw", 0o644)
+    rc, out = call("steam-lib", "runner", "nwjs")
+    c(out[-1] == "done\tnwjs" and stat.S_IMODE(os.stat(f"{dst}/nw").st_mode) == 0o755 and len(curls()) == 3,
+      f"nw not executable: {out[-1:]} {curls()}")
+    write(f"{USR}/runners.d/built.conf", "CLASSES=rgss:windows\n")
+    for name in ("none", "../nwjs", "built"):
+        rc, out = call("steam-lib", "runner", name)
+        c(out == [f"fail\t{name}\tother"], f"{name}: {out}")
+    write(f"{USR}/runners.d/odd.conf", f"CLASSES=rmmv:windows\nURL=http://example.invalid/x\nSHA256={sha}\n")
+    rc, out = call("steam-lib", "runner", "odd")
+    c(out == ["fail\todd\trunner"], f"odd: {out}")
+    write(f"{T}/scope-rc", "0\n")
+    rc, out = call("steam-lib", "runner", "nwjs")
+    c(out == ["fail\tnwjs\tbusy"], f"busy: {out}")
+    write(f"{T}/scope-rc", "3\n")
+    write(f"{T}/nm", "wifi:disconnected\n")
+    rc, out = call("steam-lib", "runner", "nwjs")
+    c(out == ["fail\tnwjs\tnetwork"], f"offline: {out}")
+    write(f"{T}/nm", "wifi:connected\n")
+    m.remove(dst)
+    m.FLOOR = 1 << 62
+    try:
+        rc, out = call("steam-lib", "runner", "nwjs")
+    finally:
+        m.FLOOR = 0
+    c(out[-1] == "fail\tnwjs\tspace" and len(curls()) == 3 and runners() == [], f"floor: {out[-1:]} {curls()}")
+
+
+@case("steam-lib get with a fetched runner: after the pass the runner (progress runner) before the download; a "
+      "runner failure ends fail <app> runner with no game file, the next get fetches the runner and places the game")
+def _(c):
+    sha = nw_ready()
+    serve("fail")
+    rc, out = call("steam-lib", "get", "9000201")
+    c(out[-1] == "fail\t9000201\trunner" and len(dd_runs("pass")) == 1 and not dd_runs("get") and
+      not os.path.exists(f"{GAMES}/9000201/Game.exe") and runners() == [], f"{out[-3:]} {LOG[-3:]}")
+    serve(src=f"{T}/runner.tar.gz")
+    rc, out = call("steam-lib", "get", "9000201")
+    words = [x.split("\t")[1] for x in out if x.startswith("progress\t")]
+    c(out[-1] == "done\t9000201" and runners() == [sha[:16]] and os.path.isfile(f"{GAMES}/9000201/Game.exe"),
+      f"{out[-3:]} {LOG[-3:]}")
+    c("runner" in words and "download" in words and words.index("runner") < words.index("download") and
+      words.index("check") < words.index("runner"), f"{words}")
+    rc, out = call("steam-lib", "get", "9000201")
+    c(out[-1] == "done\t9000201" and len(curls()) == 2, f"{out[-1:]} {curls()}")
+
+
+PKG = json.dumps({"name": "rmmz-game", "main": "index.html", "chromium-args": "--force-color-profile=srgb",
+                  "node-remote": "*", "window": {"title": "", "width": 816, "height": 624, "position": "center"}})
+
+
+@case("the Blockie package.json: the get's last step writes name steam-nwjs, the depot's main, chromium-args and "
+      "window keys with fullscreen true, no other key; .got records its size and SHA1; the next get rewrites it with "
+      "no exists failure; remove deletes it; a runner conf not named nwjs leaves the depot's file")
+def _(c):
+    nw_ready(dict(GET, **{"package.json": PKG}))
+    rc, out = call("steam-lib", "get", "9000201")
+    pj = f"{GAMES}/9000201/package.json"
+    want = {"name": "steam-nwjs", "main": "index.html", "chromium-args": "--force-color-profile=srgb",
+            "window": {"title": "", "width": 816, "height": 624, "position": "center", "fullscreen": True}}
+    c(out[-1] == "done\t9000201" and json.loads(rd(pj)) == want, f"{out[-1:]} {rd(pj)} {LOG[-3:]}")
+    got = json.loads(rd(f"{GS}/9000201.got"))
+    c(got["files"]["9000201/package.json"] == [len(rd(pj).encode()), sha1(rd(pj))] and
+      "9000201/package.json" in got["placed"], f"{got['files'].get('9000201/package.json')}")
+    rc, out = call("steam-lib", "get", "9000201")
+    c(out[-1] == "done\t9000201" and json.loads(rd(pj)) == want, f"second get: {out[-1:]} {LOG[-3:]}")
+    rc, out = call("steam-lib", "remove", "9000201")
+    c(out == ["done\t9000201"] and not os.path.exists(pj) and not os.path.exists(f"{GS}/9000201.got"),
+      f"remove: {out} {os.path.exists(pj)}")
+    get_ready(dict(GET, **{"package.json": PKG}))
+    call("steam-lib", "get", "9000201")
+    c(rd(pj) == PKG, f"test.conf: {rd(pj)}")
+
+
+@case("the Blockie package.json from depot files out of form: a Package.json is replaced by package.json and "
+      "recorded so; chromium-args keeps only --force-color-profile=<token> (-host-rules=, a quoted --host-rules, "
+      "--class=, --remote-debugging-port= dropped, with one log line of the count) and js-flags is kept; a window "
+      "that is no dict, a main that is a URL, a file over 64 KiB or no JSON give name, index.html and window "
+      "fullscreen only")
+def _(c):
+    base = {k: v for k, v in GET.items() if k != "package.json"}
+    nw_ready(dict(base, **{"Package.json": PKG}))
+    rc, out = call("steam-lib", "get", "9000201")
+    files = sorted(os.listdir(f"{GAMES}/9000201"))
+    got = json.loads(rd(f"{GS}/9000201.got"))
+    c(out[-1] == "done\t9000201" and "package.json" in files and "Package.json" not in files and
+      json.loads(rd(f"{GAMES}/9000201/package.json"))["name"] == "steam-nwjs" and
+      "9000201/package.json" in got["files"] and "9000201/Package.json" not in got["files"] and
+      "9000201/package.json" in got["placed"], f"{out[-1:]} {files} {LOG[-3:]}")
+    rc, out = call("steam-lib", "get", "9000201")
+    files = sorted(os.listdir(f"{GAMES}/9000201"))
+    c(out[-1] == "done\t9000201" and "package.json" in files and "Package.json" not in files, f"again: {files}")
+    rc, out = call("steam-lib", "remove", "9000201")
+    c(out == ["done\t9000201"] and not os.path.exists(f"{GAMES}/9000201/package.json"), f"remove: {out}")
+    plain = {"name": "steam-nwjs", "main": "index.html", "window": {"fullscreen": True}}
+    args = ('-host-rules=MAP * 203.0.113.9 "--host-rules=MAP * x" --class=x --remote-debugging-port=9222 '
+            '--force-color-profile=srgb')
+    for label, body, want in (
+            ("allowlist", json.dumps({"main": "index.html", "chromium-args": args}),
+             {"name": "steam-nwjs", "main": "index.html", "chromium-args": "--force-color-profile=srgb",
+              "window": {"fullscreen": True}}),
+            ("conflicting args", json.dumps({"main": "index.html", "chromium-args": "--disable-gpu --x",
+                                             "js-flags": "--expose-gc"}),
+             {"name": "steam-nwjs", "main": "index.html", "js-flags": "--expose-gc", "window": {"fullscreen": True}}),
+            ("window no dict", json.dumps({"main": "index.html", "window": [1]}), plain),
+            ("main a URL", json.dumps({"main": "https://example.invalid/x.html"}), plain),
+            ("over 64 KiB", json.dumps({"main": "game.html", "pad": "x" * 70000}), plain),
+            ("no JSON", "invented, not JSON", plain)):
+        nw_ready(dict(GET, **{"package.json": body}))
+        rc, out = call("steam-lib", "get", "9000201")
+        c(out[-1] == "done\t9000201" and json.loads(rd(f"{GAMES}/9000201/package.json")) == want,
+          f"{label}: {out[-1:]} {rd(f'{GAMES}/9000201/package.json')[:200]}")
+        if label == "allowlist":
+            c(sum("chromium-args: 8 dropped" in x for x in LOG) == 1, f"allowlist log: {LOG[-4:]}")
+
+
+@case("the Blockie package.json from a Package.json depot: a replay after the depot file is gone reads the Blockie "
+      "file and keeps its window keys; a package.json the game changed is replaced and recorded with Blockie's own "
+      "size and SHA1, so remove deletes it")
+def _(c):
+    base = {k: v for k, v in GET.items() if k != "package.json"}
+    nw_ready(dict(base, **{"Package.json": PKG}))
+    call("steam-lib", "get", "9000201")
+    pj = f"{GAMES}/9000201/package.json"
+    before = json.loads(rd(pj))
+    data = {"placed": [["9000201/Package.json", len(PKG), sha1(PKG)]],
+            "got": {"depots": [], "class": "rmmz", "os": "windows", "root": ""}}
+    LOG.clear()
+    placed = m.nw_package("app-9000201", data)
+    c(placed == [["9000201/package.json", len(rd(pj).encode()), sha1(rd(pj))]] and json.loads(rd(pj)) == before and
+      before["window"]["width"] == 816 and not os.path.exists(f"{GAMES}/9000201/Package.json"),
+      f"replay: {placed} {rd(pj)} {LOG}")
+    write(pj, "changed by the game")
+    rc, out = call("steam-lib", "get", "9000201")
+    got = json.loads(rd(f"{GS}/9000201.got"))
+    c(out[-1] == "done\t9000201" and json.loads(rd(pj)) == before and
+      got["files"]["9000201/package.json"] == [len(rd(pj).encode()), sha1(rd(pj))] and
+      got["placed"].count("9000201/package.json") == 1, f"{out[-1:]} {got['files'].get('9000201/package.json')}")
+    rc, out = call("steam-lib", "remove", "9000201")
+    c(out == ["done\t9000201"] and not os.path.exists(pj), f"remove: {out} {os.path.exists(pj)}")
 
 
 print(f"steam-lib: {fails} failed" if fails else "steam-lib: python cases ok", flush=True)

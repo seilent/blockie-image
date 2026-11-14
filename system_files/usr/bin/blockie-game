@@ -13,11 +13,15 @@ buttons=${BLOCKIE_GAME_BUTTONS:-/run/blockie-set/buttons}
 input=${BLOCKIE_GAME_INPUT:-$data/retroarch/input.cfg}
 pdir=$data/roms/ports
 shims=/usr/libexec/blockie/ports/bin
+games=$data/steam-games
+runners=$data/steam-runners
+runnersd=/usr/share/blockie/steam/runners.d
 appre='^[A-Za-z0-9][A-Za-z0-9._-]*$'
 
 usage() { echo "usage: $me <system> <rompath> [--core <id>] [--config <file>] [--theme dark|light]" >&2; exit 64; }
 refuse() { echo "$me: $*" >&2; exit 64; }
 q() { printf '%q' "$1"; }
+field() { sed -n "s/^$1=//p" "$2" | tail -n 1; }
 die() { echo "$me: $*" >&2; exit 70; }
 
 declare -A default=([gb]=gambatte [gbc]=gambatte [nes]=nestopia [snes]=snes9x [genesis]=genesis_plus_gx [gba]=mgba
@@ -84,8 +88,8 @@ while (( $# )); do
   esac
 done
 
-if [[ $system == ports ]]; then
-  (( ! have_core && ! have_config )) || refuse "ports takes no --core or --config"
+if [[ $system == ports || $system == steam ]]; then
+  (( ! have_core && ! have_config )) || refuse "$system takes no --core or --config"
 else
   [[ $system =~ ^[a-z0-9]+$ && -n ${default[$system]:-} ]] || refuse "unknown system $(q "$system")"
   (( have_core )) || core=${default[$system]}
@@ -98,10 +102,56 @@ if [[ $system == ports ]]; then
   [[ $rom == "$pdir"/*.sh && ${rom#"$pdir"/} != */* && -f $rom && ! -L $rom &&
     $(realpath -e -- "$rom" 2> /dev/null) == "$rom" ]] || refuse "rompath $(q "$rom") is not a script in $pdir"
   real=$rom
+elif [[ $system == steam ]]; then
+  app=${rom#"$games"/}
+  [[ $rom == "$games"/* && $app =~ ^[0-9]+$ && -d $rom && ! -L $rom &&
+    $(realpath -e -- "$rom" 2> /dev/null) == "$rom" ]] || refuse "rompath $(q "$rom") is not a game dir in $games"
+  real=$rom
 else
   real=$(realpath -e -- "$rom" 2> /dev/null) || refuse "rompath $(q "$rom") does not exist"
   [[ $real == "$data"/* ]] || refuse "rompath $(q "$rom") is not under $data"
   [[ -f $real ]] || refuse "rompath $(q "$rom") is not a file"
+fi
+
+if [[ $system == steam ]]; then
+  got=$games/.blockie/$app.got
+  keys=()
+  jkeys='if ([.class, .os, .root] | map(type) | unique) == ["string"] then .class, .os, .root else empty end'
+  [[ -f $got && ! -L $got ]] && mapfile -t keys < <(jq -r "$jkeys" "$got" 2> /dev/null)
+  (( ${#keys[@]} == 3 )) && [[ ${keys[0]} =~ ^[a-z0-9][a-z0-9-]*$ && ${keys[1]} =~ ^(windows|linux)$ ]] ||
+    refuse "$(q "$got") does not name the class, OS and root of an installed game"
+  groot=${keys[2]}
+  [[ -z $groot ]] || [[ $groot != /* && $groot != *[[:cntrl:]]* && /$groot/ != *//* && /$groot/ != */./* &&
+    /$groot/ != */../* ]] || refuse "the root $(q "$groot") in $(q "$got") is not a relative path"
+  cwd=$rom${groot:+/$groot}
+  [[ -d $cwd && $(realpath -e -- "$cwd" 2> /dev/null) == "$cwd" ]] || refuse "the root $(q "$cwd") is not a dir"
+  conf=
+  mapfile -t confs < <(LC_ALL=C; shopt -s nullglob; printf '%s\n' "$runnersd"/*.conf)
+  for c in "${confs[@]}"; do
+    [[ -f $c && " $(field CLASSES "$c" | tr -d "\"'") " == *" ${keys[0]}:${keys[1]} "* ]] || continue
+    conf=$c
+    break
+  done
+  [[ -n $conf ]] || refuse "no runner conf names ${keys[0]}:${keys[1]}"
+  runner=${conf##*/}
+  runner=${runner%.conf}
+  [[ $runner == nwjs ]] || refuse "no launch for the runner $(q "$runner")"
+  sha=$(field SHA256 "$conf")
+  [[ $sha =~ ^[0-9a-f]{64}$ ]] || refuse "$conf has no SHA256"
+  rdir=$runners/${sha:0:16}
+  sum=0
+  n=0
+  wb=
+  wn=
+  if [[ -d $rdir && ! -L $rdir && -f $rdir/.blockie-size && -x $rdir/nw ]]; then
+    read -r wb wn _ < "$rdir/.blockie-size"
+    while read -r s; do
+      sum=$((sum + s))
+      n=$((n + 1))
+    done < <(find "$rdir" -type f ! -path "$rdir/.blockie-size" -printf '%s\n')
+  fi
+  [[ $wb =~ ^[0-9]+$ && $wn =~ ^[0-9]+$ && $wb == "$sum" && $wn == "$n" ]] ||
+    refuse "the $runner runner in $rdir is missing or not whole"
 fi
 
 lines=()
@@ -139,7 +189,7 @@ if (( have_config )); then
 fi
 
 so=$cores/${core}_libretro.so
-if [[ $system != ports && ! -f $so ]]; then
+if [[ $system != ports && $system != steam && ! -f $so ]]; then
   echo "$me: core $core is not installed ($so)" >&2
   exit 69
 fi
@@ -257,11 +307,8 @@ pstop() {
 }
 
 port() {
-  local log=$run/blockie-ports/last.log ptmp=$data/cache/ports-tmp/run snap line rc quit=0
-  local msg="WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-} XDG_RUNTIME_DIR=$run LD_LIBRARY_PATH=$gpulib BLOCKIE_THEME=$theme" v
-  for v in "${WAYLAND_DISPLAY:-}" "$run" "$gpulib" "$theme"; do
-    [[ $v =~ ^[A-Za-z0-9_./:@+,=-]*$ ]] || die "$(q "$v") has a space or a glob character, BLOCKIE_PORTMSG_ENV not built"
-  done
+  local log=$1 ptmp=$2 cwd=$3 snap line rc quit=0
+  shift 3
   pid=
   poll=
   rm -rf -- "${ptmp:?}" && mkdir -p -m 0700 -- "$ptmp" || die "cannot empty $ptmp"
@@ -279,13 +326,12 @@ port() {
   exec 3<> "$cmd" || die "cannot open $cmd"
   : > "$run/blockie-game.port" || die "cannot write $run/blockie-game.port"
   (
-    cd -- "$pdir" || exit
+    cd -- "$cwd" || exit
     umask 022
     exec systemd-run --user --scope --quiet --unit=blockie-game --collect --slice=blockie-emulation.slice \
       -p BindsTo=blockie-frontend.service -p After=blockie-frontend.service -p MemoryHigh=80% -p MemoryMax=90% \
       -p TasksMax=512 -p OOMPolicy=kill -p TimeoutStopSec=10s -- env -u XDG_CONFIG_HOME -u XDG_DATA_HOME \
-      -u XDG_CACHE_HOME -u SDL_AUDIODRIVER PATH="$shims:$PATH" HOME="$data/ports-home" TMPDIR="$ptmp" PM_CAN_MOUNT=N \
-      ALSA_CONFIG_PATH=/usr/share/blockie/ports/alsa.conf BLOCKIE_PORTMSG_ENV="$msg" BLOCKIE_GPULIB="$gpulib" bash "$real"
+      -u XDG_CACHE_HOME -u SDL_AUDIODRIVER "$@"
   ) < /dev/null > "$log" 2>&1 3<&- {lk}>&- &
   pid=$!
   appids "$pid" "$snap" < /dev/null > /dev/null 2>&1 3<&- {lk}>&- &
@@ -304,7 +350,23 @@ port() {
   (( rc != 137 || quit )) || exit 1
   exit 0
 }
-[[ $system != ports ]] || port
+if [[ $system == ports ]]; then
+  msg="WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-} XDG_RUNTIME_DIR=$run LD_LIBRARY_PATH=$gpulib BLOCKIE_THEME=$theme"
+  for v in "${WAYLAND_DISPLAY:-}" "$run" "$gpulib" "$theme"; do
+    [[ $v =~ ^[A-Za-z0-9_./:@+,=-]*$ ]] || die "$(q "$v") has a space or a glob character, BLOCKIE_PORTMSG_ENV not built"
+  done
+  ptmp=$data/cache/ports-tmp/run
+  port "$run/blockie-ports/last.log" "$ptmp" "$pdir" PATH="$shims:$PATH" HOME="$data/ports-home" TMPDIR="$ptmp" \
+    PM_CAN_MOUNT=N ALSA_CONFIG_PATH=/usr/share/blockie/ports/alsa.conf BLOCKIE_PORTMSG_ENV="$msg" \
+    BLOCKIE_GPULIB="$gpulib" bash "$real"
+elif [[ $system == steam ]]; then
+  stmp=$data/cache/steam-tmp/run
+  mkdir -p -m 0700 -- "$rom/.blockie/nw" || die "cannot make $rom/.blockie/nw"
+  port "$run/blockie-steam/last.log" "$stmp" "$cwd" HOME="$data/steam-home" TMPDIR="$stmp" \
+    ALSA_CONFIG_PATH=/usr/share/blockie/ports/alsa.conf LD_LIBRARY_PATH="$rdir/lib${gpulib:+:$gpulib}" "$rdir/nw" \
+    --ozone-platform=wayland --ignore-gpu-blocklist --use-gl=angle --use-angle=gles \
+    "--host-resolver-rules=MAP * ~NOTFOUND" --user-data-dir="$rom/.blockie/nw" --disk-cache-dir="$stmp/nw-cache" .
+fi
 
 if [[ -z $shader && $enable != false && -f $share/shader-defaults ]]; then
   n=0

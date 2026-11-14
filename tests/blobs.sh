@@ -30,6 +30,11 @@ confs=("$root"/usr/share/blockie/blobs.d/*.conf)
 for c in "${confs[@]}"; do
   grep -q '^SHA256=[0-9a-f]\{64\}$' "$c" || fail "${c##*/} has no SHA256= line"
 done
+for c in "$root"/usr/share/blockie/steam/runners.d/*.conf; do
+  grep -q '^URL=' "$c" || continue
+  grep -q '^SHA256=[0-9a-f]\{64\}$' "$c" || fail "runners.d/${c##*/} has a URL= line and no SHA256= line"
+  confs+=("$c")
+done
 if (( ${#confs[@]} )); then
   sums=$(find "$root/usr" "$root/etc" -xdev -type f -size +0 -exec sha256sum {} +)
   while read -r value; do

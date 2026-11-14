@@ -36,7 +36,7 @@ conf() {
 
 run() {
   BLOCKIE_BLOBS_D=$d/blobs.d BLOCKIE_BLOBS=$d/store BLOCKIE_GPU=$d/gpu BLOCKIE_GPU_RUN=$d/run \
-    BLOCKIE_SYSROOT=$d/sysroot BLOCKIE_ICD_DIR=$d/share "$script" "$@" > "$d/out" 2>&1
+    BLOCKIE_SYSROOT=$d/sysroot BLOCKIE_ICD_DIR=$d/share BLOCKIE_STEAM_RUNNERS=$d/runners "$script" "$@" > "$d/out" 2>&1
   rc=$?
 }
 
@@ -132,6 +132,49 @@ conf "$dep/$(printf 'b%.0s' {1..64}).0/usr/share/blockie/blobs.d/test-gpu.conf" 
 run prune
 [[ $rc == 0 && -f $d/store/sha256/$h1 && -f $d/store/sha256/$h3 && ! -e $d/store/sha256/$h2 && -e $d/store/sha256/$h2.part ]]
 res $? "prune: keeps every deployment's blobs, removes an unlisted one, leaves a .part"
+
+runner() {
+  mkdir -p "$1"
+  printf '%s\n' CLASSES=rmmz:windows FILE=invented.tar.gz URL=https://example.invalid/invented.tar.gz "SHA256=$2" \
+    SIZE=1 UNPACKED=1 > "$1/$3.conf"
+}
+x16() { printf "$1%.0s" {1..16}; }
+
+setup prune-runners
+dep=$d/sysroot/ostree/deploy/default/deploy
+da=$dep/$(printf 'a%.0s' {1..64}).0
+db=$dep/$(printf 'b%.0s' {1..64}).0
+mkdir -p "$da/usr/share/blockie/blobs.d" "$db/usr/share/blockie/blobs.d"
+conf "$da/usr/share/blockie/blobs.d/test-gpu.conf" "$h1" 1
+conf "$db/usr/share/blockie/blobs.d/test-gpu.conf" "$h1" 1
+ra=$(printf '1%.0s' {1..64})
+rb=$(printf '2%.0s' {1..64})
+runner "$da/usr/share/blockie/steam/runners.d" "$ra" nwjs
+runner "$db/usr/share/blockie/steam/runners.d" "$rb" nwjs
+printf 'CLASSES=rgss:windows\nSHA256=%s\n' "$(printf '3%.0s' {1..64})" \
+  > "$db/usr/share/blockie/steam/runners.d/built.conf"
+mkdir -p "$d/runners/${ra:0:16}/lib" "$d/runners/${rb:0:16}" "$d/runners/$(x16 3)" "$d/runners/$(x16 4)/lib" \
+  "$d/runners/.tmp-1" "$d/runners/other" "$d/outside"
+: > "$d/runners/${ra:0:16}/lib/libinvented.so"
+: > "$d/outside/keep"
+ln -s "$d/outside" "$d/runners/$(x16 5)"
+run prune
+[[ $rc == 0 && -d $d/runners/${ra:0:16}/lib && -d $d/runners/${rb:0:16} && ! -e $d/runners/$(x16 3) ]] &&
+  [[ ! -e $d/runners/$(x16 4) && -d $d/runners/.tmp-1 && -d $d/runners/other && -f $d/outside/keep ]] &&
+  [[ -L $d/runners/$(x16 5) && -f $d/store/sha256/$h1 ]] && grep -q "kept 1 listed blobs and 2 runners" "$d/out"
+res $? "prune: keeps the runners any deployment's runners.d names by URL and SHA256, removes an unnamed one and one only a conf with no URL names, leaves a temp, another name and a symlink"
+
+setup prune-runner-bad
+dep=$d/sysroot/ostree/deploy/default/deploy
+da=$dep/$(printf 'a%.0s' {1..64}).0
+mkdir -p "$da/usr/share/blockie/blobs.d" "$d/runners/$(x16 4)"
+conf "$da/usr/share/blockie/blobs.d/test-gpu.conf" "$h1" 1
+h2=$(printf 'invented old blob\n' | tee "$d/store/sha256/x" | sha256sum | cut -d' ' -f1)
+mv "$d/store/sha256/x" "$d/store/sha256/$h2"
+runner "$da/usr/share/blockie/steam/runners.d" "../../etc" nwjs
+run prune
+[[ $rc == 1 && -f $d/store/sha256/$h2 && -d $d/runners/$(x16 4) ]] && grep -q "SHA256" "$d/out"
+res $? "prune: a runner conf with a URL and a SHA256 that is no hash refuses before anything is removed"
 
 setup prune-none
 run prune

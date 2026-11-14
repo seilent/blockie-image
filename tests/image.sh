@@ -55,7 +55,8 @@ grep -qx 'd /var/home/blockie 0700 blockie blockie -' /usr/lib/tmpfiles.d/blocki
   getent group blockie > /dev/null || fail "/dev/uinput is not 0660 to the blockie group"
 cmp -s <(printf 'd /var/lib/blockie/data/%s\n' 'cache 0755 blockie blockie -' 'roms 0755 root root -' \
   'roms/ports 0755 blockie blockie -' 'ports-home 0700 blockie blockie -' 'cache/ports-tmp 0700 blockie blockie -') \
-  <(grep -E '^d /var/lib/blockie/data/(cache|roms|ports-home)[/ ]' /usr/lib/blockie/data-tmpfiles.conf) ||
+  <(grep -E '^d /var/lib/blockie/data/(cache|roms|roms/ports|ports-home|cache/ports-tmp) ' \
+    /usr/lib/blockie/data-tmpfiles.conf) ||
   fail "the data tmpfiles do not make cache, roms, roms/ports, ports-home and cache/ports-tmp in that order"
 [[ -s /usr/share/blockie/ports/alsa.conf ]] || fail "the ports alsa.conf is missing"
 for p in /var/cache/libX11 /var/cache/libX11/compose /var/lib/alsa /var/lib/bluetooth /var/lib/bluetooth/mesh /var/lib/geoclue \
@@ -76,6 +77,7 @@ rpm -q e2fsprogs tzdata erofs-utils vulkan-tools egl-utils drm-utils strace file
   alsa-utils retroarch libretro-mgba libretro-pcsx-rearmed kmscube glmark2 > /dev/null || fail "packages missing"
 rpm -q gptokeyb gptokeyb2 portmaster SDL2_mixer SDL2_ttf SDL2_image love luajit innoextract xdelta turbojpeg \
   7zip-standalone-all squashfs-tools sdl2-compat openal-soft libtheora libvorbis libjpeg8 > /dev/null || fail "ports packages missing"
+rpm -q libatomic > /dev/null || fail "libatomic missing (the NW.js runner's libnode dlopens it)"
 compat=/usr/lib64/blockie-ports/compat
 [[ -f $compat/libjpeg.so.8 && $(rpm -qf --qf '%{NAME}' "$compat/libjpeg.so.8") == libjpeg8 ]] &&
   grep -qaF LIBJPEG_8.0 "$compat/libjpeg.so.8" || fail "$compat/libjpeg.so.8 is not libjpeg8's LIBJPEG_8.0 library"
