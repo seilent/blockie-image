@@ -16,6 +16,7 @@ Source0:        gl4es-%{commit}.tar.gz
 Patch0:         egl-attrib-ptr.patch
 Patch1:         egl15-forward.patch
 Patch2:         egl-no-error.patch
+Patch3:         debug-fbo.patch
 BuildRequires:  gcc
 BuildRequires:  cmake
 BuildRequires:  ninja-build
