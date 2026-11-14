@@ -15,7 +15,7 @@ grep -Eqx "Release: +[0-9]+\.${day}git%\{shortcommit\}%\{\?dist\}" "$spec" || { 
 top=/var/tmp/gl4es-build
 mkdir -p "$top/SOURCES"
 cp "/srcpkg/$SOURCE_TAR" "$top/SOURCES/"
-cp "$src/egl-attrib-ptr.patch" "$src/egl15-forward.patch" "$src/egl-no-error.patch" "$src/debug-fbo.patch" "$top/SOURCES/"
+cp "$src/egl-attrib-ptr.patch" "$src/egl15-forward.patch" "$src/egl-no-error.patch" "$src/fbo-probe.patch" "$top/SOURCES/"
 rpmbuild -bb \
   --define "_topdir $top" \
   --define "_buildhost blockie" \
