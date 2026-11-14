@@ -59,7 +59,8 @@ for s in glXCreateContext glXMakeCurrent glXSwapBuffers glBegin glGetString; do
   grep -qxF "$s" <<< "$syms" || fail "libGL.so.1 does not export $s"
 done
 syms=$(readelf --dyn-syms -W "$t$dir/egl/libEGL.so.1" | awk '$7 != "UND" { print $8 }')
-for s in eglGetDisplay eglBindAPI eglCreateContext; do
+for s in eglGetDisplay eglBindAPI eglCreateContext eglClientWaitSync eglCreateImage eglCreatePlatformPixmapSurface \
+  eglCreatePlatformWindowSurface eglCreateSync eglDestroyImage eglDestroySync eglGetSyncAttrib eglWaitSync; do
   grep -qxF "$s" <<< "$syms" || fail "libEGL.so.1 does not export $s"
 done
 both=0

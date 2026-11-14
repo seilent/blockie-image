@@ -83,9 +83,11 @@ line endings made LF) and codebude/QRCoder (v1.6.0); Apache-2.0.txt is the Apach
 packages/gl4es: gl4es (https://github.com/ptitSeb/gl4es, 8b1a3da, MIT, Copyright (c) 2016-2018 Sebastien Chevalier and
 (c) 2013-2016 Ryan Hileman), built into /usr/lib64/gl4es with egl-attrib-ptr.patch: eglGetPlatformDisplay takes EGL
 1.5's EGLAttrib list and copies it to an EGLint list when only the EXT entry resolves, and the exported
-eglGetPlatformDisplayEXT takes an EGLint list and copies it to EGLAttrib. It holds MIT code by Matthäus G. Chajdas,
-Benjamin Dobell, Attractive Chaos and Brian Paul (Mesa), and public domain stb_dxt; their notices are in
-/usr/share/licenses/gl4es/THIRD-PARTY beside LICENSE.
+eglGetPlatformDisplayEXT takes an EGLint list and copies it to EGLAttrib; with egl15-forward.patch the EGL wrapper
+exports and looks up EGL 1.5's sync, image and platform surface calls, passed to the GPU's EGL; with egl-no-error.patch
+a display's extension string carries EGL_KHR_create_context_no_error, whose hint the wrapper's ES2 context ignores. It
+holds MIT code by Matthäus G. Chajdas, Benjamin Dobell, Attractive Chaos and Brian Paul (Mesa), and public domain
+stb_dxt; their notices are in /usr/share/licenses/gl4es/THIRD-PARTY beside LICENSE.
 packages/box64: Box64 (https://github.com/ptitSeb/box64, v0.4.4 2f130fa, MIT, Copyright (c) 2020 ptitSeb), built twice
 into /usr/bin/box64 (generic ARM64) and /usr/bin/box64-sd845 (SD845), with system/box64.box64rc as /etc/box64.box64rc.
 It holds elfhacks by Pyry Haulos (Zlib), Realmode X86 Emulator Library code by SciTech Software, David Mosberger-Tang,

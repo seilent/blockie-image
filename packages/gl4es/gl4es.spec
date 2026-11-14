@@ -14,6 +14,8 @@ License:        MIT AND LicenseRef-Fedora-Public-Domain
 URL:            https://github.com/ptitSeb/gl4es
 Source0:        gl4es-%{commit}.tar.gz
 Patch0:         egl-attrib-ptr.patch
+Patch1:         egl15-forward.patch
+Patch2:         egl-no-error.patch
 BuildRequires:  gcc
 BuildRequires:  cmake
 BuildRequires:  ninja-build

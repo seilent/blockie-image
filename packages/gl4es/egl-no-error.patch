@@ -1,0 +1,72 @@
+diff --git a/src/egl/egl.c b/src/egl/egl.c
+index 0c8b325..4f8a888 100644
+--- a/src/egl/egl.c
++++ b/src/egl/egl.c
+@@ -1,4 +1,8 @@
+ 
++#include <pthread.h>
++#include <stdlib.h>
++#include <string.h>
++
+ #include "egl.h"
+ #include "../gl/loader.h"
+ #include "../glx/hardext.h"
+@@ -36,9 +40,57 @@ EGLBoolean gl4es_eglTerminate(EGLDisplay dpy) {
+     return egl_eglTerminate(dpy);
+ }
+ 
++#define NO_ERROR_EXTENSION "EGL_KHR_create_context_no_error"
++#define DISPLAY_EXTENSIONS_MAX 8
++
++static pthread_mutex_t display_extensions_lock = PTHREAD_MUTEX_INITIALIZER;
++static struct {
++    EGLDisplay dpy;
++    const char *base;
++    char *str;
++} display_extensions[DISPLAY_EXTENSIONS_MAX];
++
++static int has_extension(const char *list, const char *ext) {
++    size_t len = strlen(ext);
++    const char *p = list;
++    while ((p = strstr(p, ext))) {
++        if ((p == list || p[-1] == ' ') && (p[len] == ' ' || p[len] == '\0'))
++            return 1;
++        p += len;
++    }
++    return 0;
++}
++
+ const char * gl4es_eglQueryString(EGLDisplay dpy, EGLint name) {
+     LOAD_EGL(eglQueryString);
+-    return egl_eglQueryString(dpy, name);
++    const char *s = egl_eglQueryString(dpy, name);
++    if (!s || name != EGL_EXTENSIONS || dpy == EGL_NO_DISPLAY || has_extension(s, NO_ERROR_EXTENSION))
++        return s;
++    const char *ret = s;
++    pthread_mutex_lock(&display_extensions_lock);
++    for (int i = 0; i < DISPLAY_EXTENSIONS_MAX; i++) {
++        if (display_extensions[i].dpy == dpy && display_extensions[i].base == s) {
++            ret = display_extensions[i].str;
++            break;
++        }
++        if (!display_extensions[i].dpy) {
++            size_t len = strlen(s);
++            char *str = malloc(len + sizeof(NO_ERROR_EXTENSION) + 1);
++            if (str) {
++                memcpy(str, s, len);
++                if (len && s[len - 1] != ' ')
++                    str[len++] = ' ';
++                memcpy(str + len, NO_ERROR_EXTENSION, sizeof(NO_ERROR_EXTENSION));
++                display_extensions[i].dpy = dpy;
++                display_extensions[i].base = s;
++                display_extensions[i].str = str;
++                ret = str;
++            }
++            break;
++        }
++    }
++    pthread_mutex_unlock(&display_extensions_lock);
++    return ret;
+ }
+ 
+ EGLBoolean gl4es_eglGetConfigs(EGLDisplay dpy, EGLConfig *configs, EGLint config_size, EGLint *num_config) {

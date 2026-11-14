@@ -1,0 +1,156 @@
+diff --git a/src/egl/egl.c b/src/egl/egl.c
+index b747e6a..0c8b325 100644
+--- a/src/egl/egl.c
++++ b/src/egl/egl.c
+@@ -252,6 +252,51 @@ EGLint gl4es_eglClientWaitSyncKHR(EGLDisplay dpy, EGLSyncKHR sync, EGLint flags,
+     return egl_eglClientWaitSyncKHR(dpy, sync, flags, timeout);
+ }
+ 
++EGLint gl4es_eglClientWaitSync(EGLDisplay dpy, EGLSync sync, EGLint flags, EGLTime timeout) {
++    LOAD_EGL(eglClientWaitSync);
++    return egl_eglClientWaitSync(dpy, sync, flags, timeout);
++}
++
++EGLImage gl4es_eglCreateImage(EGLDisplay dpy, EGLContext ctx, EGLenum target, EGLClientBuffer buffer, const EGLAttrib *attrib_list) {
++    LOAD_EGL(eglCreateImage);
++    return egl_eglCreateImage(dpy, ctx, target, buffer, attrib_list);
++}
++
++EGLSurface gl4es_eglCreatePlatformPixmapSurface(EGLDisplay dpy, EGLConfig config, void *native_pixmap, const EGLAttrib *attrib_list) {
++    LOAD_EGL(eglCreatePlatformPixmapSurface);
++    return egl_eglCreatePlatformPixmapSurface(dpy, config, native_pixmap, attrib_list);
++}
++
++EGLSurface gl4es_eglCreatePlatformWindowSurface(EGLDisplay dpy, EGLConfig config, void *native_window, const EGLAttrib *attrib_list) {
++    LOAD_EGL(eglCreatePlatformWindowSurface);
++    return egl_eglCreatePlatformWindowSurface(dpy, config, native_window, attrib_list);
++}
++
++EGLSync gl4es_eglCreateSync(EGLDisplay dpy, EGLenum type, const EGLAttrib *attrib_list) {
++    LOAD_EGL(eglCreateSync);
++    return egl_eglCreateSync(dpy, type, attrib_list);
++}
++
++EGLBoolean gl4es_eglDestroyImage(EGLDisplay dpy, EGLImage image) {
++    LOAD_EGL(eglDestroyImage);
++    return egl_eglDestroyImage(dpy, image);
++}
++
++EGLBoolean gl4es_eglDestroySync(EGLDisplay dpy, EGLSync sync) {
++    LOAD_EGL(eglDestroySync);
++    return egl_eglDestroySync(dpy, sync);
++}
++
++EGLBoolean gl4es_eglGetSyncAttrib(EGLDisplay dpy, EGLSync sync, EGLint attribute, EGLAttrib *value) {
++    LOAD_EGL(eglGetSyncAttrib);
++    return egl_eglGetSyncAttrib(dpy, sync, attribute, value);
++}
++
++EGLBoolean gl4es_eglWaitSync(EGLDisplay dpy, EGLSync sync, EGLint flags) {
++    LOAD_EGL(eglWaitSync);
++    return egl_eglWaitSync(dpy, sync, flags);
++}
++
+ NativePixmapType gl4es_egl_create_pixmap_ID_mapping(void *pixmap)
+ {
+     LOAD_EGL(egl_create_pixmap_ID_mapping);
+@@ -302,6 +347,15 @@ AliasExport(EGLBoolean, eglCopyBuffers,,(EGLDisplay dpy, EGLSurface surface, EGL
+ AliasExport(EGLSyncKHR, eglCreateSyncKHR,,(EGLDisplay dpy, EGLenum type, const EGLint *attrib_list));
+ AliasExport(EGLSyncKHR, eglDestroySyncKHR,,(EGLDisplay dpy, EGLSyncKHR sync));
+ AliasExport(EGLint, eglClientWaitSyncKHR,,(EGLDisplay dpy, EGLSyncKHR sync, EGLint flags, EGLTimeKHR timeout));
++AliasExport(EGLint, eglClientWaitSync,,(EGLDisplay dpy, EGLSync sync, EGLint flags, EGLTime timeout));
++AliasExport(EGLImage, eglCreateImage,,(EGLDisplay dpy, EGLContext ctx, EGLenum target, EGLClientBuffer buffer, const EGLAttrib *attrib_list));
++AliasExport(EGLSurface, eglCreatePlatformPixmapSurface,,(EGLDisplay dpy, EGLConfig config, void *native_pixmap, const EGLAttrib *attrib_list));
++AliasExport(EGLSurface, eglCreatePlatformWindowSurface,,(EGLDisplay dpy, EGLConfig config, void *native_window, const EGLAttrib *attrib_list));
++AliasExport(EGLSync, eglCreateSync,,(EGLDisplay dpy, EGLenum type, const EGLAttrib *attrib_list));
++AliasExport(EGLBoolean, eglDestroyImage,,(EGLDisplay dpy, EGLImage image));
++AliasExport(EGLBoolean, eglDestroySync,,(EGLDisplay dpy, EGLSync sync));
++AliasExport(EGLBoolean, eglGetSyncAttrib,,(EGLDisplay dpy, EGLSync sync, EGLint attribute, EGLAttrib *value));
++AliasExport(EGLBoolean, eglWaitSync,,(EGLDisplay dpy, EGLSync sync, EGLint flags));
+ 
+ AliasExport(NativePixmapType, egl_create_pixmap_ID_mapping,,(void *pixmap));
+ AliasExport(NativePixmapType, egl_destroy_pixmap_ID_mapping,,(int id));
+\ No newline at end of file
+diff --git a/src/egl/egl.h b/src/egl/egl.h
+index 1c32956..9de91d5 100644
+--- a/src/egl/egl.h
++++ b/src/egl/egl.h
+@@ -52,6 +52,15 @@ void* gl4es_eglGetProcAddress(const char *name);
+ EGLSyncKHR gl4es_eglCreateSyncKHR(EGLDisplay dpy, EGLenum type, const EGLint *attrib_list);
+ EGLSyncKHR gl4es_eglDestroySyncKHR(EGLDisplay dpy, EGLSyncKHR sync);
+ EGLint gl4es_eglClientWaitSyncKHR(EGLDisplay dpy, EGLSyncKHR sync, EGLint flags, EGLTimeKHR timeout);
++EGLint gl4es_eglClientWaitSync(EGLDisplay dpy, EGLSync sync, EGLint flags, EGLTime timeout);
++EGLImage gl4es_eglCreateImage(EGLDisplay dpy, EGLContext ctx, EGLenum target, EGLClientBuffer buffer, const EGLAttrib *attrib_list);
++EGLSurface gl4es_eglCreatePlatformPixmapSurface(EGLDisplay dpy, EGLConfig config, void *native_pixmap, const EGLAttrib *attrib_list);
++EGLSurface gl4es_eglCreatePlatformWindowSurface(EGLDisplay dpy, EGLConfig config, void *native_window, const EGLAttrib *attrib_list);
++EGLSync gl4es_eglCreateSync(EGLDisplay dpy, EGLenum type, const EGLAttrib *attrib_list);
++EGLBoolean gl4es_eglDestroyImage(EGLDisplay dpy, EGLImage image);
++EGLBoolean gl4es_eglDestroySync(EGLDisplay dpy, EGLSync sync);
++EGLBoolean gl4es_eglGetSyncAttrib(EGLDisplay dpy, EGLSync sync, EGLint attribute, EGLAttrib *value);
++EGLBoolean gl4es_eglWaitSync(EGLDisplay dpy, EGLSync sync, EGLint flags);
+ 
+ // Undocumented libmali internals, needed for ODROID Go Ultra
+ NativePixmapType gl4es_egl_create_pixmap_ID_mapping(void *pixmap);
+diff --git a/src/egl/lookup.c b/src/egl/lookup.c
+index 9427ac3..1d8cfe0 100644
+--- a/src/egl/lookup.c
++++ b/src/egl/lookup.c
+@@ -57,6 +57,15 @@ void* gl4es_eglGetProcAddress(const char *name) {
+     _EX(eglCreateSyncKHR);
+     _EX(eglDestroySyncKHR);
+     _EX(eglClientWaitSyncKHR);
++    _EX(eglClientWaitSync);
++    _EX(eglCreateImage);
++    _EX(eglCreatePlatformPixmapSurface);
++    _EX(eglCreatePlatformWindowSurface);
++    _EX(eglCreateSync);
++    _EX(eglDestroyImage);
++    _EX(eglDestroySync);
++    _EX(eglGetSyncAttrib);
++    _EX(eglWaitSync);
+ 
+     _EX(egl_create_pixmap_ID_mapping);
+     _EX(egl_destroy_pixmap_ID_mapping);
+diff --git a/src/gl/loader.h b/src/gl/loader.h
+index a744fa4..32e291f 100644
+--- a/src/gl/loader.h
++++ b/src/gl/loader.h
+@@ -14,15 +14,21 @@
+ typedef EGLBoolean (*eglBindAPI_PTR)(EGLenum api);
+ typedef EGLBoolean (*eglBindTexImage_PTR)(EGLDisplay dpy, EGLSurface surface, EGLint buffer);
+ typedef EGLBoolean (*eglChooseConfig_PTR)(EGLDisplay dpy, const EGLint * attrib_list, EGLConfig * configs, EGLint config_size, EGLint * num_config);
++typedef EGLint (*eglClientWaitSync_PTR)(EGLDisplay dpy, EGLSync sync, EGLint flags, EGLTime timeout);
+ typedef EGLBoolean (*eglCopyBuffers_PTR)(EGLDisplay dpy, EGLSurface surface, EGLNativePixmapType target);
+ typedef EGLContext (*eglCreateContext_PTR)(EGLDisplay dpy, EGLConfig config, EGLContext share_context, const EGLint * attrib_list);
++typedef EGLImage (*eglCreateImage_PTR)(EGLDisplay dpy, EGLContext ctx, EGLenum target, EGLClientBuffer buffer, const EGLAttrib * attrib_list);
+ typedef EGLSurface (*eglCreatePbufferFromClientBuffer_PTR)(EGLDisplay dpy, EGLenum buftype, EGLClientBuffer buffer, EGLConfig config, const EGLint * attrib_list);
+ typedef EGLSurface (*eglCreatePbufferSurface_PTR)(EGLDisplay dpy, EGLConfig config, const EGLint * attrib_list);
+ typedef EGLSurface (*eglCreatePixmapSurface_PTR)(EGLDisplay dpy, EGLConfig config, EGLNativePixmapType pixmap, const EGLint * attrib_list);
+-typedef EGLSurface (*eglCreatePlatformWindowSurface_PTR)(EGLDisplay display, EGLConfig config, void * native_window, const EGLint * attrib_list);
++typedef EGLSurface (*eglCreatePlatformPixmapSurface_PTR)(EGLDisplay dpy, EGLConfig config, void * native_pixmap, const EGLAttrib * attrib_list);
++typedef EGLSurface (*eglCreatePlatformWindowSurface_PTR)(EGLDisplay dpy, EGLConfig config, void * native_window, const EGLAttrib * attrib_list);
++typedef EGLSync (*eglCreateSync_PTR)(EGLDisplay dpy, EGLenum type, const EGLAttrib * attrib_list);
+ typedef EGLSurface (*eglCreateWindowSurface_PTR)(EGLDisplay dpy, EGLConfig config, EGLNativeWindowType win, const EGLint * attrib_list);
+ typedef EGLBoolean (*eglDestroyContext_PTR)(EGLDisplay dpy, EGLContext ctx);
++typedef EGLBoolean (*eglDestroyImage_PTR)(EGLDisplay dpy, EGLImage image);
+ typedef EGLBoolean (*eglDestroySurface_PTR)(EGLDisplay dpy, EGLSurface surface);
++typedef EGLBoolean (*eglDestroySync_PTR)(EGLDisplay dpy, EGLSync sync);
+ typedef EGLBoolean (*eglGetConfigAttrib_PTR)(EGLDisplay dpy, EGLConfig config, EGLint attribute, EGLint * value);
+ typedef EGLBoolean (*eglGetConfigs_PTR)(EGLDisplay dpy, EGLConfig * configs, EGLint config_size, EGLint * num_config);
+ typedef EGLContext (*eglGetCurrentContext_PTR)();
+@@ -33,6 +39,7 @@ typedef EGLDisplay (*eglGetPlatformDisplay_PTR)(EGLenum platform, void * native_
+ typedef EGLDisplay (*eglGetPlatformDisplayEXT_PTR)(EGLenum platform, void * native_display, const EGLint * attrib_list);
+ typedef EGLint (*eglGetError_PTR)();
+ typedef __eglMustCastToProperFunctionPointerType (*eglGetProcAddress_PTR)(const char * procname);
++typedef EGLBoolean (*eglGetSyncAttrib_PTR)(EGLDisplay dpy, EGLSync sync, EGLint attribute, EGLAttrib * value);
+ typedef EGLBoolean (*eglInitialize_PTR)(EGLDisplay dpy, EGLint * major, EGLint * minor);
+ typedef EGLBoolean (*eglMakeCurrent_PTR)(EGLDisplay dpy, EGLSurface draw, EGLSurface read, EGLContext ctx);
+ typedef EGLenum (*eglQueryAPI_PTR)();
+@@ -50,6 +57,7 @@ typedef EGLBoolean (*eglUnlockSurfaceKHR_PTR)(EGLDisplay display, EGLSurface sur
+ typedef EGLBoolean (*eglWaitClient_PTR)();
+ typedef EGLBoolean (*eglWaitGL_PTR)();
+ typedef EGLBoolean (*eglWaitNative_PTR)(EGLint engine);
++typedef EGLBoolean (*eglWaitSync_PTR)(EGLDisplay dpy, EGLSync sync, EGLint flags);
+ typedef EGLSyncKHR (*eglCreateSyncKHR_PTR)(EGLDisplay dpy, EGLenum type, const EGLint * attrib_list);
+ typedef EGLSyncKHR (*eglDestroySyncKHR_PTR)(EGLDisplay dpy, EGLSyncKHR sync);
+ typedef EGLint (*eglClientWaitSyncKHR_PTR)(EGLDisplay dpy, EGLSyncKHR sync, EGLint flags, EGLTimeKHR timeout);
