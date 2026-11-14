@@ -25,6 +25,7 @@ res() {
   fi
 }
 
+if [[ ${HOTKEYD_CASES:-} != qs11 ]]; then
 mkdir -p "$t/usr" "$t/etc" "$t/usr/test-a.conf.d" "$t/run"
 printf 'test-a 1 1\n' > "$t/current"
 cat > "$t/usr/test-a.conf" << 'EOF'
@@ -1081,6 +1082,61 @@ running
 FAST='SHOWN_MS=800' live "$lt; sleep 1.5"
 [[ $(nt) == "$woke"$'\n'"$pmo"$'\n'"$woke" && ! -e $flag ]] && termed || { ok=1; echo "  no shown: $(paste -sd '|' "$t/hooks.log")"; }
 res $ok "T7: menu-on failing twice and a child with no shown remove blockie-game.paused before blank-off continues the scope"
+
+bat 1 50
+printf '#!/bin/sh\necho volume-up >> "%s"\n' "$t/hooks.log" > "$hk/volume-up"
+chmod 755 "$hk/volume-up"
+nogame
+ok=0
+for k in home extra2 extra3 volup voldown extra1; do
+  mq '0.1 shown' '0.2 screen-off' '0.1 exit'
+  live "$hold; until_n '^exit blank-on$' $t/hooks.log; sleep 0.3; echo $k down; echo $k up; until_n '^start blank-off$' $t/hooks.log 2
+    sleep 0.3"
+  [[ $(grep -E '^start blank-(on|off)$' "$t/hooks.log" | paste -sd ' ') == 'start blank-off start blank-on start blank-off' ]] &&
+    ! grep -qx volume-up "$t/hooks.log" && grep -q "idle blank on usb: $k wakes" "$t/err" &&
+    ! grep -qE "blockie-hotkeyd: $k (tap|hold|press)" "$t/err" || { ok=1; echo "  $k: $(paste -sd '|' "$t/hooks.log")"; }
+done
+res $ok "qs11 live: on usb after the power menu's screen-off home, extra2, extra3, volup, voldown and extra1 each wake (blank-on, then blank-off) and fire no row"
+rm -f "${hk:?}/volume-up"
+
+ok=0
+for k in extra2 extra3; do
+  running
+  mq '0.1 shown' '0.3 screen-off' '0.1 exit'
+  live "$lt; until_n '^exit blank-on$' $t/hooks.log; printf '0.1 shown\n' > $t/menu.q; sleep 0.3; echo $k down; echo $k up
+    until_n '^menu mode=pause$' $t/hooks.log 2; sleep 0.3"
+  [[ $(grep -c '^start menu-on$' "$t/hooks.log") == 2 && $(grep -c '^menu mode=pause$' "$t/hooks.log") == 2 &&
+    $(grep -c '^start blank-off$' "$t/hooks.log") == 1 && -e $flag ]] && ! grep -q '^menu stdin' "$t/hooks.log" &&
+    ! grep -q 'no pause child to tell' "$t/err" && grep -q "idle blank on usb: $k wakes" "$t/err" ||
+    { ok=1; echo "  $k: $(paste -sd '|' "$t/hooks.log")"; }
+done
+res $ok "qs11 live: on usb after the pause box's screen-off extra2 and extra3 wake into the pause (menu-on, a new pause child, no blank-off, blockie-game.paused kept) and the logo's release writes no back"
+
+running
+mq '0.1 shown' '0.3 screen-off' '0.1 exit'
+live "$lt; until_n '^exit blank-on$' $t/hooks.log; mv -f '$port' '$t/port.gone'; sleep 0.3; echo extra2 down; echo extra2 up
+  until_n '^start blank-off$' $t/hooks.log 2; sleep 0.3"
+[[ $(grep -c '^menu mode=pause$' "$t/hooks.log") == 1 && $(grep -c '^start blank-off$' "$t/hooks.log") == 2 && ! -e $flag ]] &&
+  grep -q 'is gone: the pause ends' "$t/err" && grep -q 'idle blank on usb: extra2 wakes' "$t/err"
+res $? "qs11 live: a key wake after the pause box's screen-off with the port gone ends the pause: blank-off shows the home, no new pause child, blockie-game.paused removed"
+
+running
+mq '0.1 shown' '0.3 screen-off' '0.1 exit'
+live "$lt; until_n '^exit blank-on$' $t/hooks.log; printf 'android 1 1\n' > '$t/current'; sleep 0.3; echo extra2 down; echo extra2 up
+  until_n '^start blank-off$' $t/hooks.log 2; sleep 0.3"
+[[ $(grep -c '^start menu-on$' "$t/hooks.log") == 1 && $(grep -c '^start blank-off$' "$t/hooks.log") == 2 && -e $flag ]] &&
+  grep -qx 'flag blank-off' "$t/hooks.log" && grep -q 'idle blank on usb: extra2 wakes' "$t/err"
+res $? "qs11 live: a key wake after the pause box's screen-off in another session keeps the pause and wakes to awake: blank-off with blockie-game.paused kept, no menu-on"
+printf 'emulation 1 1\n' > "$t/current"
+
+running
+mq '0.1 shown' '2.2 shown power' '0.5 screen-off' '0.1 exit'
+live "$lt; sleep 0.3; $hold; until_n '^exit blank-on$' $t/hooks.log; printf '0.1 shown\n' > $t/menu.q; sleep 0.3; echo extra3 down
+  echo extra3 up; until_n '^menu mode=pause$' $t/hooks.log 2; sleep 0.3"
+[[ $(grep -c '^menu mode=pause$' "$t/hooks.log") == 2 && $(grep -c '^start blank-off$' "$t/hooks.log") == 1 && -e $flag ]] &&
+  grep -qx 'menu stdin power' "$t/hooks.log" && grep -q 'blockie-powermenu: shown power' "$t/err" &&
+  grep -q 'idle blank on usb: extra3 wakes' "$t/err"
+res $? "qs11 live: on usb after the screen-off of the power dialog over the pause a logo down wakes into the pause: menu-on, a new pause child, no blank-off"
 nogame
 rm -f "$hk/game-menu" "$hk/game-quit"
 printf 'nobody-here 1 1\n' > "$t/current"
@@ -1255,6 +1311,30 @@ res $? "sleep: 30 wakes in 10 min of boot time hold it blanked awake"
 FAST=$fast live "until_n '^exit blank-off$' $t/hooks.log; echo 30 > $t/slept; $tap; until_n '^start blank-off$' $t/hooks.log 2; sleep 0.5"
 [[ $(ev) == "start blank-off start blank-off" ]] && grep -q 'resume: ' "$t/err"
 res $? "sleep: a sleep seen while awake runs blank-off again and the tap after it does not blank"
+
+bat 1 50
+ok=0
+BLOCKIE_HOTKEYD_KNOB=$t/knob run 'echo power down; echo power up; echo home down; sleep 0.5; echo home up; echo volup down; echo volup up
+  echo extra3 down; echo extra3 up; echo power down; echo power up'
+[[ $(cat "$t/out") == $'action power tap blank\ngrab\nvbus\naction power tap blank\nungrab\nresync' ]] ||
+  { ok=1; echo "  tap blank on usb: $(paste -sd '|' "$t/out")"; }
+for c in battery knob; do
+  : > "$t/queue"
+  mq '0.1 shown' '0.2 screen-off' '1 exit'
+  if [[ $c == knob ]]; then
+    bat 1 50
+    : > "$t/knob"
+  else
+    bat 0 50
+  fi
+  FAST=$fast live "sleep 0.4; echo power down; sleep 1.3; echo power up; until_n '^helper' $t/hooks.log; sleep 0.2; echo home down
+    echo home up; sleep 0.5"
+  [[ $(ev) == "start blank-off start menu-on menu start from=awake state=$t/boot.state start blank-on menu exit helper first" ]] &&
+    ! grep -q 'idle blank on usb' "$t/err" || { ok=1; echo "  $c: $(ev)"; }
+done
+rm -f "${t:?}/knob"
+bat 0 50
+res $ok "qs11 live: a power tap blank on usb stays power only (home, volup, extra3 do nothing); after the power menu's screen-off on battery or with the knob a home press does not wake and the helper runs"
 
 for h in blank-on blank-off screen-on menu-on; do
   rm -f "$hk/$h.sleep"
@@ -1454,7 +1534,7 @@ REAL = os.path.realpath(os.path.join(m.SYSFS, "class/input", "event1"))
 
 
 def extra(d, dev, real):
-    d.extra[P1] = (dev, real)
+    d.extra[P1] = (dev, real, 0)
     d.grab(dev, P1)
 
 
@@ -1732,21 +1812,523 @@ print(bad)
 sys.exit(1 if bad else 0)
 EOF
 res $? "virtual nodes stay out except the AYANEO Controller by name, ids and phys"
+fi
 
-env -u BLOCKIE_HOTKEYD_BACKSTOP_MS -u BLOCKIE_HOTKEYD_BOOT_BACKSTOP_MS timeout -k 5 60 python3 - "$bin" > "$t/backstop.out" 2>&1 << 'EOF'
+mkdir -p "$t/krun"
+BLOCKIE_HOTKEYD_CURRENT=$t/kcur BLOCKIE_HOTKEYD_SYSFS=$t/psys BLOCKIE_HOTKEYD_INPUT=/dev/null BLOCKIE_HOTKEYD_KNOB=$t/kknob \
+  BLOCKIE_HOTKEYD_TABLES=$t/none BLOCKIE_HOTKEYD_BUTTONS=$t/nomap BLOCKIE_HOTKEYD_SLEEP=$t/none BLOCKIE_HOTKEYD_MENU=$t/none \
+  BLOCKIE_HOTKEYD_UP_MS=200 XDG_RUNTIME_DIR=$t/krun timeout -k 5 60 python3 - "$bin" > "$t/qs11.out" 2>&1 << 'EOF'
+import contextlib
+import errno
 import importlib.machinery
 import importlib.util
+import io
+import os
+import sys
+import time
+import types
+
+loader = importlib.machinery.SourceFileLoader("hotkeyd", sys.argv[1])
+spec = importlib.util.spec_from_loader("hotkeyd", loader)
+m = importlib.util.module_from_spec(spec)
+loader.exec_module(m)
+GLib = m.GLib
+ctx = GLib.MainContext.default()
+removed = set()
+source_remove = GLib.source_remove
+GLib.source_remove = lambda source: (removed.add(source), source_remove(source))[1]
+EV_SYN, EV_KEY, EV_ABS = 0, 1, 3
+KEY_POWER, HOME, BTN_SOUTH, BTN_EAST, BTN_TOUCH, BTN_MODE = 116, 0x2F1, 0x130, 0x131, 0x14A, 316
+ABS_HAT0Y, ABS_MT_POSITION_X, ABS_MT_POSITION_Y, ABS_MT_TRACKING_ID = 0x11, 0x35, 0x36, 0x39
+PMIC, PAD, GPIO, TOUCH, PAD2 = (f"/dev/input/event{n}" for n in range(5))
+SYN = (EV_SYN, 0, 0)
+TOUCH_DOWN = [(EV_KEY, BTN_TOUCH, 1), (EV_ABS, ABS_MT_TRACKING_ID, 7), (EV_ABS, ABS_MT_POSITION_X, 120),
+              (EV_ABS, ABS_MT_POSITION_Y, 340), SYN]
+TOUCH_UP = [(EV_ABS, ABS_MT_TRACKING_ID, -1), (EV_KEY, BTN_TOUCH, 0), SYN]
+UNGRAB = ["ungrab mtk-pmic-keys", "ungrab AYANEO Controller", "ungrab odm:gpio_keys"]
+CLOSED = ["close hyn_ts", "close Wireless Controller"]
+online = os.path.join(m.SYSFS, m.ONLINE)
+os.makedirs(os.path.dirname(online), exist_ok=True)
+with open(m.CURRENT, "w") as f:
+    f.write("emulation 1 1\n")
+
+
+def key(code, value):
+    return [(EV_KEY, code, value), SYN]
+
+
+class Ev:
+    def __init__(self, type, code, value):
+        self.type, self.code, self.value = type, code, value
+
+
+class Dev:
+    def __init__(self, name, ev, caps, axes=()):
+        self.name = name
+        self.ev = ev
+        self.fd, self.w = os.pipe()
+        self.caps = list(caps)
+        self.abs = dict.fromkeys(axes, 0)
+        self.q = []
+        self.held = set()
+        self.broken = False
+        self.keys_broken = False
+
+    def push(self, *evs):
+        for t, c, v in evs:
+            if t == EV_KEY and v:
+                self.held.add(c)
+            elif t == EV_KEY:
+                self.held.discard(c)
+            elif t == EV_ABS and c in self.abs:
+                self.abs[c] = v
+        self.q.append([Ev(*e) for e in evs])
+        os.write(self.w, b"x")
+
+    def fail(self):
+        self.broken = True
+        os.write(self.w, b"x")
+
+    def read(self):
+        if self.broken:
+            raise OSError(errno.ENODEV, "No such device")
+        if not self.q:
+            raise BlockingIOError
+        os.read(self.fd, 1)
+        return iter(self.q.pop(0))
+
+    def active_keys(self):
+        if self.keys_broken:
+            raise OSError(errno.ENODEV, "No such device")
+        return sorted(self.held)
+
+    def absinfo(self, axis):
+        return types.SimpleNamespace(value=self.abs[axis])
+
+    def capabilities(self, absinfo=True):
+        return {EV_KEY: self.caps, EV_ABS: list(self.abs)}
+
+    def grab(self):
+        self.ev.append(f"grab {self.name}")
+
+    def ungrab(self):
+        self.ev.append(f"ungrab {self.name}")
+
+    def close(self):
+        self.ev.append(f"close {self.name}")
+
+
+class Proc:
+    def send_signal(self, sig):
+        pass
+
+    def force_exit(self):
+        pass
+
+    def wait_finish(self, res):
+        pass
+
+    def get_if_exited(self):
+        return True
+
+    def get_exit_status(self):
+        return 0
+
+
+def pump():
+    for _ in range(100):
+        if not ctx.pending():
+            break
+        ctx.iteration(False)
+
+
+def make(usb="1", knob=False):
+    with open(online, "w") as f:
+        f.write(f"{usb}\n")
+    if knob:
+        open(m.KNOB, "w").close()
+    elif os.path.exists(m.KNOB):
+        os.unlink(m.KNOB)
+    ev = []
+    d = m.Hotkeyd(GLib.MainLoop())
+    n = {"pmic": Dev("mtk-pmic-keys", ev, [KEY_POWER, 115]),
+         "pad": Dev("AYANEO Controller", ev, [BTN_SOUTH, BTN_EAST, BTN_MODE], [0x10, ABS_HAT0Y, 0x09, 0x0A]),
+         "gpio": Dev("odm:gpio_keys", ev, [0x2F0, HOME, 0x2F2, 114]),
+         "touch": Dev("hyn_ts", ev, [BTN_TOUCH], [ABS_MT_POSITION_X, ABS_MT_POSITION_Y, ABS_MT_TRACKING_ID]),
+         "pad2": Dev("Wireless Controller", ev, [BTN_SOUTH, BTN_EAST])}
+    for path, name in ((PMIC, "pmic"), (PAD, "pad"), (GPIO, "gpio")):
+        dev = n[name]
+        watch = GLib.io_add_watch(dev.fd, GLib.PRIORITY_DEFAULT, GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR, d.readable, path)
+        d.devices[path] = (dev, d.keymap(dev.name, set(dev.caps)), watch)
+    extras = {TOUCH: n["touch"], PAD2: n["pad2"]}
+    m.glob.glob = lambda pattern: sorted([*d.devices, *extras]) if pattern == "/dev/input/event*" else []
+    m.evdev.InputDevice = lambda path: extras[path]
+    d.spawn = lambda name, ms: (ev.append(f"hook {name}"), (None, True, 0))[1]
+    resync = d.resync
+    d.resync = lambda resumed=None: (ev.append("resync"), resync(resumed))[1]
+    fire = d.fire
+    d.fire = lambda k, gesture, row, fallback=False: (ev.append(f"fire {k} {gesture}"), fire(k, gesture, row, fallback))[1]
+    return d, n, ev
+
+
+def screen_off(d, pause=False):
+    child = m.Menu(Proc())
+    child.pause = pause
+    d.menu = d.last = child
+    d.menu_due = d.pause_due = False
+    d.menu_said(child, ["screen-off"])
+    d.menu_exited(Proc(), None, child)
+    d.grab_more()
+
+
+def idle_blank(d):
+    d.open_menu()
+    screen_off(d)
+
+
+def tap_blank(d):
+    d.blank([])
+    d.grab_more()
+
+
+def pause_blank(d):
+    for f in (m.PORT, m.PAUSED):
+        open(f, "w").close()
+    d.paused = True
+    d.scope = True
+    d.want("paused")
+    screen_off(d, True)
+
+
+def idle(d, n, ev):
+    idle_blank(d)
+    ev.clear()
+
+
+def state(d):
+    return f"wanted {d.wanted}, grabbed {d.grabbed!r}, hold {d.hold!r}, hold timer {bool(d.hold_timer)}"
+
+
+def k1(node, down, up, name=None):
+    def run(err):
+        d, n, ev = make()
+        idle(d, n, ev)
+        watches = [w for _, _, w in d.extra.values()]
+        n[node].push(*down)
+        pump()
+        if (d.wanted, d.grabbed, d.hold, ev) != ("awake", "all", "", ["hook blank-off"]):
+            return f"after the down {state(d)}, {ev}"
+        k = d.keys.get(name)
+        if k and (not k.consumed or k.timer):
+            return f"{name} consumed {k.consumed}, hold timer {bool(k.timer)}"
+        n[node].push(*up)
+        pump()
+        left = [w for w in watches if not w or w not in removed]
+        if ev != ["hook blank-off", *UNGRAB, *CLOSED, "resync"] or d.extra or left or d.grabbed or d.hold is not None \
+                or d.hold_timer or "idle blank on usb: " not in err.getvalue():
+            return f"after the up {state(d)}, {ev}, extras {sorted(d.extra)}, watches left {left}"
+        return ""
+    return run
+
+
+def k1b(err):
+    d, n, ev = make()
+    idle(d, n, ev)
+    n["pad"].push(*key(BTN_EAST, 1))
+    pump()
+    n["touch"].push(*TOUCH_DOWN)
+    pump()
+    n["pad"].push(*key(BTN_EAST, 0))
+    pump()
+    if d.grabbed != "all" or d.hold != "":
+        return f"after the pad up {state(d)}"
+    n["touch"].push(*TOUCH_UP)
+    pump()
+    if d.grabbed or d.hold is not None or UNGRAB[0] not in ev:
+        return f"after the lift {state(d)}, {ev}"
+    return ""
+
+
+def k1c(err):
+    d, n, ev = make()
+    idle(d, n, ev)
+    n["touch"].keys_broken = True
+    n["pad"].push(*key(BTN_EAST, 1))
+    pump()
+    if d.wanted != "awake" or d.grabbed != "all":
+        return f"after the down {state(d)}"
+    n["pad"].push(*key(BTN_EAST, 0))
+    pump()
+    if d.grabbed or d.hold is not None or UNGRAB[0] not in ev:
+        return f"after the pad up {state(d)}, {ev}"
+    return ""
+
+
+def k1d(err):
+    d, n, ev = make()
+    idle(d, n, ev)
+    d.regrab[PAD] = n["pad"]
+    n["pad"].push(*key(BTN_EAST, 1))
+    pump()
+    if d.wanted != "blanked" or d.grabbed != "all" or d.hold is not None or ev:
+        return f"{state(d)}, {ev}"
+    return ""
+
+
+def k1e(node, down):
+    def run(err):
+        d, n, ev = make()
+        idle(d, n, ev)
+        watch = d.extra[TOUCH][2]
+        n[node].push(*down)
+        pump()
+        if d.wanted != "awake" or d.grabbed != "all":
+            return f"after the down {state(d)}"
+        n[node].fail()
+        pump()
+        log = err.getvalue()
+        path = TOUCH if node == "touch" else PAD
+        if "Traceback" in log or d.grabbed or d.hold is not None or d.hold_timer or f"{path} gone" not in log \
+                or path in d.extra or path in d.devices or f"close {n[node].name}" not in ev:
+            return f"after the read error {state(d)}, {ev}"
+        if node == "touch" and watch in removed:
+            return "the watch removed in its own callback, then ended by its False"
+        return ""
+    return run
+
+
+def k1g(err):
+    d, n, ev = make()
+    idle(d, n, ev)
+    n["touch"].push(*TOUCH_DOWN)
+    n["pad2"].push(*key(BTN_SOUTH, 1))
+    d.resume()
+    pump()
+    if d.wanted != "blanked" or d.hold is not None or n["touch"].q or n["pad2"].q or "wakes" in err.getvalue():
+        return f"{state(d)}, queued {len(n['touch'].q)} {len(n['pad2'].q)}"
+    return ""
+
+
+def k1h(err):
+    d, n, ev = make()
+    idle(d, n, ev)
+    d.regrab[TOUCH] = n["touch"]
+    n["touch"].held.add(BTN_TOUCH)
+    n["pad"].push(*key(BTN_EAST, 1))
+    pump()
+    if d.wanted != "awake" or d.grabbed != "all":
+        return f"after the down {state(d)}"
+    n["pad"].push(*key(BTN_EAST, 0))
+    pump()
+    if d.grabbed or d.hold is not None:
+        return f"after the pad up {state(d)}"
+    return ""
+
+
+def k1f(err):
+    d, n, ev = make()
+    idle_blank(d)
+    d.open_menu()
+    if d.menu_from != "dark":
+        return f"menu from {d.menu_from}"
+    screen_off(d)
+    ev.clear()
+    n["gpio"].push(*key(HOME, 1))
+    pump()
+    if d.wanted != "awake" or d.grabbed != "all" or "idle blank on usb: home wakes" not in err.getvalue():
+        return f"{state(d)}, {ev}"
+    return ""
+
+
+def k2(err):
+    d, n, ev = make()
+    try:
+        pause_blank(d)
+        ev.clear()
+        n["pad"].push(*key(BTN_EAST, 1))
+        pump()
+        if (d.wanted, d.pause_due, d.grabbed, d.hold, ev) != ("paused", True, "all", "keys", ["hook menu-on"]):
+            return f"after the down {state(d)}, pause due {d.pause_due}, {ev}"
+        n["pad"].push(*key(BTN_EAST, 0))
+        pump()
+        if ev != ["hook menu-on", *UNGRAB, *CLOSED, "resync", "grab mtk-pmic-keys", "grab odm:gpio_keys"] \
+                or d.grabbed != "keys" or d.hold is not None or not os.path.exists(m.PAUSED):
+            return f"after the up {state(d)}, {ev}, paused {os.path.exists(m.PAUSED)}"
+        return ""
+    finally:
+        for f in (m.PORT, m.PAUSED):
+            if os.path.exists(f):
+                os.unlink(f)
+
+
+def k3(err):
+    d, n, ev = make()
+    idle(d, n, ev)
+    t0 = time.monotonic()
+    n["pad"].push(*key(BTN_EAST, 1))
+    pump()
+    timer = d.hold_timer
+    n["pad2"].push(*key(BTN_SOUTH, 1))
+    pump()
+    if not timer or d.hold_timer != timer or timer in removed or d.grabbed != "all" or d.hold != "":
+        return f"after the second down: timer {timer} then {d.hold_timer}, removed {timer in removed}, {state(d)}"
+    loop = GLib.MainLoop()
+    seen = {}
+
+    def poll():
+        t = time.monotonic() - t0
+        if d.grabbed != "all":
+            seen["released"] = t
+        if d.grabbed != "all" or t > 1.5:
+            loop.quit()
+            return False
+        return True
+
+    GLib.timeout_add(10, poll)
+    loop.run()
+    r = seen.get("released")
+    if r is None or r < m.UP_MS / 1000 or d.hold is not None or d.hold_timer \
+            or f"still down {m.UP_MS} ms after the wake" not in err.getvalue() or d.wanted != "awake":
+        return f"released at {r} s, {state(d)}"
+    return ""
+
+
+def k4(blank, push, usb="1", knob=False, draining=False):
+    def run(err):
+        d, n, ev = make(usb, knob)
+        blank(d)
+        ev.clear()
+        d.draining = draining
+        node, evs = push
+        n[node].push(*evs)
+        pump()
+        d.draining = False
+        home = d.keys["home"]
+        if d.wanted != "blanked" or d.grabbed != "all" or d.hold is not None or ev or "wakes" in err.getvalue() \
+                or (node == "gpio" and not home.consumed):
+            return f"{state(d)}, {ev}, home consumed {home.consumed}"
+        return ""
+    return run
+
+
+def menu_cancel_tap(d):
+    idle_blank(d)
+    d.open_menu()
+    child = m.Menu(Proc())
+    d.menu = d.last = child
+    d.menu_said(child, ["cancel"])
+    d.menu_exited(Proc(), None, child)
+    tap_blank(d)
+
+
+def blank_on(d):
+    idle_blank(d)
+    d.blank(["on"])
+    d.grab_more()
+
+
+def tap_menu_screen_off(d):
+    tap_blank(d)
+    d.open_menu()
+    screen_off(d)
+
+
+def k56(act):
+    def run(err):
+        d, n, ev = make()
+        idle(d, n, ev)
+        n["pad"].push(*key(BTN_EAST, 1))
+        pump()
+        if d.wanted != "awake" or d.hold != "":
+            return f"after the down {state(d)}"
+        act(d, n)
+        pump()
+        if d.wanted != "blanked" or d.grabbed != "all" or d.hold is not None or d.hold_timer or d.idle_blank:
+            return f"after the blank {state(d)}, mark {d.idle_blank}, {ev}"
+        loop = GLib.MainLoop()
+        GLib.timeout_add(m.UP_MS + 150, loop.quit)
+        loop.run()
+        if d.grabbed != "all":
+            return f"{m.UP_MS + 150} ms later {state(d)}, {ev}"
+        return ""
+    return run
+
+
+def power_tap(d, n):
+    n["pmic"].push(*key(KEY_POWER, 1))
+    pump()
+    n["pmic"].push(*key(KEY_POWER, 0))
+
+
+HOME_DOWN = ("gpio", key(HOME, 1))
+cases = [
+    ("K1 home", k1("gpio", key(HOME, 1), key(HOME, 0), "home")),
+    ("K1 east", k1("pad", key(BTN_EAST, 1), key(BTN_EAST, 0))),
+    ("K1 hat", k1("pad", [(EV_ABS, ABS_HAT0Y, -1), SYN], [(EV_ABS, ABS_HAT0Y, 0), SYN])),
+    ("K1 touch", k1("touch", TOUCH_DOWN, TOUCH_UP)),
+    ("K1 pad2", k1("pad2", key(BTN_SOUTH, 1), key(BTN_SOUTH, 0))),
+    ("K1b touch still down", k1b),
+    ("K1c touch keys error", k1c),
+    ("K1d retry set", k1d),
+    ("K1e touch read error", k1e("touch", TOUCH_DOWN)),
+    ("K1e pad read error", k1e("pad", key(BTN_EAST, 1))),
+    ("K1f idle blank, power hold, screen-off", k1f),
+    ("K1g resume drains the extras", k1g),
+    ("K1h a node in the retry set holds nothing", k1h),
+    ("K2 pause", k2),
+    ("K3 bound", k3),
+    ("K4 tap blank", k4(tap_blank, HOME_DOWN)),
+    ("K4 online 0", k4(idle_blank, HOME_DOWN, usb="0")),
+    ("K4 knob", k4(idle_blank, HOME_DOWN, knob=True)),
+    ("K4 value 0", k4(idle_blank, ("pad", key(BTN_EAST, 0)))),
+    ("K4 value 2", k4(idle_blank, ("pad", key(BTN_EAST, 2)))),
+    ("K4 draining", k4(idle_blank, HOME_DOWN, draining=True)),
+    ("K4 menu from idle, cancel, tap blank", k4(menu_cancel_tap, HOME_DOWN)),
+    ("K4 blank on row", k4(blank_on, HOME_DOWN)),
+    ("K4 tap blank, power hold, screen-off", k4(tap_menu_screen_off, HOME_DOWN)),
+    ("K5 power tap in the hold", k56(power_tap)),
+    ("K6 blank on row in the hold", k56(lambda d, n: d.blank(["on"]))),
+]
+bad = []
+for name, fn in cases:
+    err = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err):
+            why = fn(err)
+    except Exception as e:
+        why = f"{type(e).__name__}: {e}"
+    print(f"{name}: {why or 'ok'}")
+    if why:
+        bad.append(f"{name}: {why}, log {err.getvalue().splitlines()}")
+for b in bad:
+    print(f"FAILED {b}")
+sys.exit(1 if bad else 0)
+EOF
+r=$?
+((r == 0)) || sed 's/^/  /' "$t/qs11.out"
+res $r "qs11: after an idle blank on usb a non-power key, pad button, hat or touch down wakes and is swallowed, the full grab held until every node the next grab mode releases is up, a held node goes or the bound; no wake after a tap blank (also through the dark menu), on battery, with the knob, for value 0 or 2, while draining or from a node in the retry set; a power tap or a blank on row in the hold ends it with the grab kept; a node in the retry set holds nothing; a resume drains the extras"
+
+env -u BLOCKIE_HOTKEYD_BACKSTOP_MS -u BLOCKIE_HOTKEYD_BOOT_BACKSTOP_MS -u BLOCKIE_HOTKEYD_UP_MS timeout -k 5 60 python3 - "$bin" > "$t/backstop.out" 2>&1 << 'EOF'
+import importlib.machinery
+import importlib.util
+import os
 import sys
 
 loader = importlib.machinery.SourceFileLoader("hotkeyd", sys.argv[1])
 spec = importlib.util.spec_from_loader("hotkeyd", loader)
 m = importlib.util.module_from_spec(spec)
 loader.exec_module(m)
-print(m.BACKSTOP_MS, m.BOOT_BACKSTOP_MS, m.SHOWN_MS, m.MENU_KILL_MS, m.TOAST_MS, m.POLL_MS)
-ok = (m.BACKSTOP_MS, m.BOOT_BACKSTOP_MS, m.SHOWN_MS, m.MENU_KILL_MS, m.TOAST_MS, m.POLL_MS) == (35000, 50000, 5000, 2000, 5100, 1000)
+os.environ["BLOCKIE_HOTKEYD_UP_MS"] = "5000"
+up = importlib.util.module_from_spec(spec)
+loader.exec_module(up)
+print(m.BACKSTOP_MS, m.BOOT_BACKSTOP_MS, m.SHOWN_MS, m.MENU_KILL_MS, m.TOAST_MS, m.POLL_MS, m.UP_MS, up.UP_MS)
+ok = (m.BACKSTOP_MS, m.BOOT_BACKSTOP_MS, m.SHOWN_MS, m.MENU_KILL_MS, m.TOAST_MS, m.POLL_MS, m.UP_MS, up.UP_MS) \
+    == (35000, 50000, 5000, 2000, 5100, 1000, 1000, 1000)
 sys.exit(0 if ok and m.TOAST_MS >= 350 + 3500 + 250 + m.POLL_MS and m.BOOT_BACKSTOP_MS > 45000 else 1)
 EOF
-res $? "defaults: the power off backstop 35000 ms (past the 25 s limit of blockie-poweroff.service), the boot unit backstop 50000 ms (past the 45 s limit of blockie-reboot@.service), the menu shown limit 5000 ms, kill 2000 ms, toast 5100 ms (toast in 350, hold 3500, out 250 plus one poll), reboot unit poll 1000 ms"
+res $? "defaults: the power off backstop 35000 ms (past the 25 s limit of blockie-poweroff.service), the boot unit backstop 50000 ms (past the 45 s limit of blockie-reboot@.service), the menu shown limit 5000 ms, kill 2000 ms, toast 5100 ms (toast in 350, hold 3500, out 250 plus one poll), reboot unit poll 1000 ms, the wake hold bound 1000 ms, also with BLOCKIE_HOTKEYD_UP_MS 5000 (at or below the pause child's 1000 ms busy wait)"
+
+if [[ ${HOTKEYD_CASES:-} != qs11 ]]; then
 
 BLOCKIE_HOTKEYD_CURRENT=$t/none BLOCKIE_HOTKEYD_SYSFS=$t/psys BLOCKIE_HOTKEYD_INPUT=/dev/null \
   timeout -k 5 60 python3 - "$bin" > "$t/codes.out" 2>&1 << 'EOF'
@@ -1813,6 +2395,7 @@ EOF
 r=$?
 ((r == 0)) || sed 's/^/  /' "$t/bdef.out"
 res $r "map: the built in button defaults and words equal 30-buttons.json"
+fi
 
 if (( fails )); then
   echo "hotkeyd: $fails failed"

@@ -47,6 +47,7 @@ MENU_KILL_MS = int(os.environ.get("BLOCKIE_HOTKEYD_MENU_KILL_MS", "2000"))
 TOAST_MS = int(os.environ.get("BLOCKIE_HOTKEYD_TOAST_MS", "5100"))
 POLL_MS = int(os.environ.get("BLOCKIE_HOTKEYD_POLL_MS", "1000"))
 SHOWN_MS = int(os.environ.get("BLOCKIE_HOTKEYD_SHOWN_MS", "5000"))
+UP_MS = min(int(os.environ.get("BLOCKIE_HOTKEYD_UP_MS", "1000")), 1000)
 BACKLIGHT = os.environ.get("BLOCKIE_HOTKEYD_BACKLIGHT", "/usr/libexec/blockie/blockie-backlight")
 BOOT_STATE = os.environ.get("BLOCKIE_BOOT_STATE", "/run/blockie/boot/state")
 RUN = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
@@ -69,6 +70,7 @@ SWITCHER = ("net.seilent.Blockie.Switcher", "/net/seilent/Blockie/Switcher", "ne
 KEY_POWER, KEY_VOLUMEDOWN, KEY_VOLUMEUP, BTN_MODE = 116, 114, 115, 316
 KEY_F13, KEY_F14, KEY_F15 = 183, 184, 185
 BTN_JOYSTICK, BTN_THUMBR, BTN_TOUCH, ABS_MT_POSITION_X = 0x120, 0x13E, 0x14A, 0x35
+ABS_GAS, ABS_BRAKE, ABS_HAT0X, ABS_HAT0Y = 0x09, 0x0A, 0x10, 0x11
 KEYS = {
     "home": (("odm:gpio_keys",), (0x2F1, KEY_F13)),
     "extra1": (("AYANEO Controller",), (BTN_MODE,)),
@@ -115,6 +117,10 @@ def sysfs(rel):
             return f.read().strip()
     except OSError:
         return ""
+
+
+def usb_awake():
+    return sysfs(ONLINE) == "1" and not os.path.exists(KNOB)
 
 
 def slept_extra():
@@ -342,6 +348,7 @@ class Hotkeyd:
         self.missing_hooks = {"switcher-open"}
         self.bus = None
         self.wanted = "awake"
+        self.idle_blank = False
         self.applied = "unknown"
         self.busy = False
         self.kill_timer = 0
@@ -354,10 +361,13 @@ class Hotkeyd:
         self.started = None
         self.backstop = 0
         self.grabbed = ""
+        self.hold = None
+        self.hold_timer = 0
         self.menu = None
         self.last = None
         self.menu_due = False
         self.menu_from = "awake"
+        self.dark_idle = False
         self.boot = None
         self.poll_timer = 0
         self.started_at = 0
@@ -430,7 +440,8 @@ class Hotkeyd:
         if p is not None:
             GLib.timeout_add(ms, lambda: p.force_exit() or False)
 
-    def want(self, state):
+    def want(self, state, idle=False):
+        self.idle_blank = idle and state == "blanked"
         if state == "awake" and self.paused:
             if self.scope is False or not port_running():
                 log(f"{SCOPE} is not active or {PORT} is gone: the pause ends")
@@ -456,7 +467,13 @@ class Hotkeyd:
             self.menu_due = False
         if self.menu is not None and (state in ("awake", "blanked") or (state == "paused" and self.pause_due)):
             self.end_menu(self.menu)
-        self.set_grab("all" if state in ("blanked", "lit-frozen") else "keys" if state in ("menu", "paused") else "")
+        mode = "all" if state in ("blanked", "lit-frozen") else "keys" if state in ("menu", "paused") else ""
+        if self.hold is not None and mode == "all":
+            self.end_hold()
+        if self.hold is None:
+            self.set_grab(mode)
+        else:
+            self.hold = mode
         self.apply()
         self.consider()
 
@@ -831,6 +848,7 @@ class Hotkeyd:
         if self.menu is not None or self.wanted in ("menu", "lit-frozen"):
             log(f"menu: ignored, {'blockie-powermenu still runs' if self.menu is not None else self.wanted}")
             return
+        self.dark_idle = self.wanted == "blanked" and self.idle_blank
         self.menu_from = "dark" if self.wanted == "blanked" else "awake"
         self.menu_due = True
         self.last = None
@@ -930,7 +948,7 @@ class Hotkeyd:
         elif words == ["cancel"] or words[:1] == ["failed"]:
             self.want("awake")
         elif words == ["screen-off"]:
-            self.want("blanked")
+            self.want("blanked", idle=m.pause or self.menu_from == "awake" or self.dark_idle)
         elif words == ["poweroff"]:
             self.end_menu(m)
             self.unit("blockie-poweroff.service")
@@ -1028,7 +1046,7 @@ class Hotkeyd:
     def gone(self, path):
         del self.regrab[path]
         if path in self.extra:
-            self.close(self.extra.pop(path)[0])
+            self.close_extra(path)
             log(f"{path} gone")
 
     def regrab_tick(self):
@@ -1064,6 +1082,12 @@ class Hotkeyd:
         except OSError:
             pass
 
+    def close_extra(self, path):
+        dev, _, watch = self.extra.pop(path)
+        if watch:
+            GLib.source_remove(watch)
+        self.close(dev)
+
     def grab_more(self):
         for path in sorted(glob.glob("/dev/input/event*")):
             if path in self.devices:
@@ -1073,7 +1097,7 @@ class Hotkeyd:
             if (old and old[1] == real) or self.nograb.get(path) == real:
                 continue
             if old:
-                self.close(self.extra.pop(path)[0])
+                self.close_extra(path)
             try:
                 dev = evdev.InputDevice(path)
                 caps = dev.capabilities(absinfo=False)
@@ -1087,7 +1111,9 @@ class Hotkeyd:
                 continue
             if self.grab(dev, path):
                 log(f"{path} {dev.name}: grabbed while {self.wanted}")
-            self.extra[path] = (dev, real)
+            watch = GLib.io_add_watch(dev.fd, GLib.PRIORITY_DEFAULT, GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR,
+                                      self.extra_readable, path)
+            self.extra[path] = (dev, real, watch)
 
     def grabs(self, dev):
         return self.grabbed == "all" or dev.name not in KEYS["extra1"][0]
@@ -1125,9 +1151,8 @@ class Hotkeyd:
                 dev.ungrab()
             except OSError:
                 pass
-        for dev, _ in self.extra.values():
-            self.close(dev)
-        self.extra.clear()
+        for path in list(self.extra):
+            self.close_extra(path)
         self.nograb.clear()
         log("ungrabbed")
         if not self.draining:
@@ -1181,7 +1206,7 @@ class Hotkeyd:
             return "menu"
         if self.refused or self.storm:
             return "held"
-        if sysfs(ONLINE) == "1" and not os.path.exists(KNOB):
+        if usb_awake():
             return "vbus"
         return ""
 
@@ -1344,6 +1369,16 @@ class Hotkeyd:
                     if ev.type == 1 and ev.code in m:
                         log(f"resume drain {path}: {m[ev.code]} {ev.value}")
                         self.handle(m[ev.code], ev.value)
+        for path in list(self.extra):
+            while path in self.extra:
+                try:
+                    list(self.extra[path][0].read())
+                except BlockingIOError:
+                    break
+                except OSError:
+                    self.regrab.pop(path, None)
+                    self.close_extra(path)
+                    log(f"{path} gone")
         self.resync(self.resumed)
         self.draining = False
         self.apply()
@@ -1478,7 +1513,7 @@ class Hotkeyd:
             return False
         return True
 
-    def handle(self, key, value):
+    def handle(self, key, value, path=None):
         k = self.keys[key]
         if key == "volup" or (key == "power" and value == 1):
             self.seen.add(key)
@@ -1489,6 +1524,8 @@ class Hotkeyd:
             k.consumed = self.wanted in ("blanked", "menu", "lit-frozen") and key != "power"
             k.stage = 0
             self.stop_timer(k)
+            if k.consumed and self.wake_ok(path):
+                self.key_wake(key)
             if not k.consumed:
                 k.table = load_table(current())
                 if (key, "press") in k.table:
@@ -1503,6 +1540,50 @@ class Hotkeyd:
             if not k.consumed and (key, "tap") in k.table:
                 self.fire(key, "tap", k.table[(key, "tap")])
         self.consider()
+
+    def wake_ok(self, path):
+        return (self.wanted == "blanked" and self.idle_blank and usb_awake() and not self.draining
+                and path not in self.regrab)
+
+    def key_wake(self, what):
+        log(f"idle blank on usb: {what} wakes")
+        self.hold = self.grabbed
+        self.hold_timer = GLib.timeout_add(UP_MS, self.hold_over)
+        self.want("awake")
+
+    def end_hold(self):
+        mode, self.hold = self.hold, None
+        if self.hold_timer:
+            GLib.source_remove(self.hold_timer)
+            self.hold_timer = 0
+        return mode
+
+    def hold_over(self):
+        self.hold_timer = 0
+        if self.hold is not None:
+            log(f"still down {UP_MS} ms after the wake: the grab ends")
+            self.set_grab(self.end_hold())
+        return False
+
+    def node_down(self, dev, keys):
+        if any(self.keys[key].down for key in keys):
+            return True
+        try:
+            if dev.active_keys():
+                return True
+            axes = dev.capabilities(absinfo=False).get(evdev.ecodes.EV_ABS, [])
+            return any(dev.absinfo(axis).value for axis in (ABS_HAT0X, ABS_HAT0Y, ABS_GAS, ABS_BRAKE) if axis in axes)
+        except OSError:
+            return False
+
+    def hold_check(self):
+        if self.hold is None:
+            return
+        nodes = [(path, dev, m.values()) for path, (dev, m, _) in self.devices.items()
+                 if not self.hold or dev.name in KEYS["extra1"][0]]
+        nodes += [(path, dev, ()) for path, (dev, _, _) in self.extra.items()]
+        if not any(self.node_down(dev, keys) for path, dev, keys in nodes if path not in self.regrab):
+            self.set_grab(self.end_hold())
 
     def keymap(self, name, caps):
         return {code: key for key, (names, codes) in KEYS.items() if name in names
@@ -1559,14 +1640,46 @@ class Hotkeyd:
         try:
             for ev in dev.read():
                 if ev.type == 1 and ev.code in m:
-                    self.handle(m[ev.code], ev.value)
+                    self.handle(m[ev.code], ev.value, path)
+                else:
+                    self.activity(path, ev)
         except BlockingIOError:
             return True
         except OSError:
             self.devices[path] = (dev, m, 0)
             self.drop(path)
+            self.hold_check()
             return False
+        self.hold_check()
         return True
+
+    def extra_readable(self, fd, cond, path):
+        self.sample()
+        if path not in self.extra:
+            return False
+        dev, real, _ = self.extra[path]
+        try:
+            for ev in dev.read():
+                self.activity(path, ev)
+        except BlockingIOError:
+            return True
+        except OSError:
+            self.extra[path] = (dev, real, 0)
+            self.regrab.pop(path, None)
+            self.close_extra(path)
+            log(f"{path} gone")
+            self.hold_check()
+            return False
+        self.hold_check()
+        return True
+
+    def activity(self, path, ev):
+        if ev.type == evdev.ecodes.EV_KEY:
+            down = ev.value == 1 and ev.code != KEY_POWER
+        else:
+            down = ev.type == evdev.ecodes.EV_ABS and ev.code in (ABS_HAT0X, ABS_HAT0Y) and ev.value != 0
+        if down and self.wake_ok(path):
+            self.key_wake(f"code {ev.code} on {path}")
 
     def script(self, fd, cond, buf):
         try:
@@ -1586,6 +1699,7 @@ class Hotkeyd:
                 self.handle(words[0], 1 if words[1] == "down" else 0)
             elif words:
                 log(f"input: ignored: {' '.join(words)}")
+        self.hold_check()
         return True
 
 
