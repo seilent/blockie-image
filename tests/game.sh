@@ -67,6 +67,7 @@ rom=$data/roms/gba/test.gba
 cat > "$FAKE/bin/systemd-run" << 'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FAKE/systemd-run.log"
+printf '%s\n' "${DBUS_SESSION_BUS_ADDRESS-unset}" > "$FAKE/systemd-run.bus"
 while (( $# )) && [[ $1 != -- ]]; do
   shift
 done
@@ -898,23 +899,25 @@ mkdir -p /run/blockie-gpu
 printf 'LD_LIBRARY_PATH=/invented/farm\n' > /run/blockie-gpu/gpu.env
 echo invented > "$stmp/stale"
 rm -f "$FAKE/rundir"
-XDG_CONFIG_HOME=/invented SDL_AUDIODRIVER=alsa splay "$g"
+DBUS_SESSION_BUS_ADDRESS=unix:path=/invented/bus XDG_CONFIG_HOME=/invented SDL_AUDIODRIVER=alsa splay "$g"
 sargv="--user --scope --quiet --unit=blockie-game --collect --slice=blockie-emulation.slice -p BindsTo=blockie-frontend.service"
 sargv+=" -p After=blockie-frontend.service -p MemoryHigh=80% -p MemoryMax=90% -p TasksMax=512 -p OOMPolicy=kill"
 sargv+=" -p TimeoutStopSec=10s -- env -u XDG_CONFIG_HOME -u XDG_DATA_HOME -u XDG_CACHE_HOME -u SDL_AUDIODRIVER"
 sargv+=" HOME=$data/steam-home TMPDIR=$stmp ALSA_CONFIG_PATH=/usr/share/blockie/ports/alsa.conf"
-sargv+=" LD_LIBRARY_PATH=$rdir/lib:/invented/farm $rdir/nw --ozone-platform=wayland --ignore-gpu-blocklist --use-gl=angle"
+sargv+=" LD_LIBRARY_PATH=$rdir/lib:/invented/farm DBUS_SESSION_BUS_ADDRESS=disabled:"
+sargv+=" $rdir/nw --ozone-platform=wayland --ignore-gpu-blocklist --use-gl=angle"
 sargv+=" --use-angle=gles --host-resolver-rules=MAP * ~NOTFOUND --user-data-dir=$g/.blockie/nw"
 sargv+=" --disk-cache-dir=$stmp/nw-cache ."
 [[ $rc == 0 && $(< "$FAKE/systemd-run.log") == "$sargv" ]] &&
   [[ $(sed -n 5p "$FAKE/nw.argv") == '--host-resolver-rules=MAP * ~NOTFOUND' && $(wc -l < "$FAKE/nw.argv") == 8 ]] &&
   nenv "HOME=$data/steam-home" && nenv "TMPDIR=$stmp" && nenv "LD_LIBRARY_PATH=$rdir/lib:/invented/farm" &&
-  nenv ALSA_CONFIG_PATH=/usr/share/blockie/ports/alsa.conf &&
+  nenv ALSA_CONFIG_PATH=/usr/share/blockie/ports/alsa.conf && nenv DBUS_SESSION_BUS_ADDRESS=disabled: &&
+  [[ $(< "$FAKE/systemd-run.bus") == unix:path=/invented/bus ]] &&
   ! grep -qE '^(XDG_CONFIG_HOME|SDL_AUDIODRIVER)=' "$FAKE/nw.env" &&
   [[ $(< "$FAKE/nw.umask") == 0022 && $(< "$FAKE/nw.cwd") == "$g/$groot" && ! -s $FAKE/nw.tmp && -d $g/.blockie/nw ]] &&
   grep -qx blockie-game.port "$FAKE/rundir" && [[ ! -e $t/run/blockie-game.port && ! -e $t/run/blockie-game.cmd ]] &&
   [[ $(< "$t/dl1.log") == $'check\nset' ]]
-res $? "steam: the .got's class and root pick nwjs.conf's runner dir by its SHA256; one scope with a 10 s stop runs nw from the root with the flags, the resolver block as one argument, the profile in <install>/.blockie/nw, the disk cache under the emptied TMPDIR, HOME steam-home, the runner lib before gpu.env's, the ALSA redirect, XDG and SDL_AUDIODRIVER unset, umask 022; blockie-game.port while it runs, gone after; dl1 check before, set after"
+res $? "steam: the .got's class and root pick nwjs.conf's runner dir by its SHA256; one scope with a 10 s stop runs nw from the root with the flags, the resolver block as one argument, the profile in <install>/.blockie/nw, the disk cache under the emptied TMPDIR, HOME steam-home, the runner lib before gpu.env's, the ALSA redirect, the session bus disabled for nw only (systemd-run keeps it, so Chromium cannot move itself into a scope of its own), XDG and SDL_AUDIODRIVER unset, umask 022; blockie-game.port while it runs, gone after; dl1 check before, set after"
 rm -rf /run/blockie-gpu
 
 FAKE_NW=kill splay "$g"

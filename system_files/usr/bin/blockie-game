@@ -363,7 +363,8 @@ elif [[ $system == steam ]]; then
   stmp=$data/cache/steam-tmp/run
   mkdir -p -m 0700 -- "$rom/.blockie/nw" || die "cannot make $rom/.blockie/nw"
   port "$run/blockie-steam/last.log" "$stmp" "$cwd" HOME="$data/steam-home" TMPDIR="$stmp" \
-    ALSA_CONFIG_PATH=/usr/share/blockie/ports/alsa.conf LD_LIBRARY_PATH="$rdir/lib${gpulib:+:$gpulib}" "$rdir/nw" \
+    ALSA_CONFIG_PATH=/usr/share/blockie/ports/alsa.conf LD_LIBRARY_PATH="$rdir/lib${gpulib:+:$gpulib}" \
+    DBUS_SESSION_BUS_ADDRESS=disabled: "$rdir/nw" \
     --ozone-platform=wayland --ignore-gpu-blocklist --use-gl=angle --use-angle=gles \
     "--host-resolver-rules=MAP * ~NOTFOUND" --user-data-dir="$rom/.blockie/nw" --disk-cache-dir="$stmp/nw-cache" .
 fi

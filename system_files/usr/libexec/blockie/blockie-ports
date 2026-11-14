@@ -170,6 +170,8 @@ NW_JSON_MAX = 1 << 16
 NW_BIN = "nw"
 NW_ARGS_MAX = 1024
 NW_ARGS = re.compile(r"--force-color-profile=[A-Za-z0-9_.-]+")
+NW_JS = ".blockie-nw.js"
+NW_JS_BODY = b'for (const k of ["resizeBy", "resizeTo", "moveBy", "moveTo"]) window[k] = function () {};\n'
 
 
 class Fail(Exception):
@@ -2398,7 +2400,8 @@ def nw_package(name, data):
     if hit is None:
         return placed
     dst = f"{os.path.dirname(hit[0])}/package.json"
-    if not (inside_port_dst(name, hit[0]) and inside_port_dst(name, dst)):
+    jdst = f"{os.path.dirname(hit[0])}/{NW_JS}"
+    if not (inside_port_dst(name, hit[0]) and inside_port_dst(name, dst) and inside_port_dst(name, jdst)):
         return placed
     full = os.path.join(GAMES, hit[0])
     src = full if hit[0] == dst or os.path.lexists(full) else os.path.join(GAMES, dst)
@@ -2417,7 +2420,7 @@ def nw_package(name, data):
     main = depot.get("main")
     window = depot.get("window") if isinstance(depot.get("window"), dict) else {}
     out = {"name": NW_APP, "main": main if rel_ok(main) and len(main) <= 256 else "index.html",
-           "window": {**window, "fullscreen": True}}
+           "window": {**window, "fullscreen": True, "frame": False}, "inject_js_start": NW_JS}
     for key in ("chromium-args", "js-flags"):
         v = depot.get(key)
         if not isinstance(v, str) or len(v) > NW_ARGS_MAX or CTRL.search(v):
@@ -2431,6 +2434,13 @@ def nw_package(name, data):
                 continue
         out[key] = v
     body = json.dumps(out).encode()
+    for x in [x for x in placed if x[0].lower() == jdst.lower()]:
+        placed.remove(x)
+        log(f"{name}: the depot's {os.path.basename(x[0])} is replaced by Blockie's")
+        if x[0] != jdst:
+            remove(os.path.join(GAMES, x[0]))
+    write_atomic(os.path.join(GAMES, jdst), NW_JS_BODY)
+    placed.append([jdst, len(NW_JS_BODY), hashlib.sha1(NW_JS_BODY).hexdigest()])
     write_atomic(os.path.join(GAMES, dst), body)
     if hit[0] != dst:
         remove(full)

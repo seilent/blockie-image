@@ -1986,29 +1986,57 @@ def _(c):
 
 PKG = json.dumps({"name": "rmmz-game", "main": "index.html", "chromium-args": "--force-color-profile=srgb",
                   "node-remote": "*", "window": {"title": "", "width": 816, "height": 624, "position": "center"}})
+NWJS = 'for (const k of ["resizeBy", "resizeTo", "moveBy", "moveTo"]) window[k] = function () {};\n'
+WIN = {"fullscreen": True, "frame": False}
+
+
+def blockie(**keys):
+    return {"name": "steam-nwjs", "main": "index.html", "inject_js_start": ".blockie-nw.js", **keys}
 
 
 @case("the Blockie package.json: the get's last step writes name steam-nwjs, the depot's main, chromium-args and "
-      "window keys with fullscreen true, no other key; .got records its size and SHA1; the next get rewrites it with "
-      "no exists failure; remove deletes it; a runner conf not named nwjs leaves the depot's file")
+      "window keys with fullscreen true and frame false, inject_js_start naming .blockie-nw.js, no other key; "
+      ".blockie-nw.js beside it holds the line that stubs the window move and resize calls; .got records both with "
+      "their size and SHA1; the next get rewrites both with no exists failure; remove deletes both; a runner conf "
+      "not named nwjs writes neither")
 def _(c):
     nw_ready(dict(GET, **{"package.json": PKG}))
     rc, out = call("steam-lib", "get", "9000201")
     pj = f"{GAMES}/9000201/package.json"
-    want = {"name": "steam-nwjs", "main": "index.html", "chromium-args": "--force-color-profile=srgb",
-            "window": {"title": "", "width": 816, "height": 624, "position": "center", "fullscreen": True}}
-    c(out[-1] == "done\t9000201" and json.loads(rd(pj)) == want, f"{out[-1:]} {rd(pj)} {LOG[-3:]}")
+    js = f"{GAMES}/9000201/.blockie-nw.js"
+    want = blockie(**{"chromium-args": "--force-color-profile=srgb",
+                      "window": {"title": "", "width": 816, "height": 624, "position": "center", **WIN}})
+    c(out[-1] == "done\t9000201" and json.loads(rd(pj)) == want and rd(js) == NWJS,
+      f"{out[-1:]} {rd(pj)} {LOG[-3:]}")
     got = json.loads(rd(f"{GS}/9000201.got"))
     c(got["files"]["9000201/package.json"] == [len(rd(pj).encode()), sha1(rd(pj))] and
-      "9000201/package.json" in got["placed"], f"{got['files'].get('9000201/package.json')}")
+      got["files"]["9000201/.blockie-nw.js"] == [len(NWJS), sha1(NWJS)] and
+      got["placed"].count("9000201/package.json") == 1 and got["placed"].count("9000201/.blockie-nw.js") == 1,
+      f"{got['files'].get('9000201/package.json')} {got['files'].get('9000201/.blockie-nw.js')}")
+    os.unlink(js)
     rc, out = call("steam-lib", "get", "9000201")
-    c(out[-1] == "done\t9000201" and json.loads(rd(pj)) == want, f"second get: {out[-1:]} {LOG[-3:]}")
+    got = json.loads(rd(f"{GS}/9000201.got"))
+    c(out[-1] == "done\t9000201" and json.loads(rd(pj)) == want and rd(js) == NWJS and
+      got["placed"].count("9000201/.blockie-nw.js") == 1, f"second get: {out[-1:]} {LOG[-3:]}")
     rc, out = call("steam-lib", "remove", "9000201")
-    c(out == ["done\t9000201"] and not os.path.exists(pj) and not os.path.exists(f"{GS}/9000201.got"),
-      f"remove: {out} {os.path.exists(pj)}")
+    c(out == ["done\t9000201"] and not os.path.exists(pj) and not os.path.exists(js) and
+      not os.path.exists(f"{GS}/9000201.got"), f"remove: {out} {os.path.exists(pj)} {os.path.exists(js)}")
     get_ready(dict(GET, **{"package.json": PKG}))
     call("steam-lib", "get", "9000201")
-    c(rd(pj) == PKG, f"test.conf: {rd(pj)}")
+    c(rd(pj) == PKG and not os.path.exists(js), f"test.conf: {rd(pj)}")
+
+
+@case("a depot file named .blockie-nw.js, in any case, is replaced by Blockie's under that exact name and recorded "
+      "with Blockie's size and SHA1, with one log line")
+def _(c):
+    nw_ready(dict(GET, **{".Blockie-NW.js": "invented depot script"}))
+    rc, out = call("steam-lib", "get", "9000201")
+    files = os.listdir(f"{GAMES}/9000201")
+    got = json.loads(rd(f"{GS}/9000201.got"))
+    c(out[-1] == "done\t9000201" and ".blockie-nw.js" in files and ".Blockie-NW.js" not in files and
+      rd(f"{GAMES}/9000201/.blockie-nw.js") == NWJS and "9000201/.Blockie-NW.js" not in got["files"] and
+      got["files"]["9000201/.blockie-nw.js"] == [len(NWJS), sha1(NWJS)] and
+      sum("is replaced by Blockie's" in x for x in LOG) == 1, f"{out[-1:]} {sorted(files)} {LOG[-3:]}")
 
 
 @case("the Blockie package.json from depot files out of form: a Package.json is replaced by package.json and "
@@ -2031,16 +2059,15 @@ def _(c):
     c(out[-1] == "done\t9000201" and "package.json" in files and "Package.json" not in files, f"again: {files}")
     rc, out = call("steam-lib", "remove", "9000201")
     c(out == ["done\t9000201"] and not os.path.exists(f"{GAMES}/9000201/package.json"), f"remove: {out}")
-    plain = {"name": "steam-nwjs", "main": "index.html", "window": {"fullscreen": True}}
+    plain = blockie(window=WIN)
     args = ('-host-rules=MAP * 203.0.113.9 "--host-rules=MAP * x" --class=x --remote-debugging-port=9222 '
             '--force-color-profile=srgb')
     for label, body, want in (
             ("allowlist", json.dumps({"main": "index.html", "chromium-args": args}),
-             {"name": "steam-nwjs", "main": "index.html", "chromium-args": "--force-color-profile=srgb",
-              "window": {"fullscreen": True}}),
+             blockie(**{"chromium-args": "--force-color-profile=srgb"}, window=WIN)),
             ("conflicting args", json.dumps({"main": "index.html", "chromium-args": "--disable-gpu --x",
                                              "js-flags": "--expose-gc"}),
-             {"name": "steam-nwjs", "main": "index.html", "js-flags": "--expose-gc", "window": {"fullscreen": True}}),
+             blockie(**{"js-flags": "--expose-gc"}, window=WIN)),
             ("window no dict", json.dumps({"main": "index.html", "window": [1]}), plain),
             ("main a URL", json.dumps({"main": "https://example.invalid/x.html"}), plain),
             ("over 64 KiB", json.dumps({"main": "game.html", "pad": "x" * 70000}), plain),
@@ -2066,7 +2093,8 @@ def _(c):
             "got": {"depots": [], "class": "rmmz", "os": "windows", "root": ""}}
     LOG.clear()
     placed = m.nw_package("app-9000201", data)
-    c(placed == [["9000201/package.json", len(rd(pj).encode()), sha1(rd(pj))]] and json.loads(rd(pj)) == before and
+    c(placed == [["9000201/package.json", len(rd(pj).encode()), sha1(rd(pj))],
+                 ["9000201/.blockie-nw.js", len(NWJS), sha1(NWJS)]] and json.loads(rd(pj)) == before and
       before["window"]["width"] == 816 and not os.path.exists(f"{GAMES}/9000201/Package.json"),
       f"replay: {placed} {rd(pj)} {LOG}")
     write(pj, "changed by the game")
