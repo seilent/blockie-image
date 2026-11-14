@@ -11,6 +11,7 @@ done
 own+=(retroarch/retroarch libretro-shaders-blockie/libretro-shaders-blockie waydroid/waydroid)
 own+=(gptokeyb/gptokeyb gptokeyb2/gptokeyb2 libjpeg8/libjpeg8 portmaster/portmaster depotdownloader/depotdownloader)
 own+=(gl4es/gl4es)
+own+=(box64/box64)
 
 own_rpm() {
   local dir=/pkgs/${1%%/*} name=${1#*/} f found=()
@@ -84,5 +85,4 @@ dnf -y "${opts[@]}" install \
   openal-soft \
   libtheora \
   libvorbis \
-  libatomic \
-  box64
+  libatomic

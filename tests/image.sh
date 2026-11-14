@@ -78,7 +78,11 @@ rpm -q e2fsprogs tzdata erofs-utils vulkan-tools egl-utils drm-utils strace file
 rpm -q gptokeyb gptokeyb2 portmaster SDL2_mixer SDL2_ttf SDL2_image love luajit innoextract xdelta turbojpeg \
   7zip-standalone-all squashfs-tools sdl2-compat openal-soft libtheora libvorbis libjpeg8 > /dev/null || fail "ports packages missing"
 rpm -q libatomic > /dev/null || fail "libatomic missing (the NW.js runner's libnode dlopens it)"
-rpm -q box64 box64-data gl4es > /dev/null || fail "box64 runner packages missing"
+rpm -q box64 gl4es > /dev/null || fail "box64 runner packages missing"
+[[ $(rpm -q --qf '%{VERSION}' box64) == 0.4.4 ]] || fail "box64 is not 0.4.4: $(rpm -q box64)"
+[[ -f /usr/bin/box64-sd845 && -x /usr/bin/box64-sd845 ]] || fail "/usr/bin/box64-sd845 missing"
+! rpm -q box64-data > /dev/null 2>&1 || fail "box64-data installed"
+[[ $(rpm -qf --qf '%{NAME}' /etc/box64.box64rc) == box64 ]] || fail "/etc/box64.box64rc is not from box64"
 compat=/usr/lib64/blockie-ports/compat
 [[ -f $compat/libjpeg.so.8 && $(rpm -qf --qf '%{NAME}' "$compat/libjpeg.so.8") == libjpeg8 ]] &&
   grep -qaF LIBJPEG_8.0 "$compat/libjpeg.so.8" || fail "$compat/libjpeg.so.8 is not libjpeg8's LIBJPEG_8.0 library"

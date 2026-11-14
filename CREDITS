@@ -86,6 +86,12 @@ packages/gl4es: gl4es (https://github.com/ptitSeb/gl4es, 8b1a3da, MIT, Copyright
 eglGetPlatformDisplayEXT takes an EGLint list and copies it to EGLAttrib. It holds MIT code by Matthäus G. Chajdas,
 Benjamin Dobell, Attractive Chaos and Brian Paul (Mesa), and public domain stb_dxt; their notices are in
 /usr/share/licenses/gl4es/THIRD-PARTY beside LICENSE.
+packages/box64: Box64 (https://github.com/ptitSeb/box64, v0.4.4 2f130fa, MIT, Copyright (c) 2020 ptitSeb), built twice
+into /usr/bin/box64 (generic ARM64) and /usr/bin/box64-sd845 (SD845), with system/box64.box64rc as /etc/box64.box64rc.
+It holds elfhacks by Pyry Haulos (Zlib), Realmode X86 Emulator Library code by SciTech Software, David Mosberger-Tang,
+Egbert Eich and SUSE (HPND-sell-variant), khash by Attractive Chaos (MIT), sheredom json.h (Unlicense), the SDL
+dynapi list by Sam Lantinga (Zlib) and Mesa d3dadapter9 headers by Joakim Sindholt (MIT); their notices are in
+/usr/share/licenses/box64/THIRD-PARTY beside LICENSE.
 system_files/usr/share/blockie/ports/steam-map.tsv and steam-files/: made from the PortMaster-New catalogue and port
 zips (https://github.com/PortsMaster/PortMaster-New, MIT, ports.json of 2026-11-02_1442), with depot ids from public
 Steam app data.
