@@ -1,0 +1,12 @@
+diff --git a/src/config.cpp b/src/config.cpp
+--- a/src/config.cpp
++++ b/src/config.cpp
+@@ -43,7 +43,7 @@
+ 
+     FILE* fp;
+ 
+-    if ((fp = fopen(path, "r+")) == NULL) {
++    if ((fp = fopen(path, "r")) == NULL) {
+         fprintf(stderr, "[GPTK]: fopen(%s):", path);
+         perror("");
+         return result;

@@ -15,7 +15,7 @@ lic=/usr/share/licenses/$name
 src=/usr/share/blockie/sources/portmaster/$name
 want=$(printf '%s\n' /usr/lib64/blockie-ports /usr/lib64/blockie-ports/gptokeyb "$lic" "$lic/LICENSE.md" \
   /usr/share/blockie/sources /usr/share/blockie/sources/portmaster "$src" "$src/$name-$commit.tar.gz" \
-  "$src/no-kill-mode.patch" | LC_ALL=C sort)
+  "$src/no-kill-mode.patch" "$src/read-only-config.patch" | LC_ALL=C sort)
 [[ $(rpm -qpl "$rpm" | LC_ALL=C sort) == "$want" ]] || fail "file list: $(rpm -qpl "$rpm" | tr '\n' ' ')"
 [[ $(rpm -qp --qf '%{LICENSE}' "$rpm") == GPL-2.0-or-later ]] || fail "licence tag"
 t=$(mktemp -d)
@@ -26,6 +26,7 @@ grep -q 'GNU GENERAL PUBLIC LICENSE' "$t$lic/LICENSE.md" && grep -q 'Version 2, 
   fail "GPL-2.0 text"
 tar -tzf "$t$src/$name-$commit.tar.gz" "$name-$commit/src/gptokeyb.cpp" > /dev/null || fail "source tarball"
 grep -q '^-void doKillMode();$' "$t$src/no-kill-mode.patch" || fail "kill mode patch"
+grep -qxF '+    if ((fp = fopen(path, "r")) == NULL) {' "$t$src/read-only-config.patch" || fail "read only config patch"
 case $(uname -m) in
   x86_64) machine="Advanced Micro Devices X86-64" ;;
   aarch64) machine=AArch64 ;;

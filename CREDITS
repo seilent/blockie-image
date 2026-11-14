@@ -52,8 +52,8 @@ handheld/shaders/retro-v2.glsl (Hyllian 2013, GPL-2.0-or-later). sp101-color.gls
 handheld/shaders/color/sp101-color.slang of https://github.com/libretro/slang-shaders (afb1416b) by Pokefan531,
 hunterk and crashGG (public domain).
 packages/gptokeyb: gptokeyb (https://github.com/PortsMaster/gptokeyb, 5b1284e, GPL-2.0-or-later), built with
-no-kill-mode.patch, which removes the hotkey plus START kill. The source and the patch are under
-/usr/share/blockie/sources/portmaster/gptokeyb/.
+no-kill-mode.patch, which removes the hotkey plus START kill, and read-only-config.patch, which opens the config
+file read only. The source and the patches are under /usr/share/blockie/sources/portmaster/gptokeyb/.
 packages/gptokeyb2: gptokeyb2 and libinterpose (https://github.com/PortsMaster/gptokeyb2, 647b46f,
 GPL-2.0-or-later, with inih under BSD-3-Clause), built with no-kill-mode.patch, which removes the hotkey plus START
 kill. The source and the patch are under /usr/share/blockie/sources/portmaster/gptokeyb2/.
