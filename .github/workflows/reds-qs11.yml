@@ -1,0 +1,95 @@
+name: reds-qs11
+
+on:
+  push:
+    branches: ['reds/**']
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  IMAGE: ghcr.io/seilent/blockie
+  REDS: ci/qs11-red.json
+
+jobs:
+  legs:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+
+      - name: Install tools
+        run: build/ci-need.sh podman:podman jq:jq
+
+      - name: Pull
+        env:
+          GH_ACTOR: ${{ github.actor }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag=dev-$(git rev-parse HEAD^ | cut -c1-7)
+          podman login ghcr.io -u "$GH_ACTOR" --password-stdin <<< "$GH_TOKEN"
+          podman pull "$IMAGE:$tag"
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+
+      - name: Control
+        run: |
+          [[ $(jq length "$REDS") == 33 ]] || { echo "::error::$REDS length changed"; exit 1; }
+          timeout -k 30 600 podman run --rm -e HOTKEYD_CASES=qs11 -v "$PWD/tests:/tests:ro" -v "$PWD/boot:/repo-boot:ro" \
+            "$IMAGE:$TAG" /tests/hotkeyd.sh
+
+      - name: Legs
+        run: |
+          leg() {
+            i=$1
+            d=$RUNNER_TEMP/leg$i
+            mkdir -p "$d"
+            file=$(jq -r ".[$i].file" "$REDS")
+            [[ $file == system_files/* && -f $file ]] || { echo "leg $i: $file is not a system_files path"; return 1; }
+            dest=/${file#system_files/}
+            s=$(jq -r ".[$i].test | split(\" \")[0] | ltrimstr(\"tests/\") | rtrimstr(\".sh\")" "$REDS")
+            [[ -f tests/$s.sh ]] || { echo "leg $i names no suite"; return 1; }
+            jq -j ".[$i].old" "$REDS" > "$d/old"
+            jq -j ".[$i].new" "$REDS" > "$d/new"
+            python3 - "$file" "$d/old" "$d/new" "$d/mutant" << 'PY' || { echo "leg $i: old does not occur exactly once"; return 1; }
+          import sys
+          s = open(sys.argv[1]).read()
+          old = open(sys.argv[2]).read()
+          new = open(sys.argv[3]).read()
+          if s.count(old) != 1:
+              sys.exit(1)
+          open(sys.argv[4], "w").write(s.replace(old, new))
+          PY
+            cmp -s "$file" "$d/mutant" && { echo "leg $i: mutant equals the file"; return 1; }
+            chmod --reference="$file" "$d/mutant"
+            timeout -k 30 600 podman run --rm -e HOTKEYD_CASES=qs11 -v "$PWD/tests:/tests:ro" -v "$PWD/boot:/repo-boot:ro" \
+              -v "$d/mutant:$dest:ro" "$IMAGE:$TAG" "/tests/$s.sh" > "$d/red.out" 2>&1 && rc=0 || rc=$?
+            want=$(jq -r ".[$i].expected_failure" "$REDS")
+            if (( rc == 0 )); then
+              cat "$d/red.out"
+              echo "leg $i ($s) passed with the mutant"
+              return 1
+            elif ! grep -qF -- "$want" "$d/red.out"; then
+              cat "$d/red.out"
+              echo "leg $i ($s) failed (rc $rc) without: $want"
+              return 1
+            fi
+            echo "leg $i red as expected ($s, rc $rc): $want"
+          }
+          export -f leg
+          n=$(jq length "$REDS")
+          seq 0 $((n - 1)) | xargs -P 6 -I{} bash -c 'leg {} > "$RUNNER_TEMP/leg{}.log" 2>&1; echo $? > "$RUNNER_TEMP/leg{}.rc"' || true
+          bad=0
+          for i in $(seq 0 $((n - 1))); do
+            cat "$RUNNER_TEMP/leg$i.log"
+            [[ $(cat "$RUNNER_TEMP/leg$i.rc" 2>/dev/null) == 0 ]] || { echo "::error::leg $i not red"; bad=1; }
+          done
+          exit $bad
