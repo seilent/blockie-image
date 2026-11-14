@@ -1,0 +1,251 @@
+diff --git a/src/egl/egl.c b/src/egl/egl.c
+index 4f8a888..5d791f1 100644
+--- a/src/egl/egl.c
++++ b/src/egl/egl.c
+@@ -156,11 +156,6 @@ EGLBoolean gl4es_eglWaitClient(void) {
+     return egl_eglWaitClient();
+ }
+ 
+-EGLBoolean gl4es_eglReleaseThread(void) {
+-    LOAD_EGL(eglReleaseThread);
+-    return egl_eglReleaseThread();
+-}
+-
+ EGLSurface gl4es_eglCreatePbufferFromClientBuffer(EGLDisplay dpy, EGLenum buftype, EGLClientBuffer buffer, EGLConfig config, const EGLint *attrib_list) {
+     LOAD_EGL(eglCreatePbufferFromClientBuffer);
+     return egl_eglCreatePbufferFromClientBuffer(dpy, buftype, buffer, config, attrib_list);
+@@ -186,19 +181,198 @@ EGLBoolean gl4es_eglSwapInterval(EGLDisplay dpy, EGLint interval) {
+     return egl_eglSwapInterval(dpy, interval);
+ }
+ 
++#define CONTEXTS_MAX 64
++
++typedef struct {
++    int refs;
++    void *anchor;
++} context_group_t;
++
++static pthread_mutex_t contexts_lock = PTHREAD_MUTEX_INITIALIZER;
++static struct {
++    EGLContext ctx;
++    context_group_t *group;
++    void *state;
++    int bound;
++    int destroyed;
++} contexts[CONTEXTS_MAX];
++
++static int find_context(EGLContext ctx) {
++    if (ctx == EGL_NO_CONTEXT)
++        return -1;
++    for (int i = 0; i < CONTEXTS_MAX; i++)
++        if (contexts[i].ctx == ctx)
++            return i;
++    return -1;
++}
++
++static void forget_context(int i) {
++    context_group_t *group = contexts[i].group;
++    memset(&contexts[i], 0, sizeof(contexts[i]));
++    if (!--group->refs)
++        free(group);
++}
++
++static void drop_context(int i) {
++    context_group_t *group = contexts[i].group;
++    void *state = contexts[i].state, *anchor = NULL;
++    memset(&contexts[i], 0, sizeof(contexts[i]));
++    if (!--group->refs) {
++        anchor = group->anchor;
++        free(group);
++    }
++    if (state)
++        gl4es_state_delete(state);
++    if (anchor)
++        gl4es_state_delete(anchor);
++}
++
++static void* bind_context(int i) {
++    if (!contexts[i].state) {
++        context_group_t *group = contexts[i].group;
++        if (!group->anchor)
++            group->anchor = gl4es_state_new(NULL);
++        contexts[i].state = gl4es_state_new(group->anchor);
++    }
++    contexts[i].bound = 1;
++    return contexts[i].state;
++}
++
++static void drop_if_destroyed(EGLContext ctx) {
++    pthread_mutex_lock(&contexts_lock);
++    int i = find_context(ctx);
++    if (i >= 0 && contexts[i].destroyed)
++        drop_context(i);
++    pthread_mutex_unlock(&contexts_lock);
++}
++
++static void unbind_context(EGLContext ctx) {
++    pthread_mutex_lock(&contexts_lock);
++    int i = find_context(ctx);
++    if (i >= 0)
++        contexts[i].bound = 0;
++    pthread_mutex_unlock(&contexts_lock);
++}
++
+ EGLContext gl4es_eglCreateContext(EGLDisplay dpy, EGLConfig config, EGLContext share_context, const EGLint *attrib_list) {
+     LOAD_EGL(eglCreateContext);
+-    return egl_eglCreateContext(dpy, config, share_context, (hardext.esversion == 1) ? egl_context_attrib : egl_context_attrib_es2);
++    EGLContext ctx = egl_eglCreateContext(dpy, config, share_context, (hardext.esversion == 1) ? egl_context_attrib : egl_context_attrib_es2);
++    if (ctx == EGL_NO_CONTEXT)
++        return ctx;
++    pthread_mutex_lock(&contexts_lock);
++    int i = find_context(ctx);
++    if (i >= 0)
++        forget_context(i);
++    i = 0;
++    while (i < CONTEXTS_MAX && contexts[i].ctx != EGL_NO_CONTEXT)
++        i++;
++    if (i < CONTEXTS_MAX) {
++        int s = find_context(share_context);
++        context_group_t *group = (s >= 0) ? contexts[s].group : calloc(1, sizeof(context_group_t));
++        if (group) {
++            group->refs++;
++            contexts[i].ctx = ctx;
++            contexts[i].group = group;
++        }
++    }
++    pthread_mutex_unlock(&contexts_lock);
++    return ctx;
+ }
+ 
+ EGLBoolean gl4es_eglDestroyContext(EGLDisplay dpy, EGLContext ctx) {
+     LOAD_EGL(eglDestroyContext);
++    LOAD_EGL(eglMakeCurrent);
++    LOAD_EGL(eglGetCurrentContext);
++    LOAD_EGL(eglGetCurrentDisplay);
++    LOAD_EGL(eglGetCurrentSurface);
++    pthread_mutex_lock(&contexts_lock);
++    int i = find_context(ctx);
++    int needs_current = 0;
++    if (i >= 0) {
++        if (contexts[i].bound)
++            contexts[i].destroyed = 1;
++        else if (!contexts[i].state && (contexts[i].group->refs > 1 || !contexts[i].group->anchor))
++            forget_context(i);
++        else
++            needs_current = 1;
++    }
++    pthread_mutex_unlock(&contexts_lock);
++    if (needs_current) {
++        EGLContext cur = egl_eglGetCurrentContext();
++        EGLDisplay cdpy = egl_eglGetCurrentDisplay();
++        EGLSurface cdraw = egl_eglGetCurrentSurface(EGL_DRAW);
++        EGLSurface cread = egl_eglGetCurrentSurface(EGL_READ);
++        pthread_mutex_lock(&contexts_lock);
++        int c = find_context(cur);
++        if (c >= 0 && contexts[c].destroyed) {
++            drop_context(c);
++            cur = EGL_NO_CONTEXT;
++        }
++        pthread_mutex_unlock(&contexts_lock);
++        if (egl_eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx)) {
++            pthread_mutex_lock(&contexts_lock);
++            i = find_context(ctx);
++            if (i >= 0)
++                drop_context(i);
++            pthread_mutex_unlock(&contexts_lock);
++            EGLBoolean back = (cur != EGL_NO_CONTEXT) && egl_eglMakeCurrent(cdpy, cdraw, cread, cur);
++            if (!back)
++                egl_eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
++            void *state = NULL;
++            pthread_mutex_lock(&contexts_lock);
++            c = find_context(cur);
++            if (c >= 0) {
++                if (back)
++                    state = bind_context(c);
++                else
++                    contexts[c].bound = 0;
++            }
++            pthread_mutex_unlock(&contexts_lock);
++            if (state)
++                gl4es_state_activate(state);
++        } else {
++            pthread_mutex_lock(&contexts_lock);
++            i = find_context(ctx);
++            if (i >= 0)
++                forget_context(i);
++            pthread_mutex_unlock(&contexts_lock);
++        }
++    }
+     return egl_eglDestroyContext(dpy, ctx);
+ }
+ 
+ EGLBoolean gl4es_eglMakeCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read, EGLContext ctx) {
+     LOAD_EGL(eglMakeCurrent);
+-    return egl_eglMakeCurrent(dpy, draw, read, ctx);
++    LOAD_EGL(eglGetCurrentContext);
++    EGLContext old = egl_eglGetCurrentContext();
++    if (old != ctx)
++        drop_if_destroyed(old);
++    EGLBoolean ret = egl_eglMakeCurrent(dpy, draw, read, ctx);
++    if (!ret)
++        return ret;
++    if (old != ctx)
++        unbind_context(old);
++    if (ctx != EGL_NO_CONTEXT) {
++        void *state = NULL;
++        pthread_mutex_lock(&contexts_lock);
++        int i = find_context(ctx);
++        if (i >= 0)
++            state = bind_context(i);
++        pthread_mutex_unlock(&contexts_lock);
++        gl4es_state_activate(state);
++    }
++    return ret;
++}
++
++EGLBoolean gl4es_eglReleaseThread(void) {
++    LOAD_EGL(eglReleaseThread);
++    LOAD_EGL(eglGetCurrentContext);
++    EGLContext old = egl_eglGetCurrentContext();
++    drop_if_destroyed(old);
++    EGLBoolean ret = egl_eglReleaseThread();
++    if (ret)
++        unbind_context(old);
++    return ret;
+ }
+ 
+ EGLContext gl4es_eglGetCurrentContext(void) {
+diff --git a/src/egl/egl.h b/src/egl/egl.h
+index 9de91d5..b69c076 100644
+--- a/src/egl/egl.h
++++ b/src/egl/egl.h
+@@ -66,5 +66,8 @@ EGLBoolean gl4es_eglWaitSync(EGLDisplay dpy, EGLSync sync, EGLint flags);
+ NativePixmapType gl4es_egl_create_pixmap_ID_mapping(void *pixmap);
+ NativePixmapType gl4es_egl_destroy_pixmap_ID_mapping(int id);
+ 
+-#endif // _EGL_EGL_H
++void* gl4es_state_new(void* shared_state);
++void gl4es_state_activate(void* state);
++void gl4es_state_delete(void* state);
+ 
++#endif // _EGL_EGL_H
+diff --git a/src/gl/glstate.c b/src/gl/glstate.c
+index 5532147..8b5161c 100644
+--- a/src/gl/glstate.c
++++ b/src/gl/glstate.c
+@@ -653,3 +653,15 @@ void gl_init() {
+ void gl_close() {
+  DeleteGLState(DEFAULT_STATE);
+ }
++
++EXPORT void* gl4es_state_new(void* shared_state) {
++    return NewGLState(shared_state, 0);
++}
++
++EXPORT void gl4es_state_activate(void* state) {
++    ActivateGLState(state);
++}
++
++EXPORT void gl4es_state_delete(void* state) {
++    DeleteGLState(state);
++}

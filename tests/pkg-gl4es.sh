@@ -55,7 +55,8 @@ grep -qxF libGL.so.1 <<< "$(needed "$t$dir/egl/libEGL.so.1")" || fail "libEGL.so
 ! grep -qE '^lib(EGL|GLESv2|GLESv1_CM|mali)\.so' <<< "$(needed "$t$dir/egl/libEGL.so.1")" ||
   fail "libEGL.so.1 links a GLES or EGL library"
 syms=$(readelf --dyn-syms -W "$t$dir/libGL.so.1" | awk '$7 != "UND" { print $8 }')
-for s in glXCreateContext glXMakeCurrent glXSwapBuffers glBegin glGetString; do
+for s in glXCreateContext glXMakeCurrent glXSwapBuffers glBegin glGetString gl4es_state_new gl4es_state_activate \
+  gl4es_state_delete; do
   grep -qxF "$s" <<< "$syms" || fail "libGL.so.1 does not export $s"
 done
 syms=$(readelf --dyn-syms -W "$t$dir/egl/libEGL.so.1" | awk '$7 != "UND" { print $8 }')

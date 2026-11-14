@@ -17,6 +17,7 @@ Patch0:         egl-attrib-ptr.patch
 Patch1:         egl15-forward.patch
 Patch2:         egl-no-error.patch
 Patch3:         fbo-probe.patch
+Patch4:         egl-context-state.patch
 BuildRequires:  gcc
 BuildRequires:  cmake
 BuildRequires:  ninja-build
