@@ -273,7 +273,7 @@ static int rules(const char* cmd, const uint8_t* old, const uint8_t* bc)
             return 1;
         }
     } else if (!strcmp(cmd, "mark-b")) {
-        if (strcmp(block_class(old), "ours") || b0.priority != 15) {
+        if (strcmp(block_class(old), "ours") || b0.priority < 13) {
             fprintf(stderr, "abctl: mark-b refused: needs class ours and slot b priority 15, reads class %s a %d/%d/%d "
                             "b %d/%d/%d\n", block_class(old), a0.priority, a0.tries, a0.successful, b0.priority,
                     b0.tries, b0.successful);
