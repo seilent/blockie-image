@@ -314,6 +314,7 @@ def main():
         D0 = bc_of("_a", (15, 0, 0), (13, 1, 1))
         U = bc_of("_a", (15, 3, 0), (13, 1, 0))
         F = bc_of("_b", (0, 0, 0), (15, 1, 1))
+        F0 = bc_of("_b", (0, 0, 0), (15, 0, 0))
         H = bc_of("_b", (14, 3, 0), (15, 1, 1))
         T = bc_of("_a", (15, 1, 0), (14, 1, 1))
         RESET = bc_of("_a", (15, 7, 0), (15, 7, 0))
@@ -442,7 +443,8 @@ def main():
             put(bc)
             rc, out, err = abctl("-d", m, "show")
             check(f"class {cls}" in out.splitlines(), f"show prints class {cls} for {what}")
-        for cmd in ("default-a", "hold-b", "fix-b", "unprove-b", "refund-a", "test-b", "arm-a", "arm-b-once", "rearm"):
+        for cmd in ("default-a", "hold-b", "fix-b", "unprove-b", "refund-a", "test-b", "arm-a", "arm-b-once", "rearm",
+                    "mark-b"):
             refused(cmd, TORN, "no valid bootloader_control", f"{cmd} refused on a torn sector")
 
         def traced(args):
@@ -459,7 +461,8 @@ def main():
                                         (["unprove-b"], D, 512, 2048),
                                         (["refund-a"], D2, 512, 2048), (["test-b"], D, 512, 2048),
                                         (["arm-a"], F, 512, 2048), (["arm-b-once"], D, 512, 2048),
-                                        (["rearm"], T, 512, 2048), (["bcb-recovery", "menu"], D, 512, 0),
+                                        (["rearm"], T, 512, 2048), (["mark-b"], F0, 512, 2048),
+                                        (["bcb-recovery", "menu"], D, 512, 0),
                                         (["bcb-attempt"], D, 512, 0), (["bcb-input"], D, 512, 0),
                                         (["bcb-clear"], D, 512, 0), (["clear-msg"], D, 2048, 0)):
             put(before)
@@ -473,6 +476,33 @@ def main():
 
         def msg_is(sec, what, bc=D):
             check(cur() == sec + orig[512:0x800] + bc + orig[0x820:], what)
+
+        fallback = bcb(b"boot-recovery", b"", b"recovery\n--blockie=fallback")
+        for sec, before, after, what in ((fallback, F0, F,
+                                          "F after b's try was spent (a 0/0/0, b 15/0/0, BCB fallback)"),
+                                         (bytes(512), bc_of("_a", (0, 0, 0), (15, 0, 0)),
+                                          bc_of("_a", (0, 0, 0), (15, 1, 1)), "the alternation (a 0/0/0, b 15/0/0)"),
+                                         (bytes(512), bc_of("_b", (14, 3, 0), (15, 0, 0)), H,
+                                          "hold-b's shape after b's try (a 14/3/0, b 15/0/0)"),
+                                         (bytes(512), bc_of("_b", (14, 3, 0), (15, 1, 0)), H,
+                                          "test-b's shape (a 14/3/0, b 15/1/0)")):
+            put_msg(sec, before)
+            rc, out, err = abctl("-d", m, "mark-b")
+            check(rc == 0, f"mark-b on {what}: exit 0" + (": " + err.strip() if rc else ""))
+            msg_is(sec, f"mark-b on {what}: b 15/1/1, slot a, suffix and sector 0 as read", after)
+        slot_cmd("mark-b", F, F, "mark-b on F with b already 15/1/1: written again, unchanged")
+        x = bytearray(F0)
+        y = bytearray(F)
+        x[13] = y[13] = 0xfe
+        x[15] = y[15] = 1
+        slot_cmd("mark-b", fix_crc(x), fix_crc(y),
+                 "mark-b leaves slot a's two bytes as read (reserved bits 0xfe) and keeps b's verity_corrupted")
+        for bc, why, what in ((T, "class ours a 15/1/0 b 14/1/1", "T (b 14)"),
+                              (U, "class ours a 15/3/0 b 13/1/0", "b 13"),
+                              (bc_of("_b", (14, 7, 0), (15, 0, 0)), "class reset a 14/7/0", "class reset (a tries 7)"),
+                              (bc_of("_b", (15, 3, 0), (15, 0, 0)), "class reset a 15/3/0", "a at 15")):
+            refused("mark-b", bc, "mark-b refused: needs class ours and slot b priority 15, reads " + why,
+                    f"mark-b refused on {what}")
 
         ours = b"recovery\n--blockie=menu"
         put(D)
@@ -680,7 +710,7 @@ def main():
         for args in (["bcb-recovery"], ["bcb-recovery", ""], ["bcb-recovery", "Menu"], ["bcb-recovery", "a b"],
                      ["bcb-recovery", "../x"], ["bcb-recovery", "x" * 33], ["bcb-recovery", "menu", "x"],
                      ["bcb-attempt", "x"], ["bcb-input", "x"], ["bcb-clear", "x"], ["default-a", "x"],
-                     ["fix-b", "x"]):
+                     ["fix-b", "x"], ["mark-b", "x"]):
             rc, out, err = abctl("-d", m, *args)
             check(rc == 2 and cur() == orig[:0x800] + D + orig[0x820:], f"abctl {' '.join(args)} is a usage error")
 

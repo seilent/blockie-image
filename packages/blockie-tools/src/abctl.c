@@ -36,12 +36,12 @@ static int attempt;
 
 static const char* const writes[] = { "default-a", "hold-b", "fix-b", "unprove-b", "refund-a", "test-b", "arm-a",
                                       "arm-b-once", "rearm", "bcb-recovery", "bcb-attempt", "bcb-input", "bcb-refresh",
-                                      "bcb-clear", "clear-msg", "restore", NULL };
+                                      "bcb-clear", "clear-msg", "restore", "mark-b", NULL };
 
 static void usage(void)
 {
     fprintf(stderr, "usage: abctl [-d device] [-o offset] show\n"
-                    "       abctl [-d device] default-a | hold-b | fix-b | unprove-b | refund-a | test-b\n"
+                    "       abctl [-d device] default-a | hold-b | fix-b | unprove-b | refund-a | test-b | mark-b\n"
                     "       abctl [-d device] arm-a | arm-b-once | rearm | clear-msg | restore <file>\n"
                     "       abctl [-d device] bcb-recovery <reason> | bcb-attempt | bcb-input | bcb-refresh <cap>\n"
                     "       abctl [-d device] bcb-clear\n");
@@ -272,6 +272,17 @@ static int rules(const char* cmd, const uint8_t* old, const uint8_t* bc)
             fprintf(stderr, "abctl: fix-b refused: result has slot b unbootable or slot a changed\n");
             return 1;
         }
+    } else if (!strcmp(cmd, "mark-b")) {
+        if (strcmp(block_class(old), "ours") || b0.priority != 15) {
+            fprintf(stderr, "abctl: mark-b refused: needs class ours and slot b priority 15, reads class %s a %d/%d/%d "
+                            "b %d/%d/%d\n", block_class(old), a0.priority, a0.tries, a0.successful, b0.priority,
+                    b0.tries, b0.successful);
+            return 1;
+        }
+        if (!bootable(b) || memcmp(old + 12, bc + 12, 2)) {
+            fprintf(stderr, "abctl: mark-b refused: result has slot b unbootable or slot a changed\n");
+            return 1;
+        }
     } else if (!bootable(a) || !bootable(b)) {
         fprintf(stderr, "abctl: %s refused: result has slot a %s and slot b %s\n", cmd,
                 bootable(a) ? "bootable" : "unbootable", bootable(b) ? "bootable" : "unbootable");
@@ -402,6 +413,8 @@ static int change(const char* cmd, uint8_t* blk, uint8_t* file, const char* arg)
         b = (struct slot){ 13, 1, 0, b.verity };
     } else if (!strcmp(cmd, "unprove-b")) {
         b = (struct slot){ 13, 1, 0, b.verity };
+    } else if (!strcmp(cmd, "mark-b")) {
+        b = (struct slot){ b.priority, 1, 1, b.verity };
     } else if (!strcmp(cmd, "refund-a")) {
         a.tries = a.tries < 3 ? a.tries + 1 : 3;
         b.priority = 12;
@@ -417,7 +430,7 @@ static int change(const char* cmd, uint8_t* blk, uint8_t* file, const char* arg)
         a = (struct slot){ 15, 3, 0, a.verity };
         set_suffix(bc, 'a');
     }
-    if (strcmp(cmd, "fix-b") && strcmp(cmd, "unprove-b"))
+    if (strcmp(cmd, "fix-b") && strcmp(cmd, "unprove-b") && strcmp(cmd, "mark-b"))
         set_slot(bc, 0, a);
     set_slot(bc, 1, b);
     if (rules(cmd, old, bc))
