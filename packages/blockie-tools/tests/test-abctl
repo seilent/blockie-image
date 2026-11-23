@@ -489,7 +489,11 @@ def main():
                                          (bytes(512), bc_of("_b", (14, 3, 0), (15, 0, 0)), H,
                                           "hold-b's shape after b's try (a 14/3/0, b 15/0/0)"),
                                          (bytes(512), bc_of("_b", (14, 3, 0), (15, 1, 0)), H,
-                                          "test-b's shape (a 14/3/0, b 15/1/0)")):
+                                          "test-b's shape (a 14/3/0, b 15/1/0)"),
+                                         (fallback, bc_of("_b", (0, 0, 0), (13, 0, 0)), F,
+                                          "X on Preloader_b after fix-b and b's try (a 0/0/0, b 13/0/0, BCB fallback)"),
+                                         (fallback, bc_of("_b", (0, 0, 0), (13, 1, 0)), F,
+                                          "fix-b's result before b's try (a 0/0/0, b 13/1/0, BCB fallback)")):
             put_msg(sec, before)
             rc, out, err = abctl("-d", m, "mark-b")
             check(rc == 0, f"mark-b on {what}: exit 0" + (": " + err.strip() if rc else ""))
@@ -504,9 +508,14 @@ def main():
         for bc, why, what in ((T, "class ours a 15/1/0 b 14/1/1", "T (b 14)"),
                               (U, "class ours a 15/3/0 b 13/1/0", "b 13"),
                               (bc_of("_b", (14, 7, 0), (15, 0, 0)), "class reset a 14/7/0", "class reset (a tries 7)"),
-                              (bc_of("_b", (15, 3, 0), (15, 0, 0)), "class reset a 15/3/0", "a at 15")):
-            refused("mark-b", bc, "mark-b refused: needs class ours and slot b priority 15, reads " + why,
-                    f"mark-b refused on {what}")
+                              (bc_of("_b", (15, 3, 0), (15, 0, 0)), "class reset a 15/3/0", "a at 15"),
+                              (bc_of("_a", (15, 0, 0), (13, 1, 0)), "class ours a 15/0/0 b 13/1/0",
+                               "a's last try (a 15/0/0, b 13)"),
+                              (bc_of("_a", (14, 3, 0), (13, 1, 0)), "class ours a 14/3/0 b 13/1/0", "a 14/3/0, b 13"),
+                              (bc_of("_b", (0, 0, 0), (12, 1, 0)), "class ours a 0/0/0 b 12/1/0", "a 0/0/0, b 12"),
+                              (bc_of("_b", (0, 0, 0), (14, 1, 0)), "class ours a 0/0/0 b 14/1/0", "a 0/0/0, b 14")):
+            refused("mark-b", bc, "mark-b refused: needs class ours and slot b priority 15, or 13 with slot a priority "
+                    "0, reads " + why, f"mark-b refused on {what}")
 
         ours = b"recovery\n--blockie=menu"
         put(D)

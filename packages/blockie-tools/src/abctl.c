@@ -273,10 +273,10 @@ static int rules(const char* cmd, const uint8_t* old, const uint8_t* bc)
             return 1;
         }
     } else if (!strcmp(cmd, "mark-b")) {
-        if (strcmp(block_class(old), "ours") || b0.priority != 15) {
-            fprintf(stderr, "abctl: mark-b refused: needs class ours and slot b priority 15, reads class %s a %d/%d/%d "
-                            "b %d/%d/%d\n", block_class(old), a0.priority, a0.tries, a0.successful, b0.priority,
-                    b0.tries, b0.successful);
+        if (strcmp(block_class(old), "ours") || !(b0.priority == 15 || (b0.priority == 13 && !a0.priority))) {
+            fprintf(stderr, "abctl: mark-b refused: needs class ours and slot b priority 15, or 13 with slot a "
+                            "priority 0, reads class %s a %d/%d/%d b %d/%d/%d\n", block_class(old), a0.priority,
+                    a0.tries, a0.successful, b0.priority, b0.tries, b0.successful);
             return 1;
         }
         if (!bootable(b) || memcmp(old + 12, bc + 12, 2)) {
@@ -414,7 +414,7 @@ static int change(const char* cmd, uint8_t* blk, uint8_t* file, const char* arg)
     } else if (!strcmp(cmd, "unprove-b")) {
         b = (struct slot){ 13, 1, 0, b.verity };
     } else if (!strcmp(cmd, "mark-b")) {
-        b = (struct slot){ b.priority, 1, 1, b.verity };
+        b = (struct slot){ 15, 1, 1, b.verity };
     } else if (!strcmp(cmd, "refund-a")) {
         a.tries = a.tries < 3 ? a.tries + 1 : 3;
         b.priority = 12;
