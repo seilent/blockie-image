@@ -12,6 +12,7 @@ import sys
 
 ME = "blockie-android-prep"
 DATA = os.environ.get("BLOCKIE_DATA_DIR", "/var/lib/blockie/data")
+INTERNAL = os.environ.get("BLOCKIE_INTERNAL_DIR", "/var/lib/blockie/internal")
 RUN = os.environ.get("BLOCKIE_ANDROID_RUN", "/run/blockie-android")
 WORK = os.environ.get("BLOCKIE_WAYDROID_WORK", "/var/lib/waydroid")
 PIN = os.environ.get("BLOCKIE_ANDROID_PIN", "/usr/share/blockie/android.d/lineage-20-gapps.conf")
@@ -21,7 +22,7 @@ PAYLOAD = os.environ.get("BLOCKIE_ANDROID_PAYLOAD", "/sys/fs/cgroup/lxc.payload.
 LOCALTIME = os.environ.get("BLOCKIE_LOCALTIME", "/etc/localtime")
 EXTRA = "/usr/share/waydroid-extra/images"
 ANDROID = os.path.join(DATA, "android")
-IMAGES = os.path.join(ANDROID, "images")
+IMAGES = os.path.join(INTERNAL, "android", "images")
 PREPARED = os.path.join(ANDROID, "prepared")
 CFG = os.path.join(WORK, "waydroid.cfg")
 GPU_PIN = os.environ.get("BLOCKIE_ANDROID_GPU_PIN", "/usr/share/blockie/android.d/gpu-mt6768.conf")
@@ -509,8 +510,9 @@ def keylayout():
 
 def prep():
     vsync_check()
-    if subprocess.run(["mountpoint", "-q", DATA]).returncode != 0:
-        raise Refused("missing", f"{DATA} is not mounted")
+    for m in (DATA, INTERNAL):
+        if subprocess.run(["mountpoint", "-q", m]).returncode != 0:
+            raise Refused("missing", f"{m} is not mounted")
     rows = pin()
     stamp = images(rows)
     base = read(BASE)
@@ -572,7 +574,7 @@ def prep():
     keylayout()
     state("ok")
     log("ok")
-    old = os.path.join(ANDROID, "images.old")
+    old = os.path.join(INTERNAL, "android", "images.old")
     if os.path.isdir(old) and not running():
         try:
             shutil.rmtree(old)

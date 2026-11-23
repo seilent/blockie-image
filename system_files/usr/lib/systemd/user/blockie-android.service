@@ -5,6 +5,7 @@ Description=Android session
 UnsetEnvironment=LD_PRELOAD LD_LIBRARY_PATH VK_DRIVER_FILES
 Environment=XDG_DATA_HOME=/var/lib/blockie/data/android/user
 ExecStartPre=/usr/bin/mountpoint -q /var/lib/blockie/data
+ExecStartPre=/usr/bin/mountpoint -q /var/lib/blockie/internal
 ExecStartPre=/usr/bin/systemctl start waydroid-container.service
 ExecStart=/usr/libexec/blockie/blockie-android-run
 ExecStop=-/usr/bin/systemctl start blockie-android-freeze@thaw.service

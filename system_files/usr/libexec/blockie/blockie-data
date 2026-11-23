@@ -3,12 +3,32 @@ set -euo pipefail
 
 me=blockie-data
 die() { echo "$me: $*" >&2; exit 1; }
+usage() { echo "usage: $me [internal]" >&2; exit 2; }
 
 sys=${BLOCKIE_SYS:-/sys}
 devdir=${BLOCKIE_DEV:-/dev}
 host=${BLOCKIE_SD_HOST:-11240000.mmc}
-target=${BLOCKIE_DATA_DIR:-/var/lib/blockie/data}
-label=BLOCKIE_DATA
+
+(( $# <= 1 )) || usage
+case ${1:-} in
+  '')
+    target=${BLOCKIE_DATA_DIR:-/var/lib/blockie/data}
+    label=BLOCKIE_DATA
+    name=BLOCKIE_DATA
+    on=$host
+    ours() { [[ $1 == */"$host"/* ]]; }
+    ;;
+  internal)
+    target=${BLOCKIE_INTERNAL_DIR:-/var/lib/blockie/internal}
+    label=BLOCKIE_INTERNAL
+    name=userdata
+    run=${BLOCKIE_RUN:-/run/blockie}
+    read -r on 2> /dev/null < "$run/emmc" || die "no eMMC disk named in $run/emmc"
+    [[ $on =~ ^mmcblk[0-9]+$ ]] || die "$run/emmc names '$on', not an mmcblk disk"
+    ours() { [[ $1 == */block/"$on"/* && $1 != */"$host"/* ]]; }
+    ;;
+  *) usage ;;
+esac
 
 if mountpoint -q "$target"; then
   echo "$me: $target is already mounted"
@@ -19,12 +39,12 @@ found=()
 shopt -s nullglob
 for p in "$sys"/class/block/mmcblk*p*; do
   [[ -e $p/partition && -r $p/uevent ]] || continue
-  [[ $(sed -n 's/^PARTNAME=//p' "$p/uevent") == "$label" ]] || continue
-  [[ $(readlink -f "$p") == */"$host"/* ]] || continue
+  [[ $(sed -n 's/^PARTNAME=//p' "$p/uevent") == "$name" ]] || continue
+  ours "$(readlink -f "$p")" || continue
   found+=("${p##*/}")
 done
 shopt -u nullglob
-(( ${#found[@]} == 1 )) || die "expected one $label partition on $host, found ${#found[@]} (${found[*]})"
+(( ${#found[@]} == 1 )) || die "expected one $name partition on $on, found ${#found[@]} (${found[*]})"
 
 dev=$devdir/${found[0]}
 type=$(blkid -p -o value -s TYPE "$dev") || die "blkid cannot probe $dev"

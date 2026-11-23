@@ -4,6 +4,8 @@ set -u
 script=${DATA_SCRIPT:-/usr/libexec/blockie/blockie-data}
 unit=${DATA_UNIT:-/usr/lib/systemd/system/blockie-data.service}
 conf=${DATA_TMPFILES:-/usr/lib/blockie/data-tmpfiles.conf}
+iunit=${DATA_INTERNAL_UNIT:-/usr/lib/systemd/system/blockie-internal.service}
+iconf=${DATA_INTERNAL_TMPFILES:-/usr/lib/blockie/internal-tmpfiles.conf}
 drop=${DATA_DROPIN:-/usr/lib/systemd/system/user@.service.d/52-blockie-data.conf}
 top=$(mktemp -d "${TMPDIR:-/tmp}/data.XXXXXX")
 trap 'rm -rf "${top:?}"' EXIT
@@ -36,17 +38,32 @@ seat=${DATA_SEAT:-/usr/lib/systemd/system/blockie-seat.service}
 grep -qE '^After=(.* )?blockie-data\.service( |$)' "$seat" && grep -qE '^Wants=(.* )?blockie-data\.service( |$)' "$seat" &&
   ! grep -qE '^(Requires|Requisite|BindsTo)=.*blockie-data' "$seat"
 res $? "seat: Wants and After blockie-data, so its PAM call never waits on the data step"
+for kv in Type=oneshot RemainAfterExit=yes TimeoutStartSec=120 "ExecStart=/usr/libexec/blockie/blockie-data internal" \
+  "ExecStartPost=/usr/bin/systemd-tmpfiles --create /usr/lib/blockie/internal-tmpfiles.conf" \
+  RequiresMountsFor=/var/lib/blockie After=var.mount WantedBy=multi-user.target; do
+  grep -qxF "$kv" "$iunit"
+  res $? "internal unit has $kv"
+done
+! grep -q '^Requires=\|^RequiredBy=\|^Before=multi-user' "$iunit"
+res $? "internal unit: no hard dependency, an absent or foreign userdata fails only this unit"
+! grep -qs 'blockie-internal' "$drop" "$seat"
+res $? "user@ drop-in and seat: no dependency on blockie-internal, the session never waits on userdata"
 if [[ -z ${DATA_UNIT:-} ]]; then
   [[ -L /etc/systemd/system/multi-user.target.wants/blockie-data.service ]]
   res $? "unit enabled"
   ! grep -qw blockie-data.service /usr/lib/blockie/boot-ok.conf
   res $? "boot-ok does not wait on blockie-data"
 fi
+if [[ -z ${DATA_INTERNAL_UNIT:-} ]]; then
+  [[ -L /etc/systemd/system/multi-user.target.wants/blockie-internal.service ]]
+  res $? "internal unit enabled"
+  ! grep -qw blockie-internal.service /usr/lib/blockie/boot-ok.conf
+  res $? "boot-ok does not wait on blockie-internal"
+fi
 
 want="d /var/lib/blockie/data/android 0755 root root -
 d /var/lib/blockie/data/android/guest 0700 root root -
 d /var/lib/blockie/data/android/guest/data 0771 blockie blockie -
-d /var/lib/blockie/data/android/images 0755 root root -
 d /var/lib/blockie/data/android/user 0700 blockie blockie -
 $(printf 'd /var/lib/blockie/data/%s 0755 blockie blockie -\n' cache funeos media mupen64plus_next music retroarch saves states)
 d /var/lib/blockie/data/roms 0755 root root -
@@ -61,11 +78,15 @@ d /var/lib/blockie/data/steam-runners 0755 blockie blockie -
 d /var/lib/blockie/data/steam-home 0700 blockie blockie -
 d /var/lib/blockie/data/cache/steam-tmp 0700 blockie blockie -"
 [[ $(cat "$conf") == "$want" ]]
-res $? "tmpfiles: android/ and android/images root 0755, android/guest root 0700, android/guest/data blockie 0771, android/user blockie 0700; cache, funeos, media, mupen64plus_next, music, retroarch, saves, states owned by blockie; roms root 0755, roms/ports blockie; ports-home and cache/ports-tmp blockie 0700; steam blockie-steam 0700, steam-dl blockie-steam:blockie 2750; steam-games, steam-games/.blockie and steam-runners blockie 0755; steam-home and cache/steam-tmp blockie 0700"
+res $? "tmpfiles: android/ root 0755, android/guest root 0700, android/guest/data blockie 0771, android/user blockie 0700; cache, funeos, media, mupen64plus_next, music, retroarch, saves, states owned by blockie; roms root 0755, roms/ports blockie; ports-home and cache/ports-tmp blockie 0700; steam blockie-steam 0700, steam-dl blockie-steam:blockie 2750; steam-games, steam-games/.blockie and steam-runners blockie 0755; steam-home and cache/steam-tmp blockie 0700"
 ! grep -qE '^d /var/lib/blockie/data/bios([/ ]|$)|^d /var/lib/blockie/data/? ' "$conf"
 res $? "tmpfiles: no line for bios/ or the mount root"
 [[ ! -e /usr/lib/tmpfiles.d/blockie-data.conf ]] && ! grep -rqs 'blockie/data' /usr/lib/tmpfiles.d
 res $? "tmpfiles: not in tmpfiles.d, so nothing is made under /var before the mount"
+[[ $(cat "$iconf") == $'d /var/lib/blockie/internal/android 0755 root root -\nd /var/lib/blockie/internal/android/images 0755 root root -' ]]
+res $? "internal tmpfiles: only android/ and android/images, root 0755"
+! grep -rqs 'blockie/internal' /usr/lib/tmpfiles.d
+res $? "internal tmpfiles: not in tmpfiles.d, so nothing is made under the internal mount point before the mount"
 [[ -z $(awk '$2 == "/var/lib/blockie" && $4 != "root"' /usr/lib/tmpfiles.d/*.conf 2> /dev/null) ]]
 res $? "tmpfiles: /var/lib/blockie stays root owned, so uid 1000 cannot make data/ under it"
 
@@ -84,7 +105,7 @@ if [[ -z ${DATA_TMPFILES:-} ]] && command -v systemd-tmpfiles > /dev/null; then
     [[ $(stat -c '%U %G %a' "$r/var/lib/blockie/data/$n") == "blockie blockie 755" ]] || ok=1
   done
   for x in "android root root 755" "android/guest root root 700" "android/guest/data blockie blockie 771" \
-    "android/images root root 755" "android/user blockie blockie 700" "roms root root 755" \
+    "android/user blockie blockie 700" "roms root root 755" \
     "ports-home blockie blockie 700" "cache/ports-tmp blockie blockie 700" "steam blockie-steam blockie-steam 700" \
     "steam-dl blockie-steam blockie 2750" "steam-games blockie blockie 755" \
     "steam-games/.blockie blockie blockie 755" "steam-runners blockie blockie 755" "steam-home blockie blockie 700" \
@@ -92,7 +113,19 @@ if [[ -z ${DATA_TMPFILES:-} ]] && command -v systemd-tmpfiles > /dev/null; then
     [[ $(stat -c '%U %G %a' "$r/var/lib/blockie/data/${x%% *}") == "${x#* }" ]] || ok=1
   done
   [[ $(cd "$r/var/lib/blockie/data" && find roms/gba bios -printf '%p %u %g %m\n' | sort) == "$before" ]] || ok=1
-  res $ok "tmpfiles applied: ten blockie dirs, the android tree, the ports dirs, the steam dirs, roms/gba/ and bios/ unchanged"
+  [[ ! -e $r/var/lib/blockie/data/android/images ]] || ok=1
+  res $ok "tmpfiles applied: ten blockie dirs, the android tree without images/, the ports dirs, the steam dirs, roms/gba/ and bios/ unchanged"
+fi
+if [[ -z ${DATA_INTERNAL_TMPFILES:-} ]] && command -v systemd-tmpfiles > /dev/null; then
+  r=$top/iroot
+  mkdir -p "$r/var/lib/blockie/internal"
+  systemd-tmpfiles --root="$r" --create "$iconf" > "$top/itmpfiles.out" 2>&1
+  ok=$?
+  for x in android android/images; do
+    [[ $(stat -c '%U %G %a' "$r/var/lib/blockie/internal/$x") == "root root 755" ]] || ok=1
+  done
+  [[ $(cd "$r/var/lib/blockie/internal" && find . -mindepth 1 | sort) == $'./android\n./android/images' ]] || ok=1
+  res $ok "internal tmpfiles applied: android/ and android/images root 0755, nothing else in the root"
 fi
 
 setup() {
@@ -218,6 +251,103 @@ echo OTHER > "$d/label.mmcblk1p4"
 run
 [[ $rc == 1 && ! -s $d/calls ]] && grep -q "not labelled" "$d/out"
 res $? "script: a filesystem label other than BLOCKIE_DATA, refused"
+
+isetup() {
+  setup "$1"
+  mkdir -p "$d/run" "$d/internal"
+  echo mmcblk0 > "$d/run/emmc"
+  echo ext4 > "$d/type.mmcblk0p20"
+  echo BLOCKIE_INTERNAL > "$d/label.mmcblk0p20"
+}
+
+irun() {
+  PATH="$d/bin:$PATH" BLOCKIE_SYS=$sys BLOCKIE_DEV=$d/dev BLOCKIE_RUN=$d/run BLOCKIE_INTERNAL_DIR=$d/internal \
+    "$script" internal "$@" > "$d/out" 2>&1
+  rc=$?
+}
+
+isetup internal
+irun
+mounted="mount -t ext4 -o rw,noatime,nodev,nosuid $d/dev/mmcblk0p20 $d/internal"
+[[ $rc == 0 && $(cat "$d/calls") == "$(printf 'e2fsck -p %s\n%s' "$d/dev/mmcblk0p20" "$mounted")" ]]
+res $? "internal: e2fsck -p, then userdata on the disk in /run/blockie/emmc mounted rw,noatime,nodev,nosuid"
+
+isetup internal-nolabel
+rm -f "${d:?}/label.mmcblk0p20"
+irun
+[[ $rc == 1 && ! -s $d/calls ]] && grep -q "not labelled BLOCKIE_INTERNAL" "$d/out"
+res $? "internal: an ext4 userdata with no label, refused"
+
+isetup internal-label
+echo BLOCKIE_DATA > "$d/label.mmcblk0p20"
+irun
+[[ $rc == 1 && ! -s $d/calls ]] && grep -q "not labelled BLOCKIE_INTERNAL" "$d/out"
+res $? "internal: an ext4 userdata labelled BLOCKIE_DATA, refused"
+
+isetup internal-not-ext4
+echo f2fs > "$d/type.mmcblk0p20"
+irun
+[[ $rc == 1 && ! -s $d/calls ]] && grep -q "is f2fs, not ext4" "$d/out"
+res $? "internal: stock's f2fs userdata, refused"
+
+isetup internal-blank
+rm -f "${d:?}/type.mmcblk0p20"
+irun
+[[ $rc == 1 && ! -s $d/calls ]] && grep -q "blkid cannot probe" "$d/out"
+res $? "internal: a userdata blkid finds nothing on (zeroed, ciphertext), refused, nothing formatted"
+
+isetup internal-card
+echo mmcblk1 > "$d/run/emmc"
+part 11240000.mmc mmcblk1 mmcblk1p5 userdata
+echo ext4 > "$d/type.mmcblk1p5"
+echo BLOCKIE_INTERNAL > "$d/label.mmcblk1p5"
+irun
+[[ $rc == 1 && ! -s $d/calls ]] && grep -q "found 0" "$d/out"
+res $? "internal: /run/blockie/emmc naming the card, its BLOCKIE_INTERNAL userdata on the card host is not taken"
+
+isetup internal-partname
+rm -rf "${sys:?}/class/block/mmcblk0p20"
+part 11230000.mmc mmcblk0 mmcblk0p21 BLOCKIE_INTERNAL
+echo ext4 > "$d/type.mmcblk0p21"
+echo BLOCKIE_INTERNAL > "$d/label.mmcblk0p21"
+irun
+[[ $rc == 1 && ! -s $d/calls ]] && grep -q "found 0" "$d/out"
+res $? "internal: a BLOCKIE_INTERNAL ext4 on another PARTNAME of the eMMC, refused"
+
+isetup internal-two
+part 11230000.mmc mmcblk0 mmcblk0p45 userdata
+irun
+[[ $rc == 1 && ! -s $d/calls ]] && grep -q "found 2" "$d/out"
+res $? "internal: two userdata partitions on the disk, refused"
+
+isetup internal-disk
+echo mmcblk2 > "$d/run/emmc"
+irun
+[[ $rc == 1 && ! -s $d/calls ]] && grep -q "on mmcblk2, found 0" "$d/out"
+res $? "internal: userdata on a disk other than the one in /run/blockie/emmc is not taken"
+
+isetup internal-noemmc
+rm -f "${d:?}/run/emmc"
+irun
+[[ $rc == 1 && ! -s $d/calls ]] && grep -q "no eMMC disk named in" "$d/out"
+res $? "internal: no /run/blockie/emmc, refused"
+
+isetup internal-name
+echo mmcblk0p20 > "$d/run/emmc"
+irun
+[[ $rc == 1 && ! -s $d/calls ]] && grep -q "names 'mmcblk0p20', not an mmcblk disk" "$d/out"
+res $? "internal: /run/blockie/emmc naming a partition, not a disk, refused"
+
+isetup internal-extra
+irun extra
+[[ $rc == 2 && ! -s $d/calls ]] && grep -q 'usage: blockie-data \[internal\]' "$d/out"
+res $? "internal: an extra argument, usage rc 2, nothing mounted"
+
+setup mode
+PATH="$d/bin:$PATH" BLOCKIE_SYS=$sys BLOCKIE_DEV=$d/dev BLOCKIE_DATA_DIR=$d/target "$script" foo > "$d/out" 2>&1
+rc=$?
+[[ $rc == 2 && ! -s $d/calls ]] && grep -q 'usage: blockie-data \[internal\]' "$d/out"
+res $? "script: blockie-data foo, usage rc 2, nothing mounted"
 
 if [[ $(id -u) == 0 ]] && command -v setpriv > /dev/null; then
   chmod 0755 "$top"

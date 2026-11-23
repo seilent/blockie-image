@@ -8,13 +8,16 @@ run=${BLOCKIE_ANDROID_RUN:-/run/blockie-android}
 out=$run/lxc.d
 payload=${BLOCKIE_ANDROID_PAYLOAD:-/sys/fs/cgroup/lxc.payload.waydroid}
 data=${BLOCKIE_DATA_DIR:-/var/lib/blockie/data}
+internal=${BLOCKIE_INTERNAL_DIR:-/var/lib/blockie/internal}
 dev=${BLOCKIE_DEV:-/dev}
 heaps=(mtk_mm mtk_mm-uncached system system-uncached)
 gpudir=$run/gpu
 gpudev=$gpudir/dev
 die() { echo "$me: $*" >&2; exit 1; }
 
-mountpoint -q "$data" || die "$data is not mounted"
+for m in "$data" "$internal"; do
+  mountpoint -q "$m" || die "$m is not mounted"
+done
 state=
 [[ ! -r $run/state ]] || read -r state < "$run/state"
 [[ $state == ok ]] || die "Android prep state is '${state:-none}', not ok"
