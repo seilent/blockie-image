@@ -20,7 +20,7 @@ case ${1:-} in
     ;;
   internal)
     target=${BLOCKIE_INTERNAL_DIR:-/var/lib/blockie/internal}
-    label=BLOCKIE_INTERNAL
+    label=BLOCKIE_DATA
     name=userdata
     run=${BLOCKIE_RUN:-/run/blockie}
     read -r on 2> /dev/null < "$run/emmc" || die "no eMMC disk named in $run/emmc"
