@@ -25,7 +25,7 @@ case ${1:-} in
     run=${BLOCKIE_RUN:-/run/blockie}
     read -r on 2> /dev/null < "$run/emmc" || die "no eMMC disk named in $run/emmc"
     [[ $on =~ ^mmcblk[0-9]+$ ]] || die "$run/emmc names '$on', not an mmcblk disk"
-    ours() { [[ $1 == */block/"$on"/* && $1 != */"$host"/* ]]; }
+    ours() { [[ $1 == */block/"$on"/* ]]; }
     ;;
   *) usage ;;
 esac
