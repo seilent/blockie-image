@@ -109,26 +109,27 @@ res $ok "the android scripts are 755 and parse"
 sd=/usr/lib/systemd/system
 ud=/usr/lib/systemd/user
 ok=0
-for l in Requires=blockie-data.service After=blockie-data.service RequiresMountsFor=/var/lib/blockie/data \
-  Type=oneshot ExecStart=/usr/libexec/blockie/blockie-android-prep WantedBy=multi-user.target; do
+for l in 'Requires=blockie-data.service blockie-internal.service' 'After=blockie-data.service blockie-internal.service' \
+  'RequiresMountsFor=/var/lib/blockie/data /var/lib/blockie/internal' Type=oneshot ExecStart=/usr/libexec/blockie/blockie-android-prep \
+  WantedBy=multi-user.target; do
   grep -qxF "$l" $sd/blockie-android-prep.service || { ok=1; echo "  prep: $l"; }
 done
 ! grep -q '^RemainAfterExit=' $sd/blockie-android-prep.service || { ok=1; echo "  prep stays active, a start would not run it"; }
-for l in DefaultDependencies=no Requires=blockie-data.service After=blockie-data.service Conflicts=shutdown.target \
-  Before=shutdown.target PathChanged=/var/lib/blockie/data/android/images/stamp Unit=blockie-android-prep.service \
-  WantedBy=multi-user.target; do
+for l in DefaultDependencies=no 'Requires=blockie-data.service blockie-internal.service' \
+  'After=blockie-data.service blockie-internal.service' Conflicts=shutdown.target Before=shutdown.target \
+  PathChanged=/var/lib/blockie/internal/android/images/stamp Unit=blockie-android-prep.service WantedBy=multi-user.target; do
   grep -qxF "$l" $sd/blockie-android-prep.path || { ok=1; echo "  prep.path: $l"; }
 done
 drop=$sd/waydroid-container.service.d/50-blockie.conf
 for l in Requires=blockie-android-prep.service After=blockie-android-prep.service \
-  RequiresMountsFor=/var/lib/blockie/data ExecStartPre=/usr/libexec/blockie/blockie-android-lxcd \
+  'RequiresMountsFor=/var/lib/blockie/data /var/lib/blockie/internal' ExecStartPre=/usr/libexec/blockie/blockie-android-lxcd \
   'ExecStop=-/usr/bin/timeout 6 /usr/bin/waydroid shell -- /system/bin/reboot -p' \
   'ExecStopPost=-/usr/bin/lxc-stop -P /var/lib/waydroid/lxc -n waydroid -k' \
   'ExecStopPost=-/usr/bin/sync -f /var/lib/blockie/data' TimeoutStopSec=15; do
   grep -qxF "$l" "$drop" || { ok=1; echo "  container: $l"; }
 done
 [[ $(grep '^ExecStopPost=' "$drop" | head -n 1) == *lxc-stop* ]] || ok=1
-for u in blockie-data.service blockie-android-prep.service blockie-android-prep.path; do
+for u in blockie-data.service blockie-internal.service blockie-android-prep.service blockie-android-prep.path; do
   [[ -L /etc/systemd/system/multi-user.target.wants/$u ]] || { ok=1; echo "  $u not enabled"; }
 done
 [[ -z $(find /etc/systemd/system /usr/lib/systemd/system -path '*.wants/*' -name waydroid-container.service) ]] ||
@@ -157,20 +158,22 @@ for l in 'UnsetEnvironment=LD_PRELOAD LD_LIBRARY_PATH VK_DRIVER_FILES' \
   'ExecStopPost=-/usr/bin/systemctl stop waydroid-container.service' TimeoutStartSec=infinity TimeoutStopSec=25; do
   grep -qxF "$l" "$au" || { ok=1; echo "  user unit: $l"; }
 done
-[[ $(grep '^ExecStartPre=' "$au") == $'ExecStartPre=/usr/bin/mountpoint -q /var/lib/blockie/data\nExecStartPre=/usr/bin/systemctl start waydroid-container.service' ]] ||
+[[ $(grep '^ExecStartPre=' "$au") == $'ExecStartPre=/usr/bin/mountpoint -q /var/lib/blockie/data\nExecStartPre=/usr/bin/mountpoint -q /var/lib/blockie/internal\nExecStartPre=/usr/bin/systemctl start waydroid-container.service' ]] ||
   { ok=1; echo "  user unit ExecStartPre order"; }
 [[ $(grep '^ExecStop=' "$au") == $'ExecStop=-/usr/bin/systemctl start blockie-android-freeze@thaw.service\nExecStop=/usr/bin/systemctl stop waydroid-container.service' ]] ||
   { ok=1; echo "  user unit ExecStop order: the thaw before the container stop"; }
 ! grep -q '^\[Install\]' "$au" || { ok=1; echo "  user unit has [Install]"; }
 systemd-analyze verify --man=no $sd/waydroid-container.service $sd/blockie-android-prep.service $sd/blockie-android-prep.path \
-  $sd/blockie-data.service $sd/blockie-android-music.service $sd/blockie-android-pad.service > "$t/verify" 2>&1 || { ok=1; sed 's/^/  /' "$t/verify"; }
+  $sd/blockie-data.service $sd/blockie-internal.service $sd/blockie-android-music.service $sd/blockie-android-pad.service > "$t/verify" 2>&1 || { ok=1; sed 's/^/  /' "$t/verify"; }
 xdg=$t/xdg
 mkdir -p "$xdg"
 XDG_RUNTIME_DIR=$xdg systemd-analyze verify --user --man=no "$au" > "$t/verify" 2>&1 || { ok=1; sed 's/^/  /' "$t/verify"; }
-res $ok "units: prep after data and again on a stamp change, the container after prep with the generator and a bounded clean stop, the freeze instances conflict, the music and pad oneshots after the container and part of it with no [Install], the user unit starts and stops the container"
+res $ok "units: prep after data and internal and again on a stamp change on internal, the container after prep and both mounts with the generator and a bounded clean stop, the freeze instances conflict, the music and pad oneshots after the container and part of it with no [Install], the user unit checks both mounts, then starts and stops the container"
 
 ok=0
-[[ $(readlink /usr/share/waydroid-extra/images) == /var/lib/blockie/data/android/images ]] || { ok=1; echo "  images link"; }
+[[ $(readlink /usr/share/waydroid-extra/images) == /var/lib/blockie/internal/android/images ]] || { ok=1; echo "  images link"; }
+grep -qxF 'd /var/lib/blockie/internal/android/images 0755 root root -' /usr/lib/blockie/internal-tmpfiles.conf &&
+  ! grep -q 'android/images' /usr/lib/blockie/data-tmpfiles.conf || { ok=1; echo "  images dir not made on internal alone"; }
 grep -qxF 'd /run/blockie-android 0755 root root -' /usr/lib/tmpfiles.d/blockie.conf || { ok=1; echo "  run dir"; }
 [[ ! -e /usr/share/dbus-1/system-services/id.waydro.Container.service ]] || { ok=1; echo "  D-Bus activation"; }
 [[ ! -e /var/lib/waydroid ]] || { ok=1; echo "  /var/lib/waydroid in the image"; }
@@ -185,7 +188,7 @@ for f in devices music memory; do
 done
 ! grep -q 'pad\.conf' "$base" || { ok=1; echo "  config_base includes pad.conf"; }
 ! grep -rqs 'event-pad' /usr/lib/waydroid || { ok=1; echo "  an event-pad entry in /usr/lib/waydroid"; }
-res $ok "image: the images link to data, no D-Bus activation, no /var/lib/waydroid, the pad link rule, the three includes and no pad bind"
+res $ok "image: the images link to internal, its dir made there and not on data, no D-Bus activation, no /var/lib/waydroid, the pad link rule, the three includes and no pad bind"
 
 kl=/usr/share/blockie/android/Vendor_4001_Product_0428.kl
 want='key 305   BUTTON_A
@@ -220,24 +223,31 @@ blockie-session list 2> /dev/null | grep -qxF $'android\tAndroid\tno' || { ok=1;
 res $ok "sessions.d/android.conf: Android, stop in the background, park first, the check, no slice, listed"
 
 c=$t/check
-mkdir -p "$c/bin" "$c/run" "$c/data/android/images"
-printf '#!/bin/sh\n[ -e "%s/mounted" ]\n' "$c" > "$c/bin/mountpoint"
+mkdir -p "$c/bin" "$c/run" "$c/data/android/images" "$c/internal/android/images"
+printf '#!/bin/sh\n[ -e "%s/mounted.${2##*/}" ]\n' "$c" > "$c/bin/mountpoint"
 chmod 755 "$c/bin/mountpoint"
 ck() {
-  PATH=$c/bin:$PATH BLOCKIE_DATA_DIR=$c/data BLOCKIE_ANDROID_RUN=$c/run timeout 5 "$lx/blockie-android-check" > "$c/out" 2>&1
+  PATH=$c/bin:$PATH BLOCKIE_DATA_DIR=$c/data BLOCKIE_INTERNAL_DIR=$c/internal BLOCKIE_ANDROID_RUN=$c/run \
+    timeout 5 "$lx/blockie-android-check" > "$c/out" 2>&1
   rc=$?
 }
 cstate() {
-  rm -f "${c:?}/run/state" "${c:?}/mounted" "${c:?}/data/android/images/"*
+  rm -f "${c:?}/run/state" "${c:?}/mounted."* "${c:?}/data/android/images/"* "${c:?}/internal/android/images/"*
   [[ $1 == - ]] || echo "$1" > "$c/run/state"
-  [[ $2 != mounted ]] || : > "$c/mounted"
-  [[ $3 != images ]] || : > "$c/data/android/images/system.img"
-  [[ $3 != images ]] || : > "$c/data/android/images/vendor.img"
+  [[ $2 == no || $2 == internal ]] || : > "$c/mounted.data"
+  [[ $2 == no || $2 == data ]] || : > "$c/mounted.internal"
+  [[ $3 != images ]] || : > "$c/internal/android/images/system.img"
+  [[ $3 != images ]] || : > "$c/internal/android/images/vendor.img"
+  [[ $3 != card ]] || : > "$c/data/android/images/system.img"
+  [[ $3 != card ]] || : > "$c/data/android/images/vendor.img"
 }
 ok=0
 for x in "-|no|no|1|not mounted" "missing /var/lib/blockie/data is not mounted|no|no|1|/var/lib/blockie/data is not mounted" \
   "failed change pending, stop Android|no|no|2|change pending" "ok|no|images|1|not mounted" \
-  "ok|mounted|no|1|no android/images/system.img" "-|mounted|images|2|prep not run" \
+  "-|data|images|1|$c/internal is not mounted" "ok|data|images|1|$c/internal is not mounted" \
+  "-|internal|images|1|$c/data is not mounted" "failed change pending, stop Android|data|images|2|change pending" \
+  "ok|mounted|no|1|no android/images/system.img" "ok|mounted|card|1|no android/images/system.img" \
+  "-|mounted|images|2|prep not run" \
   "failed pin incomplete|mounted|images|2|pin incomplete" "missing no images/vendor.img|mounted|images|1|no images/vendor.img" \
   "ok|mounted|images|0|"; do
   IFS='|' read -r s m i want why <<< "$x"
@@ -246,11 +256,11 @@ for x in "-|no|no|1|not mounted" "missing /var/lib/blockie/data is not mounted|n
   [[ $rc == "$want" ]] && { [[ -z $why ]] && [[ ! -s $c/out ]] || grep -qF -- "$why" "$c/out"; } ||
     { ok=1; echo "  state '$s' $m $i: rc $rc $(cat "$c/out")"; }
 done
-res $ok "check: 0 only with data mounted, both images and state ok; 1 for an unmounted data or a missing image; 2 for prep failures and no prep, each with its reason"
+res $ok "check: 0 only with data and internal mounted, both images on internal and state ok; 1 for an unmounted data or internal or a missing image, images on the card alone included; 2 for prep failures and no prep, each with its reason"
 
 
 p=$t/prep
-mkdir -p "$p/bin" "$p/data/android/images" "$p/work" "$p/run"
+mkdir -p "$p/bin" "$p/data/android" "$p/internal/android/images" "$p/work" "$p/run"
 cp /usr/lib/waydroid/data/configs/config_base "$p/config_base"
 sys1=$(printf '%064d' 1)
 ven1=$(printf '%064d' 2)
@@ -258,14 +268,15 @@ zip=$(printf '%064d' 3)
 pin() {
   printf 'system.img https://example.invalid/system.zip %s 4096 %s\nvendor.img https://example.invalid/vendor.zip %s 2048\n' \
     "$1" "$zip" "$2" > "$p/pin"
-  printf 'system.img 4096 %s\nvendor.img 2048 %s\n' "$1" "$2" > "$p/data/android/images/stamp"
+  printf 'system.img 4096 %s\nvendor.img 2048 %s\n' "$1" "$2" > "$p/internal/android/images/stamp"
 }
 pin "$sys1" "$ven1"
-truncate -s 4096 "$p/data/android/images/system.img"
-truncate -s 2048 "$p/data/android/images/vendor.img"
-: > "$p/mounted"
+truncate -s 4096 "$p/internal/android/images/system.img"
+truncate -s 2048 "$p/internal/android/images/vendor.img"
+: > "$p/mounted.data"
+: > "$p/mounted.internal"
 echo 1.6.3-1.fc44.blockie > "$p/version"
-printf '#!/bin/sh\n[ -e "%s/mounted" ]\n' "$p" > "$p/bin/mountpoint"
+printf '#!/bin/sh\n[ -e "%s/mounted.${2##*/}" ]\n' "$p" > "$p/bin/mountpoint"
 printf '#!/bin/sh\ncat "%s/version"\n' "$p" > "$p/bin/rpm"
 cat > "$p/bin/waydroid" << EOF
 #!/usr/bin/python3
@@ -288,7 +299,7 @@ EOF
 chmod 755 "$p/bin/"*
 prun() {
   : > "$p/calls"
-  PATH=$p/bin:$PATH BLOCKIE_DATA_DIR=$p/data BLOCKIE_ANDROID_RUN=$p/run BLOCKIE_WAYDROID_WORK=$p/work \
+  PATH=$p/bin:$PATH BLOCKIE_DATA_DIR=$p/data BLOCKIE_INTERNAL_DIR=$p/internal BLOCKIE_ANDROID_RUN=$p/run BLOCKIE_WAYDROID_WORK=$p/work \
     BLOCKIE_ANDROID_PIN=${1:-$p/pin} BLOCKIE_WAYDROID_BASE=$p/config_base BLOCKIE_ANDROID_PAYLOAD=$p/payload \
     BLOCKIE_LOCALTIME=$p/localtime BLOCKIE_ANDROID_DRM_STATE=${drmstate-} timeout 20 "$lx/blockie-android-prep" > "$p/out" 2>&1
   rc=$?
@@ -311,7 +322,7 @@ fi
 res $ok "prep: the shipped pin names the GAPPS system and MAINLINE vendor zips; while a field is '-' prep refuses with pin incomplete and runs nothing"
 
 ok=0
-mkdir -p "$p/data/android/images.old" "$p/zoneinfo/Asia"
+mkdir -p "$p/internal/android/images.old" "$p/zoneinfo/Asia"
 : > "$p/zoneinfo/Asia/Tokyo"
 ln -sfn "$p/zoneinfo/Asia/Tokyo" "$p/localtime"
 prun
@@ -328,8 +339,8 @@ cmp -s /usr/share/blockie/android/Vendor_4001_Product_0428.kl "$p/work/overlay/s
 [[ $(sed -n 1p "$p/data/android/prepared") == 'waydroid 1.6.3-1.fc44.blockie' && $(wc -l < "$p/data/android/prepared") == 5 &&
   $(sed -n 5p "$p/data/android/prepared") == 'gpu soft' ]] ||
   { ok=1; echo "  prepared"; }
-[[ ! -e $p/data/android/images.old ]] || { ok=1; echo "  images.old kept"; }
-res $ok "prep: first run writes the properties, pins freeze and overlays (back to True after init), runs init once, copies the keylayout, records the stamp, drops images.old"
+[[ ! -e $p/internal/android/images.old ]] || { ok=1; echo "  images.old kept"; }
+res $ok "prep: first run writes the properties, pins freeze and overlays (back to True after init), runs init once, copies the keylayout, records the stamp, drops images.old on internal"
 
 ok=0
 prun
@@ -384,38 +395,46 @@ unset drmstate
 res $ok "prep: the debugfs state read is off with BLOCKIE_ANDROID_DRM_STATE empty; it takes the mode line of the active crtc, not the inactive one, logs htotal * vtotal / clock against 16666814 (8.8 ppm, no warning) and warns past 10 ppm; an unparsable state and a missing file log one line each and prep goes on, state ok"
 
 ok=0
-mkdir -p "$p/payload" "$p/data/android/images.old"
+mkdir -p "$p/payload" "$p/internal/android/images.old"
 printf 'populated 1\nfrozen 0\n' > "$p/payload/cgroup.events"
 echo 'lxc.mount.auto = sys:ro' >> "$p/config_base"
 prun
-[[ $rc == 1 && $st == "failed change pending, stop Android" && ! -s $p/calls && -d $p/data/android/images.old ]] ||
+[[ $rc == 1 && $st == "failed change pending, stop Android" && ! -s $p/calls && -d $p/internal/android/images.old ]] ||
   { ok=1; echo "  running: rc $rc '$st' $(cat "$p/calls")"; }
 printf 'populated 0\nfrozen 0\n' > "$p/payload/cgroup.events"
 prun
-[[ $rc == 0 && $st == ok && $(cat "$p/calls") == '--details-to-stdout upgrade --offline' && ! -e $p/data/android/images.old ]] ||
+[[ $rc == 0 && $st == ok && $(cat "$p/calls") == '--details-to-stdout upgrade --offline' && ! -e $p/internal/android/images.old ]] ||
   { ok=1; echo "  stopped: rc $rc $(cat "$p/calls")"; }
 rm -rf "${p:?}/payload"
 res $ok "prep: with a populated payload nothing runs and the state says change pending; an empty leftover payload is not running, so the upgrade runs and the state is ok"
 
 ok=0
-rm -f "${p:?}/data/android/images/vendor.img"
+rm -f "${p:?}/internal/android/images/vendor.img"
 prun
 [[ $rc == 1 && $st == "missing no images/vendor.img" && ! -s $p/calls ]] || { ok=1; echo "  missing: '$st'"; }
-truncate -s 2047 "$p/data/android/images/vendor.img"
+truncate -s 2047 "$p/internal/android/images/vendor.img"
 prun
 [[ $rc == 1 && $st == "failed images/vendor.img is 2047 bytes, the pin says 2048" ]] || { ok=1; echo "  size: '$st'"; }
-truncate -s 2048 "$p/data/android/images/vendor.img"
-printf 'system.img 4096 %s\nvendor.img 2048 %s\n' "$(printf '%064d' 4)" "$(printf '%064d' 5)" > "$p/data/android/images/stamp"
+truncate -s 2048 "$p/internal/android/images/vendor.img"
+printf 'system.img 4096 %s\nvendor.img 2048 %s\n' "$(printf '%064d' 4)" "$(printf '%064d' 5)" > "$p/internal/android/images/stamp"
 prun
 [[ $rc == 1 && $st == "failed the image stamp does not match the pin" ]] || { ok=1; echo "  stamp: '$st'"; }
-rm -f "${p:?}/data/android/images/stamp"
+rm -f "${p:?}/internal/android/images/stamp"
 prun
 [[ $rc == 1 && $st == "failed no image stamp" ]] || { ok=1; echo "  no stamp: '$st'"; }
 pin "$(printf '%064d' 4)" "$ven1"
-rm -f "${p:?}/mounted"
+rm -f "${p:?}/mounted.data"
 prun
 [[ $rc == 1 && $st == "missing $p/data is not mounted" ]] || { ok=1; echo "  unmounted: '$st'"; }
-: > "$p/mounted"
+: > "$p/mounted.data"
+rm -f "${p:?}/mounted.internal"
+prun
+[[ $rc == 1 && $st == "missing $p/internal is not mounted" && ! -s $p/calls ]] || { ok=1; echo "  internal unmounted: '$st'"; }
+: > "$p/mounted.internal"
+mv -T "$p/internal/android/images" "$p/data/android/images"
+prun
+[[ $rc == 1 && $st == "missing no images/system.img" && ! -s $p/calls ]] || { ok=1; echo "  card images only: '$st'"; }
+mv -T "$p/data/android/images" "$p/internal/android/images"
 rm -rf "${p:?}/work/rootfs"
 echo 1 > "$p/waydroid.rc"
 prun
@@ -427,11 +446,11 @@ prun "$p/pin2"
 printf 'system.img https://example.invalid/s.zip %s 4096\n' "$sys1" > "$p/pin2"
 prun "$p/pin2"
 [[ $rc == 1 && $st == "failed pin incomplete" ]] || { ok=1; echo "  one image: '$st'"; }
-res $ok "prep: a missing image is missing, a wrong size, stamp or no stamp, a failed init, a '-' or a missing image line is failed, each with the reason"
+res $ok "prep: a missing image is missing, images on the card alone included; an unmounted data or internal is missing; a wrong size, stamp or no stamp, a failed init, a '-' or a missing image line is failed, each with the reason"
 
 g=$t/gpu
 ov=$g/work/overlay/vendor
-mkdir -p "$g/bin" "$g/data/android/images" "$g/work/overlay/vendor" "$g/run" "$g/vendor" "$g/hwc" "$g/zoneinfo/Asia"
+mkdir -p "$g/bin" "$g/data/android" "$g/internal/android/images" "$g/work/overlay/vendor" "$g/run" "$g/vendor" "$g/hwc" "$g/zoneinfo/Asia"
 cp /usr/lib/waydroid/data/configs/config_base "$g/config_base"
 : > "$g/zoneinfo/Asia/Tokyo"
 ln -sfn "$g/zoneinfo/Asia/Tokyo" "$g/localtime"
@@ -447,9 +466,9 @@ gsys=$(printf '%064d' 7)
 gven=$(printf '%064d' 8)
 gzip=$(printf '%064d' 9)
 printf 'system.img https://example.invalid/system.zip %s 4096 %s\nvendor.img https://example.invalid/vendor.zip %s 2048\n' "$gsys" "$gzip" "$gven" > "$g/imgpin"
-printf 'system.img 4096 %s\nvendor.img 2048 %s\n' "$gsys" "$gven" > "$g/data/android/images/stamp"
-truncate -s 4096 "$g/data/android/images/system.img"
-truncate -s 2048 "$g/data/android/images/vendor.img"
+printf 'system.img 4096 %s\nvendor.img 2048 %s\n' "$gsys" "$gven" > "$g/internal/android/images/stamp"
+truncate -s 4096 "$g/internal/android/images/system.img"
+truncate -s 2048 "$g/internal/android/images/vendor.img"
 echo '1 0' > "$g/armed"
 echo gpu-boot-one > "$g/bootid"
 printf 'blockie-hwc-shim-content\n' > "$g/hwc/hwcomposer.blockie.so"
@@ -493,7 +512,7 @@ gpin() {
 grun() {
   : > "$g/calls"
   rm -f "${g:?}/mknod.calls"
-  PATH=$g/bin:$PATH BLOCKIE_DATA_DIR=$g/data BLOCKIE_ANDROID_RUN=$g/run BLOCKIE_WAYDROID_WORK=$g/work \
+  PATH=$g/bin:$PATH BLOCKIE_DATA_DIR=$g/data BLOCKIE_INTERNAL_DIR=$g/internal BLOCKIE_ANDROID_RUN=$g/run BLOCKIE_WAYDROID_WORK=$g/work \
     BLOCKIE_ANDROID_PIN=$g/imgpin BLOCKIE_WAYDROID_BASE=$g/config_base BLOCKIE_ANDROID_PAYLOAD=$g/payload \
     BLOCKIE_LOCALTIME=$g/localtime BLOCKIE_ANDROID_GPU_PIN=$g/gpin BLOCKIE_ANDROID_VENDOR=$g/vendor \
     BLOCKIE_ANDROID_HWC_SHIM=$g/hwc/hwcomposer.blockie.so BLOCKIE_KBASE_ARMED=$g/armed BLOCKIE_BOOT_ID=$g/bootid \
@@ -758,10 +777,11 @@ rm -f "${g:?}/gpusetting"
 res $ok "prep gpu: setting android.gpu to soft clears the fail marker, so a later switch back to mali tries the GPU again"
 
 l=$t/lxcd
-mkdir -p "$l/proc" "$l/run" "$l/bin" "$l/data/music" "$l/data/android/guest/data/media/0"
-printf '#!/bin/sh\n[ -e "%s/mounted" ]\n' "$l" > "$l/bin/mountpoint"
+mkdir -p "$l/proc" "$l/run" "$l/bin" "$l/data/music" "$l/data/android/guest/data/media/0" "$l/internal"
+printf '#!/bin/sh\n[ -e "%s/mounted.${2##*/}" ]\n' "$l" > "$l/bin/mountpoint"
 chmod 755 "$l/bin/mountpoint"
-: > "$l/mounted"
+: > "$l/mounted.data"
+: > "$l/mounted.internal"
 echo ok > "$l/run/state"
 printf 'Character devices:\n  1 mem\n  5 /dev/tty\n 10 misc\n 13 input\n136 pts\n488 binder\n489 dma_heap\n491 pmsg\n\nBlock devices:\n  7 loop\n490 binder\n492 pmsg\n' \
   > "$l/proc/devices"
@@ -770,7 +790,8 @@ ln -s /dev/full "$l/pad"
 lrun() {
   rm -rf "${l:?}/run/lxc.d"
   env PATH="$l/bin:$PATH" BLOCKIE_PROC="$l/proc" BLOCKIE_ANDROID_PAD="$l/pad" BLOCKIE_ANDROID_RUN="$l/run" \
-    BLOCKIE_ANDROID_PAYLOAD="$l/payload" BLOCKIE_DATA_DIR="$l/data" "$@" timeout 10 "$lx/blockie-android-lxcd" > "$l/out" 2>&1
+    BLOCKIE_ANDROID_PAYLOAD="$l/payload" BLOCKIE_DATA_DIR="$l/data" BLOCKIE_INTERNAL_DIR="$l/internal" "$@" \
+    timeout 10 "$lx/blockie-android-lxcd" > "$l/out" 2>&1
   rc=$?
 }
 a='lxc.cgroup2.devices.allow = c'
@@ -849,13 +870,18 @@ rm -f "${l:?}/run/state"
 lrun
 [[ $rc == 1 && ! -e $l/run/lxc.d/devices.conf ]] && grep -q "state is 'none', not ok" "$l/out" || { ok=1; echo "  no state: rc $rc"; }
 echo ok > "$l/run/state"
-rm -f "${l:?}/mounted"
+rm -f "${l:?}/mounted.data"
 lrun
-[[ $rc == 1 && ! -e $l/run/lxc.d/devices.conf ]] && grep -q 'is not mounted' "$l/out" || { ok=1; echo "  unmounted: rc $rc"; }
-: > "$l/mounted"
-res $ok "lxcd: the container start is refused unless data is mounted and the prep state is ok, so a start that skips the prep dependency fails here"
+[[ $rc == 1 && ! -e $l/run/lxc.d/devices.conf ]] && grep -q "$l/data is not mounted" "$l/out" || { ok=1; echo "  unmounted: rc $rc"; }
+: > "$l/mounted.data"
+rm -f "${l:?}/mounted.internal"
+lrun
+[[ $rc == 1 && ! -e $l/run/lxc.d/devices.conf ]] && grep -q "$l/internal is not mounted" "$l/out" ||
+  { ok=1; echo "  internal unmounted: rc $rc"; }
+: > "$l/mounted.internal"
+res $ok "lxcd: the container start is refused unless data and internal are mounted and the prep state is ok, so a start that skips the prep dependency fails here"
 
-printf '#!/bin/sh\ncase "$*" in *gpu/dev*) exit 1 ;; *) [ -e "%s/mounted" ] ;; esac\n' "$l" > "$l/bin/mountpoint"
+printf '#!/bin/sh\ncase "$*" in *gpu/dev*) exit 1 ;; *) [ -e "%s/mounted.${2##*/}" ] ;; esac\n' "$l" > "$l/bin/mountpoint"
 printf '#!/bin/sh\necho "mount $*" >> "%s/mount.calls"\n' "$l" > "$l/bin/mount"
 printf '#!/bin/sh\n: > "$3"\necho "mknod $*" >> "%s/mknod.calls"\n' "$l" > "$l/bin/mknod"
 chmod 755 "$l/bin/mountpoint" "$l/bin/mount" "$l/bin/mknod"
@@ -867,7 +893,7 @@ lgrun() {
   rm -rf "${l:?}/run/lxc.d" "${l:?}/mount.calls" "${l:?}/mknod.calls"
   env PATH="$l/bin:$PATH" BLOCKIE_PROC="$l/proc" BLOCKIE_DEV="$l/dev" BLOCKIE_ANDROID_PAD="$l/pad" \
     BLOCKIE_ANDROID_RUN="$l/run" BLOCKIE_ANDROID_PAYLOAD="$l/payload" BLOCKIE_DATA_DIR="$l/data" \
-    timeout 10 "$lx/blockie-android-lxcd" > "$l/out" 2>&1
+    BLOCKIE_INTERNAL_DIR="$l/internal" timeout 10 "$lx/blockie-android-lxcd" > "$l/out" 2>&1
   rc=$?
 }
 ok=0

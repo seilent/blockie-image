@@ -2,6 +2,7 @@
 set -u
 
 data=${BLOCKIE_DATA_DIR:-/var/lib/blockie/data}
+internal=${BLOCKIE_INTERNAL_DIR:-/var/lib/blockie/internal}
 run=${BLOCKIE_ANDROID_RUN:-/run/blockie-android}
 
 state=
@@ -9,16 +10,18 @@ state=
 kind=${state%% *}
 why=${state#"$kind"}
 why=${why# }
-if ! mountpoint -q "$data"; then
-  if [[ $kind == failed ]]; then
-    echo "$why"
-    exit 2
+for m in "$data" "$internal"; do
+  if ! mountpoint -q "$m"; then
+    if [[ $kind == failed ]]; then
+      echo "$why"
+      exit 2
+    fi
+    echo "${why:-$m is not mounted}"
+    exit 1
   fi
-  echo "${why:-$data is not mounted}"
-  exit 1
-fi
+done
 for f in system.img vendor.img; do
-  [[ -f $data/android/images/$f ]] || { echo "no android/images/$f"; exit 1; }
+  [[ -f $internal/android/images/$f ]] || { echo "no android/images/$f"; exit 1; }
 done
 case $kind in
   ok) exit 0 ;;
