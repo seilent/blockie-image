@@ -216,7 +216,7 @@ do_testb() {
 
 do_fastboot() {
   [[ -e $etc/fastboot ]] || die "fastboot refused: not proven on this base"
-  systemctl reboot bootloader || die "fastboot: systemctl reboot bootloader failed"
+  systemctl reboot --reboot-argument=bootloader || die "fastboot: systemctl reboot --reboot-argument=bootloader failed"
 }
 
 undo() {

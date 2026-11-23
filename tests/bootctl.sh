@@ -580,8 +580,18 @@ run boot fastboot
 r1=$?
 : > "$d/etc/fastboot"
 run boot fastboot
-[[ $rc == 0 && $(paste -sd '|' "$d/calls") == "systemctl reboot bootloader" && $(st) == "$D" ]]
-res $((r1 || $?)) "boot fastboot needs the base file, then systemctl reboot bootloader with no misc write"
+[[ $rc == 0 && $(paste -sd '|' "$d/calls") == "systemctl reboot --reboot-argument=bootloader" && $(st) == "$D" ]]
+res $((r1 || $?)) "boot fastboot needs the base file, then systemctl reboot --reboot-argument=bootloader with no misc write"
+: > "$d/calls"
+run fastboot
+[[ $rc == 0 && $(paste -sd '|' "$d/calls") == "systemctl reboot --reboot-argument=bootloader" && $(st) == "$D" ]]
+r1=$?
+: > "$d/calls"
+echo 1 > "$d/systemctl.rc"
+run fastboot
+[[ $rc == 1 && $(paste -sd '|' "$d/calls") == "systemctl reboot --reboot-argument=bootloader" && $(st) == "$D" ]] &&
+  grep -q 'fastboot: systemctl reboot --reboot-argument=bootloader failed' "$d/out"
+res $((r1 || $?)) "fastboot with the base file: systemctl reboot --reboot-argument=bootloader, no misc write; a failed call exits 1 naming it"
 
 ok=0
 setup badtarget _a 15/2/0 13/1/1

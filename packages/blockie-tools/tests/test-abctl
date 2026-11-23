@@ -340,6 +340,10 @@ def main():
         slot_cmd("default-a", H, D, "default-a from hold-b's state")
         slot_cmd("default-a", bc_of("_a", (15, 2, 0), (13, 1, 0)), U, "default-a on an unproven b: b 13/1/0")
         slot_cmd("default-a", bc_of("_b", (14, 3, 0), (15, 0, 0)), U, "default-a after an unproven b's try: b 13/1/0")
+        slot_cmd("default-a", bc_of("_b", (0, 0, 0), (0, 0, 0)), U,
+                 "default-a with both slots drained (a 0/0/0, b 0/0/0, class reset): a 15/3/0, b 13/1/0, suffix _a")
+        slot_cmd("default-a", bc_of("_b", (0, 0, 0), (13, 1, 0)), U,
+                 "default-a after fix-b on both slots drained (a 0/0/0, b 13/1/0): a 15/3/0, b 13/1/0, suffix _a")
         slot_cmd("hold-b", D, H, "hold-b from D: a 14/3/0, b 15/1/1, suffix _b")
         slot_cmd("hold-b", D2, bc_of("_b", (14, 2, 0), (15, 1, 1)), "hold-b keeps a's tries")
         slot_cmd("hold-b", U, bc_of("_b", (14, 3, 0), (15, 1, 0)), "hold-b on an unproven b with a 15/3/0: b 15/1/0")
